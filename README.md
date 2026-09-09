@@ -1,6 +1,6 @@
 # Tention Monthly Performance Report Extension
 
-Production foundation for creating correct, visual monthly performance reports for the Tention internal team. Phase 1B adds the report draft domain, validation, lifecycle, timezone-aware month completion, metadata rules, and development API endpoints.
+Production foundation for creating correct, visual monthly performance reports for the Tention internal team. Phase 1C adds durable PostgreSQL storage, optimistic locking, migrations, and lifecycle history.
 
 ## Architecture
 
@@ -26,11 +26,13 @@ The backend will eventually own provider credentials, validation, calculations, 
 
 - Node.js 20 or newer
 - npm 10 or newer
+- PostgreSQL for durable API storage
 
 ## Commands
 
 ```bash
 npm install
+npm run migrate
 npm run typecheck
 npm run test
 npm run build
@@ -38,10 +40,20 @@ npm run dev:api
 npm run dev:extension
 ```
 
-The API defaults to `http://localhost:3000`. For extension development, run the Vite build and load `apps/extension/dist` as an unpacked extension in Chrome.
+Copy `.env.example` to an untracked local environment file or export `DATABASE_URL`, then run migrations explicitly before starting the API. The API does not run migrations at startup and does not silently fall back to memory if PostgreSQL is unavailable.
+
+```bash
+export DATABASE_URL=postgresql://postgres:postgres@localhost:5432/tention_reports
+npm run migrate
+npm run dev:api
+```
+
+`REPORT_STORAGE_MODE=memory` is available only as an explicit non-production development option. The API defaults to `http://localhost:3000`. For extension development, run the Vite build and load `apps/extension/dist` as an unpacked extension in Chrome.
+
+Real PostgreSQL integration tests require a dedicated `TEST_DATABASE_URL` whose database name contains `test`. These tests clear their dedicated test tables.
 
 ## Current boundaries
 
-Klaviyo, Shopify, authentication, production persistence, queues, financial calculations, provider ranking formulas, AI analysis, binary screenshot capture, and PDF generation are intentionally absent. Their data semantics remain unresolved or belong to later phases.
+Klaviyo, Shopify, authentication, queues, financial calculations, provider ranking formulas, AI analysis, binary screenshot capture, image storage, and PDF generation are intentionally absent. Their data semantics remain unresolved or belong to later phases.
 
 Read [AGENTS.md](./AGENTS.md) before changing reporting logic. Detailed requirements live in [docs/PRODUCT_SPEC.md](./docs/PRODUCT_SPEC.md), [docs/DATA_RULES.md](./docs/DATA_RULES.md), [docs/REPORT_SPEC.md](./docs/REPORT_SPEC.md), and [docs/OPEN_DECISIONS.md](./docs/OPEN_DECISIONS.md).

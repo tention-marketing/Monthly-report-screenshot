@@ -106,7 +106,7 @@ export const reportValidationStateSchema = z.object({
 export type ReportValidationState = z.infer<typeof reportValidationStateSchema>;
 
 export const reportDraftSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().uuid(),
   client: clientSummarySchema,
   reportMonth: reportMonthSchema,
   period: reportPeriodSchema,
@@ -114,10 +114,30 @@ export const reportDraftSchema = z.object({
   sections: sectionConfigurationSchema,
   screenshots: z.array(screenshotRecordSchema),
   validation: reportValidationStateSchema,
+  version: z.number().int().positive(),
   createdAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true }),
 });
 export type ReportDraft = z.infer<typeof reportDraftSchema>;
+
+export const reportLifecycleEventTypeSchema = z.enum([
+  "REPORT_CREATED", "START_DATA_FETCH", "DATA_FETCH_SUCCEEDED", "DATA_FETCH_FAILED",
+  "MARK_CAPTURES_INCOMPLETE", "SUBMIT_FOR_REVIEW", "APPROVE", "START_GENERATION",
+  "GENERATION_SUCCEEDED", "GENERATION_FAILED", "RESET_TO_DRAFT",
+]);
+export type ReportLifecycleEventType = z.infer<typeof reportLifecycleEventTypeSchema>;
+
+export const reportLifecycleEventSchema = z.object({
+  id: z.string().uuid(),
+  reportId: z.string().uuid(),
+  eventType: reportLifecycleEventTypeSchema,
+  fromStatus: reportStatusSchema.nullable(),
+  toStatus: reportStatusSchema,
+  reportVersion: z.number().int().positive(),
+  createdAt: z.string().datetime({ offset: true }),
+  metadata: z.record(z.string(), z.unknown()).nullable(),
+});
+export type ReportLifecycleEvent = z.infer<typeof reportLifecycleEventSchema>;
 
 export function isValidIanaTimeZone(timeZone: string): boolean {
   try {

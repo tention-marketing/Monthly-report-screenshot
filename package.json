@@ -9,6 +9,7 @@
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "dev:api": "npm run dev --workspace @tention/api",
-    "dev:extension": "npm run dev --workspace @tention/extension"
+    "dev:extension": "npm run dev --workspace @tention/extension",
+    "migrate": "npm run migrate --workspace @tention/api"
   }
 }

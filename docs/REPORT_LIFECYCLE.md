@@ -2,6 +2,8 @@
 
 Report status changes occur only through domain events. Direct status mutation is not an API operation.
 
+Creation records an append-only `REPORT_CREATED` history entry at report version 1. Every successful lifecycle transition increments the report version once and writes its history entry in the same PostgreSQL transaction. Illegal transitions and version conflicts change neither the report nor its history.
+
 | Current state | Event | Next state | Guard |
 |---|---|---|---|
 | `draft` | `START_DATA_FETCH` | `data_fetching` | — |

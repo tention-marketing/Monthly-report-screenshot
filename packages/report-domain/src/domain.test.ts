@@ -6,13 +6,14 @@ import {
 } from "./index.js";
 
 const now = new Date("2026-09-09T12:00:00Z");
+const draftId = "11111111-1111-4111-8111-111111111111";
 const requiredOverview: SectionConfiguration = { executive_summary: "required" };
 
 function draft(sections: SectionConfiguration = requiredOverview): ReportDraft {
   return createReportDraft({
     client: { id: "client-1", name: "Orion", timezone: "Asia/Kolkata", currency: null },
     reportMonth: { year: 2026, month: 8 }, sections,
-  }, { now, id: "draft-1" });
+  }, { now, id: draftId });
 }
 
 function overview(overrides: Partial<ScreenshotRecord> = {}): ScreenshotRecord {
@@ -90,6 +91,6 @@ describe("screenshot service and repository", () => {
     const value = draft();
     await repository.create(value);
     value.status = "failed";
-    expect((await repository.getById("draft-1"))?.status).toBe("draft");
+    expect((await repository.getById(draftId))?.status).toBe("draft");
   });
 });

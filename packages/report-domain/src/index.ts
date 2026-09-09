@@ -3,6 +3,7 @@ import {
   isValidIanaTimeZone, reportSectionKeySchema, screenshotSectionMapping,
   type ClientSummary, type ReportDraft, type ReportMonth, type ReportSectionKey,
   type ReportStatus, type ReportValidationIssue, type ReportValidationState,
+  reportDraftSchema, reportLifecycleEventSchema, type ReportLifecycleEvent,
   type ScreenshotRecord, type ScreenshotType, type SectionConfiguration,
 } from "@tention/report-schema";
 
@@ -45,6 +46,7 @@ export function createReportDraft(input: CreateReportDraftInput, context: Create
     sections: { ...input.sections },
     screenshots: [],
     validation: { status: "pending", errors: [], warnings: [] },
+    version: 1,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -121,7 +123,7 @@ export function applyReportEvent(draft: ReportDraft, event: ReportEvent, context
   if (event === "SUBMIT_FOR_REVIEW" && validation.errors.length > 0) {
     throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Report validation blocks review submission.", validation);
   }
-  return { ...draft, status: nextStatus, validation, updatedAt: validInstant(context.now).toISOString() };
+  return { ...draft, status: nextStatus, validation, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
 }
 
 export function upsertScreenshotMetadata(
@@ -131,34 +133,110 @@ export function upsertScreenshotMetadata(
   if (screenshot.clientId !== draft.client.id) throw new ReportDomainError("SCREENSHOT_CLIENT_MISMATCH", "Screenshot belongs to another client.");
   if (!sameMonth(screenshot.reportMonth, draft.reportMonth)) throw new ReportDomainError("SCREENSHOT_MONTH_MISMATCH", "Screenshot belongs to another report month.");
   const screenshots = [...draft.screenshots.filter(({ type }) => type !== routeType), screenshot];
-  const next = { ...draft, screenshots, updatedAt: validInstant(context.now).toISOString() };
+  const next = { ...draft, screenshots, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
   return { ...next, validation: validateReportDraft(next, context) };
 }
 
 export interface ReportDraftRepository {
-  create(draft: ReportDraft): Promise<void>;
+  create(draft: ReportDraft): Promise<ReportDraft>;
   getById(id: string): Promise<ReportDraft | null>;
-  save(draft: ReportDraft): Promise<void>;
+  save(draft: ReportDraft, expectedVersion: number): Promise<ReportDraft>;
+  saveWithLifecycleEvent(draft: ReportDraft, expectedVersion: number, eventType: ReportEvent): Promise<ReportDraft>;
   list(): Promise<ReportDraft[]>;
+  getHistory(reportId: string): Promise<ReportLifecycleEvent[]>;
+}
+
+export type PersistenceErrorCode =
+  | "REPORT_NOT_FOUND" | "REPORT_VERSION_CONFLICT" | "REPORT_DRAFT_ALREADY_EXISTS"
+  | "PERSISTENCE_DATA_INVALID" | "DATABASE_UNAVAILABLE";
+
+export class ReportPersistenceError extends Error {
+  constructor(
+    public readonly code: PersistenceErrorCode,
+    message: string,
+    public readonly details?: { expectedVersion?: number; currentVersion?: number },
+  ) { super(message); this.name = "ReportPersistenceError"; }
 }
 
 /** Non-production repository for local API development and tests. */
 export class InMemoryReportDraftRepository implements ReportDraftRepository {
   private readonly drafts = new Map<string, ReportDraft>();
-  async create(draft: ReportDraft): Promise<void> {
-    if (this.drafts.has(draft.id)) throw new Error(`Report draft ${draft.id} already exists.`);
-    this.drafts.set(draft.id, structuredClone(draft));
+  private readonly history = new Map<string, ReportLifecycleEvent[]>();
+  async create(draft: ReportDraft): Promise<ReportDraft> {
+    const parsed = parseDraft(draft);
+    if ([...this.drafts.values()].some((stored) => sameClientMonth(stored, parsed))) {
+      throw new ReportPersistenceError("REPORT_DRAFT_ALREADY_EXISTS", "A report draft already exists for this client and month.");
+    }
+    this.drafts.set(parsed.id, structuredClone(parsed));
+    this.history.set(parsed.id, [createHistoryEvent(parsed, "REPORT_CREATED", null, parsed.status)]);
+    return structuredClone(parsed);
   }
   async getById(id: string): Promise<ReportDraft | null> { return structuredClone(this.drafts.get(id) ?? null); }
-  async save(draft: ReportDraft): Promise<void> {
-    if (!this.drafts.has(draft.id)) throw new Error(`Report draft ${draft.id} does not exist.`);
-    this.drafts.set(draft.id, structuredClone(draft));
+  async save(draft: ReportDraft, expectedVersion: number): Promise<ReportDraft> {
+    return this.persist(draft, expectedVersion);
+  }
+  async saveWithLifecycleEvent(draft: ReportDraft, expectedVersion: number, eventType: ReportEvent): Promise<ReportDraft> {
+    const current = this.requireCurrent(draft.id, expectedVersion);
+    const saved = this.persist(draft, expectedVersion);
+    const event = createHistoryEvent(saved, eventType, current.status, saved.status);
+    this.history.set(draft.id, [...(this.history.get(draft.id) ?? []), event]);
+    return saved;
   }
   async list(): Promise<ReportDraft[]> { return [...this.drafts.values()].map((draft) => structuredClone(draft)); }
+  async getHistory(reportId: string): Promise<ReportLifecycleEvent[]> {
+    if (!this.drafts.has(reportId)) throw new ReportPersistenceError("REPORT_NOT_FOUND", "Report draft was not found.");
+    return structuredClone(this.history.get(reportId) ?? []);
+  }
+  private persist(draft: ReportDraft, expectedVersion: number): ReportDraft {
+    const current = this.requireCurrent(draft.id, expectedVersion);
+    if (!sameIdentity(current, draft) || current.createdAt !== draft.createdAt) {
+      throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Immutable report identity cannot be changed.");
+    }
+    if (draft.version !== expectedVersion + 1) {
+      throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Saved report version must increment exactly once.");
+    }
+    const parsed = parseDraft(draft);
+    this.drafts.set(parsed.id, structuredClone(parsed));
+    return structuredClone(parsed);
+  }
+  private requireCurrent(id: string, expectedVersion: number): ReportDraft {
+    const current = this.drafts.get(id);
+    if (!current) throw new ReportPersistenceError("REPORT_NOT_FOUND", "Report draft was not found.");
+    if (current.version !== expectedVersion) {
+      throw new ReportPersistenceError("REPORT_VERSION_CONFLICT", "Report draft has changed since it was read.", { expectedVersion, currentVersion: current.version });
+    }
+    return current;
+  }
 }
 
 function sameMonth(left: ReportMonth, right: ReportMonth): boolean { return left.year === right.year && left.month === right.month; }
 function validInstant(value: Date): Date {
   if (Number.isNaN(value.getTime())) throw new Error("now must be a valid Date");
   return value;
+}
+
+function parseDraft(value: ReportDraft): ReportDraft {
+  const result = reportDraftSchema.safeParse(value);
+  if (!result.success) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Report draft failed schema validation.");
+  return result.data;
+}
+
+function sameIdentity(left: ReportDraft, right: ReportDraft): boolean {
+  return left.id === right.id && left.client.id === right.client.id &&
+    left.reportMonth.year === right.reportMonth.year && left.reportMonth.month === right.reportMonth.month;
+}
+
+function sameClientMonth(left: ReportDraft, right: ReportDraft): boolean {
+  return left.client.id === right.client.id && left.reportMonth.year === right.reportMonth.year &&
+    left.reportMonth.month === right.reportMonth.month;
+}
+
+function createHistoryEvent(
+  draft: ReportDraft, eventType: ReportLifecycleEvent["eventType"],
+  fromStatus: ReportStatus | null, toStatus: ReportStatus,
+): ReportLifecycleEvent {
+  return reportLifecycleEventSchema.parse({
+    id: crypto.randomUUID(), reportId: draft.id, eventType, fromStatus, toStatus,
+    reportVersion: draft.version, createdAt: draft.updatedAt, metadata: null,
+  });
 }

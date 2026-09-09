@@ -27,14 +27,26 @@ function shot(overrides: Record<string, unknown> = {}) {
   };
 }
 
+const screenshotPayload = (expectedVersion: number, overrides: Record<string, unknown> = {}) => ({
+  expectedVersion, screenshot: shot(overrides),
+});
+const eventPayload = (expectedVersion: number, event: string) => ({ expectedVersion, event });
+
 describe("report draft API", () => {
   it("creates a completed-month draft with a backend-derived period", async () => {
     const response = await create();
     expect(response.statusCode).toBe(201);
     expect(response.json()).toMatchObject({
+      version: 1,
       reportMonth: { year: 2026, month: 8 },
       period: { startDate: "2026-08-01", endDate: "2026-08-31", previousStartDate: "2026-07-01", previousEndDate: "2026-07-31" },
     });
+  });
+  it("rejects a duplicate client and report month", async () => {
+    expect((await create()).statusCode).toBe(201);
+    const duplicate = await create();
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json().error).toBe("REPORT_DRAFT_ALREADY_EXISTS");
   });
   it.each([
     [{ year: 2026, month: 9 }, "current"],
@@ -75,7 +87,7 @@ describe("report draft API", () => {
     const created = (await create({ sections: { executive_summary: "required" } })).json();
     let response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
     expect(response.json().errors.map(({ code }: { code: string }) => code)).toContain("REQUIRED_SCREENSHOT_MISSING");
-    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: shot({ approved: false }) });
+    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1, { approved: false }) });
     response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
     expect(response.json().errors.map(({ code }: { code: string }) => code)).toContain("REQUIRED_SCREENSHOT_UNAPPROVED");
   });
@@ -86,7 +98,7 @@ describe("report draft API", () => {
   });
   it("warns for metadata attached to a disabled section", async () => {
     const created = (await create({ sections: { executive_summary: "disabled" } })).json();
-    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: shot() });
+    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1) });
     const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
     expect(response.json().warnings.map(({ code }: { code: string }) => code)).toContain("DISABLED_SECTION_SCREENSHOT_PRESENT");
   });
@@ -96,31 +108,69 @@ describe("report draft API", () => {
     ["overview", { type: "top_flows" }, "SCREENSHOT_TYPE_MISMATCH"],
   ])("rejects inconsistent screenshot metadata", async (routeType, overrides, error) => {
     const created = (await create()).json();
-    const response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/${routeType}`, payload: shot(overrides) });
+    const response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/${routeType}`, payload: screenshotPayload(1, overrides) });
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toBe(error);
   });
   it("rejects illegal lifecycle events", async () => {
     const created = (await create()).json();
-    const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: { event: "GENERATION_SUCCEEDED" } });
+    const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(1, "GENERATION_SUCCEEDED") });
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toBe("ILLEGAL_REPORT_TRANSITION");
   });
   it("blocks invalid review submission and accepts a valid one", async () => {
     const blocked = (await create({ sections: { executive_summary: "required" } })).json();
+    let blockedVersion = 1;
     for (const event of ["START_DATA_FETCH", "DATA_FETCH_SUCCEEDED"]) {
-      await app.inject({ method: "POST", url: `/api/v1/report-drafts/${blocked.id}/events`, payload: { event } });
+      const result = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${blocked.id}/events`, payload: eventPayload(blockedVersion, event) });
+      blockedVersion = result.json().version;
     }
-    let response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${blocked.id}/events`, payload: { event: "SUBMIT_FOR_REVIEW" } });
+    let response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${blocked.id}/events`, payload: eventPayload(blockedVersion, "SUBMIT_FOR_REVIEW") });
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toBe("REPORT_VALIDATION_FAILED");
 
-    const valid = (await create({ sections: { executive_summary: "required" } })).json();
-    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${valid.id}/screenshots/overview`, payload: shot() });
+    const valid = (await create({
+      client: { id: "client-2", name: "Second Client", timezone: "Asia/Kolkata" },
+      sections: { executive_summary: "required" },
+    })).json();
+    const uploaded = await app.inject({
+      method: "PUT", url: `/api/v1/report-drafts/${valid.id}/screenshots/overview`,
+      payload: screenshotPayload(1, { clientId: "client-2" }),
+    });
+    let validVersion = uploaded.json().version;
     for (const event of ["START_DATA_FETCH", "DATA_FETCH_SUCCEEDED", "SUBMIT_FOR_REVIEW"]) {
-      response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${valid.id}/events`, payload: { event } });
+      response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${valid.id}/events`, payload: eventPayload(validVersion, event) });
+      validVersion = response.json().version;
     }
     expect(response.statusCode).toBe(200);
     expect(response.json().status).toBe("ready_for_review");
+  });
+  it("increments versions and rejects stale screenshot and lifecycle writes", async () => {
+    const created = (await create()).json();
+    let response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1) });
+    expect(response.json().version).toBe(2);
+    response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1, { id: "shot-2" }) });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "REPORT_VERSION_CONFLICT", expectedVersion: 1, currentVersion: 2 });
+    response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(2, "START_DATA_FETCH") });
+    expect(response.json().version).toBe(3);
+    response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(2, "DATA_FETCH_SUCCEEDED") });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toBe("REPORT_VERSION_CONFLICT");
+  });
+  it("returns creation and transition history, and 404 for unknown history", async () => {
+    const created = (await create()).json();
+    await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(1, "START_DATA_FETCH") });
+    const history = await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/history` });
+    expect(history.json().map(({ eventType }: { eventType: string }) => eventType)).toEqual(["REPORT_CREATED", "START_DATA_FETCH"]);
+    expect((await app.inject({ method: "GET", url: "/api/v1/report-drafts/00000000-0000-4000-8000-000000000000/history" })).statusCode).toBe(404);
+  });
+  it("does not mutate status, version, or history after an illegal transition", async () => {
+    const created = (await create()).json();
+    await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(1, "GENERATION_SUCCEEDED") });
+    const stored = (await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).json();
+    const history = (await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/history` })).json();
+    expect(stored).toMatchObject({ status: "draft", version: 1 });
+    expect(history).toHaveLength(1);
   });
 });
