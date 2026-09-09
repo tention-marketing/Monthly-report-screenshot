@@ -1,0 +1,14 @@
+{
+  "name": "tention-monthly-report",
+  "version": "0.1.0",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "build": "npm run build --workspace @tention/report-schema && npm run build --workspace @tention/report-core && npm run build --workspace @tention/api-client && npm run build --workspace @tention/api && npm run build --workspace @tention/extension",
+    "test": "npm run test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "dev:api": "npm run dev --workspace @tention/api",
+    "dev:extension": "npm run dev --workspace @tention/extension"
+  }
+}

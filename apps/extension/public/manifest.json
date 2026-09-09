@@ -1,0 +1,7 @@
+{
+  "manifest_version": 3,
+  "name": "Tention Reports",
+  "version": "0.1.0",
+  "description": "Tention monthly performance reporting workspace.",
+  "action": { "default_title": "Tention Reports", "default_popup": "index.html" }
+}
