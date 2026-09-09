@@ -19,7 +19,42 @@ The comparison period is the immediately previous calendar month: August 2026 co
 
 ## Timezone boundary
 
-Report timestamps must eventually be bounded in the client/provider account timezone. UTC must never silently become the business timezone. Phase 1A helpers use a timezone-independent `{ year, month }` identifier and ISO calendar dates; provider timestamp conversion is deferred.
+Every client has a valid IANA timezone. Completion is evaluated by converting the server's absolute current instant to the client's local calendar date, then comparing that date with the timezone-independent `{ year, month }` report identifier. UTC must never silently become the business timezone. Provider timestamp-boundary conversion remains deferred.
+
+For example, at `2026-08-31T20:00:00Z`, the local date is September 1 in Asia/Kolkata and August 31 in America/New_York. August is complete for the former client and incomplete for the latter.
+
+## Period integrity
+
+The backend derives `startDate`, `endDate`, `previousStartDate`, and `previousEndDate` from `ReportMonth`. API callers cannot supply or override these boundaries. Validation rejects stored boundaries that differ from the deterministic derivation.
+
+## Validation invariants
+
+- A report month must be complete in the client's IANA timezone.
+- Stored period boundaries must match the report month.
+- Unknown section keys are errors.
+- Required screenshot-backed sections need matching, approved metadata.
+- Optional screenshots may be absent; when present, their metadata must still match.
+- Disabled-section screenshot metadata creates a warning.
+- Duplicate screenshot types and client/month mismatches are errors.
+- Errors block review submission; warnings do not.
+
+Screenshot metadata proves only that the system recorded a client, report month, and screenshot type. It does not prove that the screenshot pixels visibly show that client or month. Visual date-range verification belongs to later extension work.
+
+## Stable validation issue codes
+
+- `REPORT_MONTH_INCOMPLETE`
+- `INVALID_CLIENT_TIMEZONE`
+- `REPORT_PERIOD_MISMATCH`
+- `SCREENSHOT_CLIENT_MISMATCH`
+- `SCREENSHOT_MONTH_MISMATCH`
+- `SCREENSHOT_TYPE_MISMATCH`
+- `REQUIRED_SCREENSHOT_MISSING`
+- `REQUIRED_SCREENSHOT_UNAPPROVED`
+- `DUPLICATE_SCREENSHOT_TYPE`
+- `DISABLED_SECTION_SCREENSHOT_PRESENT`
+- `UNKNOWN_SECTION_CONFIGURATION`
+
+Issues carry `error` or `warning` severity and may identify a field, section, or screenshot type. The screenshot type mismatch is enforced while metadata is upserted because a stored screenshot has one canonical type.
 
 ## Source and calculation rules
 
@@ -31,4 +66,4 @@ Report timestamps must eventually be bounded in the client/provider account time
 - Provider failures and incomplete pagination must never silently become client totals.
 - Internal precision is retained; rounding is a presentation concern.
 
-No attribution, conversion, revenue, refund, currency, or ranking formula is defined in Phase 1A.
+No attribution, conversion, revenue, refund, currency, or provider-specific ranking formula is defined in Phase 1B.

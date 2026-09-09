@@ -18,7 +18,7 @@ describe("calendar month boundaries", () => {
 
   it("builds current and previous boundaries", () => {
     expect(getReportPeriod({ year: 2026, month: 8 })).toEqual({
-      month: { year: 2026, month: 8 }, startDate: "2026-08-01", endDate: "2026-08-31",
+      startDate: "2026-08-01", endDate: "2026-08-31",
       previousStartDate: "2026-07-01", previousEndDate: "2026-07-31",
     });
   });

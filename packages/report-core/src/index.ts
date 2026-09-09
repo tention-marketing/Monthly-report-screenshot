@@ -1,4 +1,9 @@
-import { reportMonthSchema, type ReportMonth, type ReportPeriod } from "@tention/report-schema";
+import { isValidIanaTimeZone, reportMonthSchema, type ReportMonth, type ReportPeriod } from "@tention/report-schema";
+
+export const TOP_CAMPAIGN_COUNT = 3;
+export const TOP_FLOW_COUNT = 5;
+
+export interface CalendarDate { year: number; month: number; day: number }
 
 function validated(month: ReportMonth): ReportMonth {
   return reportMonthSchema.parse(month);
@@ -30,12 +35,49 @@ export function getReportPeriod(month: ReportMonth): ReportPeriod {
   const value = validated(month);
   const previous = getPreviousMonth(value);
   return {
-    month: value,
     startDate: getMonthStart(value),
     endDate: getMonthEnd(value),
     previousStartDate: getMonthStart(previous),
     previousEndDate: getMonthEnd(previous),
   };
+}
+
+export function getCalendarDateInTimeZone(instant: Date, timeZone: string): CalendarDate {
+  if (Number.isNaN(instant.getTime())) throw new Error("instant must be a valid Date");
+  if (!isValidIanaTimeZone(timeZone)) throw new Error("timeZone must be a valid IANA timezone");
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone, year: "numeric", month: "numeric", day: "numeric",
+  }).formatToParts(instant);
+  const value = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value);
+  return { year: value("year"), month: value("month"), day: value("day") };
+}
+
+export function isCompletedMonthAtInstant(month: ReportMonth, instant: Date, timeZone: string): boolean {
+  const local = getCalendarDateInTimeZone(instant, timeZone);
+  return isCompletedMonth(month, formatDate(local.year, local.month, local.day));
+}
+
+export interface SelectTopItemsOptions<T> {
+  items: readonly T[];
+  score: (item: T) => number;
+  stableId: (item: T) => string;
+  limit: number;
+}
+
+export function selectTopItems<T>(options: SelectTopItemsOptions<T>): T[] {
+  if (!Number.isInteger(options.limit) || options.limit <= 0) {
+    throw new Error("limit must be a positive integer");
+  }
+  const scored = options.items.map((item) => {
+    const score = options.score(item);
+    const stableId = options.stableId(item);
+    if (!Number.isFinite(score)) throw new Error(`score for ${stableId} must be finite`);
+    return { item, score, stableId };
+  });
+  return scored
+    .sort((left, right) => right.score - left.score || left.stableId.localeCompare(right.stableId))
+    .slice(0, options.limit)
+    .map(({ item }) => item);
 }
 
 export function getMostRecentlyCompletedMonth(today: string): ReportMonth {

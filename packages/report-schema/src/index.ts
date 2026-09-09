@@ -6,7 +6,7 @@ export const reportMonthSchema = z.object({
 });
 export type ReportMonth = z.infer<typeof reportMonthSchema>;
 
-const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
+export const isoDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Expected YYYY-MM-DD");
 
 export const previousReportPeriodSchema = z.object({
   month: reportMonthSchema,
@@ -16,7 +16,6 @@ export const previousReportPeriodSchema = z.object({
 export type PreviousReportPeriod = z.infer<typeof previousReportPeriodSchema>;
 
 export const reportPeriodSchema = z.object({
-  month: reportMonthSchema,
   startDate: isoDateSchema,
   endDate: isoDateSchema,
   previousStartDate: isoDateSchema,
@@ -27,7 +26,7 @@ export type ReportPeriod = z.infer<typeof reportPeriodSchema>;
 export const clientSummarySchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
-  timezone: z.string().min(1).nullable(),
+  timezone: z.string().min(1).refine(isValidIanaTimeZone, "Expected a valid IANA timezone"),
   currency: z.string().length(3).nullable(),
 });
 export type ClientSummary = z.infer<typeof clientSummarySchema>;
@@ -45,6 +44,36 @@ export const screenshotTypeSchema = z.enum([
 ]);
 export type ScreenshotType = z.infer<typeof screenshotTypeSchema>;
 
+export const reportSectionKeySchema = z.enum([
+  "executive_summary", "top_campaigns", "top_flows", "month_comparison",
+  "campaign_performance", "flow_performance", "signup_form", "welcome_flow",
+  "customer_split", "deliverability", "campaign_metrics", "flow_metrics", "list_growth",
+  "analysis", "next_month_plan",
+]);
+export type ReportSectionKey = z.infer<typeof reportSectionKeySchema>;
+
+export const sectionRequirementSchema = z.enum(["required", "optional", "disabled"]);
+export type SectionRequirement = z.infer<typeof sectionRequirementSchema>;
+
+export const sectionConfigurationSchema = z.record(z.string(), sectionRequirementSchema);
+export type SectionConfiguration = z.infer<typeof sectionConfigurationSchema>;
+
+export const screenshotSectionMapping: Readonly<Record<ScreenshotType, ReportSectionKey>> = {
+  overview: "executive_summary",
+  top_campaigns: "top_campaigns",
+  top_flows: "top_flows",
+  month_comparison: "month_comparison",
+  campaign_performance: "campaign_performance",
+  flow_performance: "flow_performance",
+  signup_form: "signup_form",
+  welcome_flow: "welcome_flow",
+  customer_split: "customer_split",
+  deliverability: "deliverability",
+  campaign_metrics: "campaign_metrics",
+  flow_metrics: "flow_metrics",
+  list_growth: "list_growth",
+};
+
 export const screenshotRecordSchema = z.object({
   id: z.string().min(1),
   clientId: z.string().min(1),
@@ -61,8 +90,11 @@ export type ScreenshotRecord = z.infer<typeof screenshotRecordSchema>;
 
 export const reportValidationIssueSchema = z.object({
   code: z.string().min(1),
+  severity: z.enum(["error", "warning"]),
   message: z.string().min(1),
-  field: z.string().min(1).nullable(),
+  field: z.string().min(1).optional(),
+  section: reportSectionKeySchema.optional(),
+  screenshotType: screenshotTypeSchema.optional(),
 });
 export type ReportValidationIssue = z.infer<typeof reportValidationIssueSchema>;
 
@@ -76,9 +108,22 @@ export type ReportValidationState = z.infer<typeof reportValidationStateSchema>;
 export const reportDraftSchema = z.object({
   id: z.string().min(1),
   client: clientSummarySchema,
+  reportMonth: reportMonthSchema,
   period: reportPeriodSchema,
   status: reportStatusSchema,
+  sections: sectionConfigurationSchema,
   screenshots: z.array(screenshotRecordSchema),
   validation: reportValidationStateSchema,
+  createdAt: z.string().datetime({ offset: true }),
+  updatedAt: z.string().datetime({ offset: true }),
 });
 export type ReportDraft = z.infer<typeof reportDraftSchema>;
+
+export function isValidIanaTimeZone(timeZone: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -1,6 +1,6 @@
 # Tention Monthly Performance Report Extension
 
-Production foundation for creating correct, visual monthly performance reports for the Tention internal team. Phase 1A establishes the TypeScript monorepo, shared data contract, calendar-month rules, API health endpoint, and a minimal Chrome extension shell.
+Production foundation for creating correct, visual monthly performance reports for the Tention internal team. Phase 1B adds the report draft domain, validation, lifecycle, timezone-aware month completion, metadata rules, and development API endpoints.
 
 ## Architecture
 
@@ -18,6 +18,7 @@ The backend will eventually own provider credentials, validation, calculations, 
 - `apps/extension`: minimal Manifest V3 React extension.
 - `packages/report-schema`: Zod schemas and inferred TypeScript types.
 - `packages/report-core`: deterministic calendar-month helpers.
+- `packages/report-domain`: report draft services, validation, lifecycle, and repository abstraction.
 - `packages/api-client`: typed backend health client.
 - `docs`: product, data, report, and open-decision specifications.
 
@@ -41,6 +42,6 @@ The API defaults to `http://localhost:3000`. For extension development, run the 
 
 ## Current boundaries
 
-Klaviyo, Shopify, authentication, databases, queues, financial calculations, ranking formulas, AI analysis, screenshot capture, and PDF generation are intentionally absent. Their data semantics remain unresolved or belong to later phases.
+Klaviyo, Shopify, authentication, production persistence, queues, financial calculations, provider ranking formulas, AI analysis, binary screenshot capture, and PDF generation are intentionally absent. Their data semantics remain unresolved or belong to later phases.
 
 Read [AGENTS.md](./AGENTS.md) before changing reporting logic. Detailed requirements live in [docs/PRODUCT_SPEC.md](./docs/PRODUCT_SPEC.md), [docs/DATA_RULES.md](./docs/DATA_RULES.md), [docs/REPORT_SPEC.md](./docs/REPORT_SPEC.md), and [docs/OPEN_DECISIONS.md](./docs/OPEN_DECISIONS.md).
