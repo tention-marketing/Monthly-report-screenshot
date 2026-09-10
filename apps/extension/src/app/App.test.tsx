@@ -74,35 +74,36 @@ describe("extension report workflow", () => {
     await user.click(screen.getByRole("button", { name: "Load existing report" }));
     expect(await screen.findByRole("heading", { name: "Orion Supplements" })).toBeInTheDocument();
   });
-  it("opens a recent report and derives required, optional, and disabled checklist states", async () => {
+  it("shows compact required progress and keeps optional and disabled sections out of the runner", async () => {
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }));
     await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
     await screen.findByRole("heading", { name: "Orion Supplements" });
-    expect(screen.getByText("Required · Missing")).toBeInTheDocument();
+    expect(screen.getByText("0 / 1 required screenshots completed")).toBeInTheDocument();
+    expect(screen.getByText("Next required capture")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start Report" })).toBeInTheDocument();
     expect(screen.getByText("Optional")).toBeInTheDocument();
-    await user.click(screen.getByText("Disabled sections"));
-    expect(screen.getByText("Deliverability")).toBeInTheDocument();
+    expect(screen.queryByText("Deliverability")).toBeNull();
   });
-  it("offers capture only for screenshot-backed sections and warns before a non-Klaviyo capture", async () => {
+  it("starts the runner and gives a non-Klaviyo capture a manual fallback", async () => {
     const captureService: CaptureService = {
       getActiveTab: vi.fn().mockResolvedValue({ sourceUrl: "https://example.com/private", isKlaviyo: false }),
       captureVisibleTab: vi.fn(),
     };
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }), captureService);
     await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
-    expect(screen.getAllByRole("button", { name: "Capture" })).toHaveLength(2);
-    const analysis = screen.getByText("Analysis").closest("li")!;
-    expect(within(analysis).queryByRole("button", { name: "Capture" })).toBeNull();
-    await user.click(screen.getAllByRole("button", { name: "Capture" })[0]!);
-    await user.click(await screen.findByRole("button", { name: "Capture Current Tab" }));
+    await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(await screen.findByText("Step 1 of 1")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Period Correct — Capture" }));
     expect(await screen.findByText("This capture is intended for a Klaviyo page.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Capture anyway" })).toBeInTheDocument();
     expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
   });
-  it("renders readable validation errors", async () => {
+  it("keeps raw validation details out of the normal view and exposes them in Advanced / Debug", async () => {
     const validation = { status: "invalid" as const, errors: [{ code: "REQUIRED_SCREENSHOT_MISSING", severity: "error" as const, message: "Top Campaigns screenshot is missing." }], warnings: [] };
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]), validateReportDraft: vi.fn().mockResolvedValue(validation) }));
     await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    expect(screen.queryByText("REQUIRED_SCREENSHOT_MISSING")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
     await user.click(await screen.findByRole("button", { name: "Validate Report" }));
     expect(await screen.findByText("Top Campaigns screenshot is missing.")).toBeInTheDocument();
     expect(screen.getByText("REQUIRED_SCREENSHOT_MISSING")).toBeInTheDocument();
@@ -116,6 +117,7 @@ describe("extension report workflow", () => {
     });
     const user = userEvent.setup(); renderApp(api);
     await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
     await user.click(await screen.findByRole("button", { name: "Start Data Fetch" }));
     expect(await screen.findByText("This report was updated somewhere else.")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Reload Latest Version" }));

@@ -4,6 +4,8 @@ import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import { formatCalendarRange } from "../../lib/dates/month-options.js";
 import type { CaptureService, ActiveCaptureTab, CapturedImage } from "./capture-service.js";
 import { mapDisplayedCropToImage, selectionFromDrag, type CropRectangle } from "./crop-geometry.js";
+import { createSessionCropTemplateStore, denormalizeCrop, normalizeCrop, type CropTemplateStore } from "./crop-template-store.js";
+import type { KlaviyoNavigationService } from "../klaviyo-navigation/navigation-service.js";
 
 interface CaptureWorkflowProps {
   api: ApiClient;
@@ -11,6 +13,12 @@ interface CaptureWorkflowProps {
   report: ReportDraft;
   screenshotType: ScreenshotType;
   label: string;
+  navigationService: KlaviyoNavigationService;
+  klaviyoAccountUrl: string;
+  onKlaviyoAccountUrlChange(value: string): void;
+  step?: { current: number; total: number };
+  continueLabel?: string;
+  cropTemplateStore?: CropTemplateStore;
   onComplete(report: ReportDraft): void;
   onVersionConflict(): void;
   onCancel(): void;
@@ -18,7 +26,10 @@ interface CaptureWorkflowProps {
 
 type Stage = "instructions" | "crop" | "review";
 
-export function CaptureWorkflow({ api, captureService, report, screenshotType, label, onComplete, onVersionConflict, onCancel }: CaptureWorkflowProps) {
+export function CaptureWorkflow({
+  api, captureService, report, screenshotType, label, navigationService, klaviyoAccountUrl, onKlaviyoAccountUrlChange,
+  step, continueLabel = "Approve & Upload", cropTemplateStore = createSessionCropTemplateStore(), onComplete, onVersionConflict, onCancel,
+}: CaptureWorkflowProps) {
   const [stage, setStage] = useState<Stage>("instructions");
   const [activeTab, setActiveTab] = useState<ActiveCaptureTab | null>(null);
   const [captured, setCaptured] = useState<CapturedImage | null>(null);
@@ -30,6 +41,7 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
   const [periodConfirmed, setPeriodConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [navigationMessage, setNavigationMessage] = useState<string | null>(null);
   const dragStart = useRef<{ x: number; y: number } | null>(null);
   const previewUrl = useObjectUrl(croppedImage);
   const period = formatCalendarRange(report.period.startDate, report.period.endDate);
@@ -51,6 +63,15 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
       setCaptured(image); setSelection(null); setCroppedImage(null); setCroppedSize(null); setPeriodConfirmed(false); setStage("crop");
     } catch (caught) { setError(message(caught, "The current tab could not be captured.")); }
     finally { setBusy(false); }
+  }
+
+  async function openKlaviyoWorkspace() {
+    setBusy(true); setError(null); setNavigationMessage(null);
+    const result = await navigationService.openSection(screenshotType, klaviyoAccountUrl.trim() || null, report.period);
+    if (result.kind === "opened_workspace") setNavigationMessage(`Klaviyo workspace opened. ${result.target.manualInstruction} Then confirm the expected period before capturing.`);
+    if (result.kind === "account_context_required") setNavigationMessage(`Add the correct Klaviyo account URL, or open it manually. ${result.target.manualInstruction}`);
+    if (result.kind === "open_failed") setNavigationMessage(`${result.message} Open Klaviyo manually. ${result.target.manualInstruction}`);
+    setBusy(false);
   }
 
   function beginSelection(event: React.PointerEvent<HTMLDivElement>) {
@@ -80,6 +101,7 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
     try {
       const naturalCrop = mapDisplayedCropToImage(selection, displaySize.width, displaySize.height, naturalSize.width, naturalSize.height);
       setCroppedImage(await cropToPng(captured.dataUrl, naturalCrop));
+      cropTemplateStore.save(screenshotType, normalizeCrop(naturalCrop, naturalSize.width, naturalSize.height));
       setCroppedSize(naturalCrop); setStage("review");
     } catch (caught) { setError(message(caught, "The screenshot crop could not be created.")); }
     finally { setBusy(false); }
@@ -106,11 +128,14 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
   }
 
   if (stage === "instructions") return <main className="capture-workflow">
-    <section className="card report-hero"><p className="kicker">Capture {label}</p><h1>{report.client.name}</h1><p className="report-month">Expected report period: {period}</p></section>
-    <section className="card"><h2>Open the correct Klaviyo screen</h2><p className="support-copy">The extension captures only the currently visible tab. It does not navigate or read Klaviyo data.</p>
+    <section className="card report-hero"><p className="kicker">{step ? `Step ${step.current} of ${step.total}` : "Capture screenshot"}</p><h1>{label}</h1><p className="report-month">{report.client.name}</p><p className="support-copy">Expected report period: {period}</p></section>
+    <section className="card"><h2>Open the correct Klaviyo screen</h2><p className="support-copy">The extension can open a configured Klaviyo workspace, but it does not guess account IDs, provider routes, or dates. {" "}Verify the screen and selected month yourself.</p>
+      <label>Klaviyo account URL <input type="url" value={klaviyoAccountUrl} onChange={(event) => onKlaviyoAccountUrlChange(event.target.value)} placeholder="https://www.klaviyo.com/..." /></label>
+      <div className="actions"><button disabled={busy} onClick={() => void openKlaviyoWorkspace()}>{busy ? "Opening…" : "Open Klaviyo workspace"}</button></div>
+      {navigationMessage && <p className="notice warning-notice">{navigationMessage}</p>}
       {activeTab && <div className="notice warning-notice"><p>This capture is intended for a Klaviyo page.</p><small>Current tab: {hostLabel(activeTab.sourceUrl)}</small><button disabled={busy} onClick={() => void capture()}>Capture anyway</button></div>}
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <div className="actions"><button className="primary" disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Capture Current Tab"}</button><button onClick={onCancel}>Cancel</button></div>
+      <div className="actions"><button className="primary" disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Period Correct — Capture"}</button><button onClick={onCancel}>Back to report</button></div>
     </section>
   </main>;
 
@@ -120,11 +145,14 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
         <img src={captured.dataUrl} alt="Captured browser tab" draggable={false} onLoad={(event) => {
           const image = event.currentTarget; const bounds = image.getBoundingClientRect();
           setDisplaySize({ width: bounds.width, height: bounds.height }); setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
+          const saved = cropTemplateStore.get(screenshotType);
+          if (saved) setSelection(denormalizeCrop(saved, bounds.width, bounds.height));
         }} />
         {selection && <span className="crop-selection" style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }} />}
       </div>
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Cancel</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue"}</button></div>
+      <p className="support-copy">A saved crop suggestion may appear for this section. It is never approved automatically.</p>
+      <div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue"}</button></div>
     </section>
   </main>;
 
@@ -135,7 +163,7 @@ export function CaptureWorkflow({ api, captureService, report, screenshotType, l
       <label className="confirmation"><input type="checkbox" checked={periodConfirmed} onChange={(event) => setPeriodConfirmed(event.target.checked)} />I confirm this screenshot shows the selected report period.</label>
       <p className="support-copy">This is a human audit control; the extension does not verify dates from screenshot pixels.</p>
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <div className="actions"><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !periodConfirmed} onClick={() => void approveAndUpload()}>{busy ? "Uploading…" : "Approve & Upload"}</button></div>
+      <div className="actions"><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !periodConfirmed} onClick={() => void approveAndUpload()}>{busy ? "Uploading…" : continueLabel}</button></div>
     </section>
   </main>;
 }

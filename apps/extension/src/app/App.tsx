@@ -5,10 +5,12 @@ import {
   type ReportDraft, type ReportMonth, type ReportValidationState, type SectionConfiguration,
 } from "@tention/report-schema";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
-import { buildReportChecklist, summarizeChecklist } from "../features/report-checklist/checklist.js";
+import { buildReportChecklist } from "../features/report-checklist/checklist.js";
 import type { ChecklistItem } from "../features/report-checklist/checklist.js";
 import { CaptureWorkflow } from "../features/screenshot-capture/CaptureWorkflow.js";
 import { unavailableCaptureService, type CaptureService } from "../features/screenshot-capture/capture-service.js";
+import { getReportRunnerState } from "../features/report-runner/runner.js";
+import { unavailableKlaviyoNavigationService, type KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
 import {
   formatCalendarRange, formatReportMonth, getCompletedMonthOptions, normalizeSelectedMonth,
   parseMonthValue, toMonthValue,
@@ -23,9 +25,9 @@ const sectionLabels: Record<string, string> = {
   list_growth: "List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
 };
 
-export interface AppProps { api: ApiClient; captureService?: CaptureService; now?: () => Date }
+export interface AppProps { api: ApiClient; captureService?: CaptureService; navigationService?: KlaviyoNavigationService; now?: () => Date }
 
-export function App({ api, captureService = unavailableCaptureService, now = () => new Date() }: AppProps) {
+export function App({ api, captureService = unavailableCaptureService, navigationService = unavailableKlaviyoNavigationService, now = () => new Date() }: AppProps) {
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [recent, setRecent] = useState<ReportDraft[]>([]);
   const [report, setReport] = useState<ReportDraft | null>(null);
@@ -57,7 +59,7 @@ export function App({ api, captureService = unavailableCaptureService, now = () 
     {connection === "unavailable" && <section className="notice error-notice"><p>The reporting API could not be reached.</p><button onClick={() => void connect()}>Retry connection</button></section>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
     {loadingReport ? <p className="loading">Loading report…</p> : report
-      ? <ReportDetail api={api} captureService={captureService} report={report} onReport={setReport} />
+      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} report={report} onReport={setReport} />
       : <Home api={api} connected={connection === "connected"} recent={recent} now={now} onCreated={(created) => { setReport(created); setRecent((items) => [created, ...items]); }} onOpen={openReport} />}
   </div>;
 }
@@ -135,17 +137,24 @@ function RecentReports({ reports, onOpen }: { reports: ReportDraft[]; onOpen(id:
   return <section className="card"><h2>Recent Reports</h2>{reports.length === 0 ? <p className="empty">No reports yet.</p> : <ul className="recent-list">{reports.map((report) => <li key={report.id}><button onClick={() => onOpen(report.id)}><strong>{report.client.name}</strong><span>{formatReportMonth(report.reportMonth)} · {humanize(report.status)}</span><small>Updated {new Date(report.updatedAt).toLocaleString()}</small></button></li>)}</ul>}</section>;
 }
 
-function ReportDetail({ api, captureService, report, onReport }: { api: ApiClient; captureService: CaptureService; report: ReportDraft; onReport(report: ReportDraft): void }) {
+function ReportDetail({ api, captureService, navigationService, report, onReport }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; report: ReportDraft; onReport(report: ReportDraft): void }) {
   const [validation, setValidation] = useState<ReportValidationState>(report.validation);
   const [history, setHistory] = useState<Awaited<ReturnType<ApiClient["getReportHistory"]>>>([]);
   const [busy, setBusy] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [conflict, setConflict] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [captureItem, setCaptureItem] = useState<ChecklistItem | null>(null);
-  const [viewedImage, setViewedImage] = useState<string | null>(null);
+  const [runnerStarted, setRunnerStarted] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [klaviyoAccountUrl, setKlaviyoAccountUrl] = useState(() => loadKlaviyoAccountUrl(report.id));
   const checklist = buildReportChecklist(report);
-  const summary = summarizeChecklist(checklist);
+  const runner = getReportRunnerState(report);
+  const optional = checklist.filter(({ requirement, screenshotType }) => requirement === "optional" && screenshotType !== null);
+
+  useEffect(() => { setValidation(report.validation); }, [report]);
+  useEffect(() => { saveKlaviyoAccountUrl(report.id, klaviyoAccountUrl); }, [report.id, klaviyoAccountUrl]);
 
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
@@ -153,8 +162,6 @@ function ReportDetail({ api, captureService, report, onReport }: { api: ApiClien
     catch { setActionError("Lifecycle history could not be loaded."); }
     finally { setHistoryLoading(false); }
   }, [api, report.id]);
-  useEffect(() => { void loadHistory(); }, [loadHistory]);
-  useEffect(() => () => { if (viewedImage) URL.revokeObjectURL(viewedImage); }, [viewedImage]);
 
   async function validate() {
     setBusy(true); setActionError(null);
@@ -164,7 +171,7 @@ function ReportDetail({ api, captureService, report, onReport }: { api: ApiClien
   }
   async function applyEvent(event: ReportMutationEvent) {
     setBusy(true); setConflict(false); setActionError(null);
-    try { const updated = await api.applyEvent(report.id, event, report.version); onReport(updated); setValidation(updated.validation); await loadHistory(); }
+    try { const updated = await api.applyEvent(report.id, event, report.version); onReport(updated); setValidation(updated.validation); if (advancedOpen) await loadHistory(); }
     catch (caught) {
       if (caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT") setConflict(true);
       else setActionError(caught instanceof ApiError ? caught.message : "Lifecycle action failed.");
@@ -176,37 +183,73 @@ function ReportDetail({ api, captureService, report, onReport }: { api: ApiClien
     catch { setActionError("Latest report version could not be loaded."); }
     finally { setBusy(false); }
   }
-  async function viewScreenshot(item: ChecklistItem) {
-    if (!item.screenshotType) return;
-    setBusy(true); setActionError(null);
-    try { setViewedImage(URL.createObjectURL(await api.getScreenshotImage(report.id, item.screenshotType))); }
-    catch (caught) { setActionError(caught instanceof ApiError ? caught.message : "Screenshot preview could not be loaded."); }
-    finally { setBusy(false); }
+  function startRunner() {
+    if (!runner.next) { setReviewOpen(true); return; }
+    setRunnerStarted(true); setCaptureItem(runner.next);
+  }
+  function selectManualCapture(item: ChecklistItem) { setRunnerStarted(false); setCaptureItem(item); }
+  function toggleAdvanced() {
+    const next = !advancedOpen; setAdvancedOpen(next);
+    if (next && history.length === 0) void loadHistory();
   }
 
   if (captureItem?.screenshotType) return <CaptureWorkflow
-    api={api} captureService={captureService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
-    onComplete={(updated) => { onReport(updated); setValidation(updated.validation); setCaptureItem(null); }}
-    onVersionConflict={() => { setCaptureItem(null); setConflict(true); }} onCancel={() => setCaptureItem(null)}
+    api={api} captureService={captureService} navigationService={navigationService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
+    klaviyoAccountUrl={klaviyoAccountUrl} onKlaviyoAccountUrlChange={setKlaviyoAccountUrl}
+    {...(runnerStarted ? { step: { current: runner.required.findIndex(({ section }) => section === captureItem.section) + 1, total: runner.required.length } } : {})}
+    continueLabel={runnerStarted ? "Confirm & Continue" : "Approve & Upload"}
+    onComplete={(updated) => {
+      onReport(updated); setValidation(updated.validation);
+      const next = getReportRunnerState(updated).next;
+      if (runnerStarted && next) setCaptureItem(next);
+      else { setCaptureItem(null); setRunnerStarted(false); }
+    }}
+    onVersionConflict={() => { setCaptureItem(null); setRunnerStarted(false); setConflict(true); }} onCancel={() => { setCaptureItem(null); setRunnerStarted(false); }}
   />;
+
+  if (reviewOpen) return <CaptureReview api={api} report={report} items={runner.required} onBack={() => setReviewOpen(false)} onRetake={(item) => { setReviewOpen(false); selectManualCapture(item); }} />;
 
   return <main>
     <section className="card report-hero"><p className="kicker">Monthly report</p><h1>{report.client.name}</h1><p className="report-month">{formatReportMonth(report.reportMonth)}</p>
       <div className="period-preview"><span>Reporting Period<strong>{formatCalendarRange(report.period.startDate, report.period.endDate)}</strong></span><span>Previous Comparison<strong>{formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}</strong></span></div>
-      <div className="metadata"><span>Status<strong>{humanize(report.status)}</strong></span><span>Version<strong>{report.version}</strong></span><span>Updated<strong>{new Date(report.updatedAt).toLocaleString()}</strong></span></div>
+      <p className="progress-copy">{runner.completed} / {runner.required.length} required screenshots completed</p>
+      {runner.isComplete ? <button className="primary" onClick={() => setReviewOpen(true)}>Review Report</button> : <button className="primary" onClick={startRunner}>Start Report</button>}
     </section>
-    <section className="card"><div className="section-heading"><h2>Report Checklist</h2><span className="count">{summary.requiredComplete} / {summary.requiredTotal} required</span></div>
-      <ul className="checklist">{checklist.filter(({ state }) => state !== "disabled").map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.state === "unapproved" ? "◐" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{item.screenshotType && (item.state === "approved" ? <span className="check-actions"><button disabled={busy} onClick={() => void viewScreenshot(item)}>View</button><button disabled={busy} onClick={() => setCaptureItem(item)}>Retake</button></span> : <button disabled={busy} onClick={() => setCaptureItem(item)}>Capture</button>)}</li>)}</ul>
-      {checklist.some(({ state }) => state === "disabled") && <details><summary>Disabled sections</summary><p>{checklist.filter(({ state }) => state === "disabled").map(({ label }) => label).join(", ")}</p></details>}
-      <div className="validation-summary"><span>Errors <strong>{validation.errors.length}</strong></span><span>Warnings <strong>{validation.warnings.length}</strong></span></div>
-      <button className="primary" disabled={busy} onClick={() => void validate()}>{busy ? "Working…" : "Validate Report"}</button>
-      {(validation.errors.length > 0 || validation.warnings.length > 0) && <ul className="issues">{[...validation.errors, ...validation.warnings].map((issue, index) => <li key={`${issue.code}-${index}`} className={issue.severity}><strong>{issue.severity.toUpperCase()}</strong><span>{issue.message}<small>{issue.code}</small></span></li>)}</ul>}
+    <section className="card"><div className="section-heading"><h2>Report Progress</h2><span className="count">{runner.completed} / {runner.required.length} completed</span></div>
+      <ul className="checklist runner-checklist">{runner.required.map((item) => <li key={item.section} className={item.section === runner.next?.section ? "current-step" : ""}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.section === runner.next?.section ? "→" : "○"}</span><span><strong>{item.label}</strong><small>{item.section === runner.next?.section ? "Next required capture" : checklistText(item.state, item.requirement)}</small></span>{item.state === "approved" && <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button>}</li>)}</ul>
     </section>
+    {optional.length > 0 && <details className="card optional-sections"><summary>Optional Sections · {optional.length} available</summary><ul className="checklist">{optional.map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{item.state === "approved" ? <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button> : <button disabled={busy} onClick={() => selectManualCapture(item)}>Capture</button>}</li>)}</ul></details>}
     {conflict && <section role="alert" className="card conflict"><h2>This report was updated somewhere else.</h2><p>Reload the latest version before deciding what to do next.</p><button onClick={() => void reload()}>Reload Latest Version</button></section>}
     {actionError && <p role="alert" className="notice error-notice">{actionError}</p>}
-    {viewedImage && <section className="card screenshot-view"><div className="section-heading"><h2>Stored Screenshot</h2><button onClick={() => setViewedImage(null)}>Close</button></div><img src={viewedImage} alt="Stored report screenshot" /></section>}
-    <section className="card"><h2>Development workflow</h2><p className="support-copy">These actions test report states only. Provider fetching and PDF generation are not implemented.</p><div className="actions">{lifecycleActions(report.status).map(([event, label]) => <button key={event} disabled={busy} onClick={() => void applyEvent(event)}>{label}</button>)}</div></section>
-    <section className="card"><h2>History</h2>{historyLoading ? <p>Loading history…</p> : history.length === 0 ? <p className="empty">No history available.</p> : <ol className="history">{history.map((entry) => <li key={entry.id}><time>{new Date(entry.createdAt).toLocaleString()}</time><strong>{entry.eventType}</strong><span>{entry.fromStatus ?? "—"} → {entry.toStatus} · Version {entry.reportVersion}</span></li>)}</ol>}</section>
+    <section className="card advanced"><button className="text-button" aria-expanded={advancedOpen} onClick={toggleAdvanced}>{advancedOpen ? "Hide Advanced / Debug" : "Show Advanced / Debug"}</button>
+      {advancedOpen && <div className="advanced-content"><p className="support-copy">Technical report state and validation details. These controls are not part of the capture workflow.</p>
+        <div className="metadata"><span>Status<strong>{humanize(report.status)}</strong></span><span>Version<strong>{report.version}</strong></span><span>Updated<strong>{new Date(report.updatedAt).toLocaleString()}</strong></span></div>
+        <div className="validation-summary"><span>Errors <strong>{validation.errors.length}</strong></span><span>Warnings <strong>{validation.warnings.length}</strong></span></div>
+        <button disabled={busy} onClick={() => void validate()}>{busy ? "Working…" : "Validate Report"}</button>
+        {(validation.errors.length > 0 || validation.warnings.length > 0) && <ul className="issues">{[...validation.errors, ...validation.warnings].map((issue, index) => <li key={`${issue.code}-${index}`} className={issue.severity}><strong>{issue.severity.toUpperCase()}</strong><span>{issue.message}<small>{issue.code}</small></span></li>)}</ul>}
+        <section><h2>Development workflow</h2><div className="actions">{lifecycleActions(report.status).map(([event, label]) => <button key={event} disabled={busy} onClick={() => void applyEvent(event)}>{label}</button>)}</div></section>
+        <section><h2>History</h2>{historyLoading ? <p>Loading history…</p> : history.length === 0 ? <p className="empty">No history available.</p> : <ol className="history">{history.map((entry) => <li key={entry.id}><time>{new Date(entry.createdAt).toLocaleString()}</time><strong>{entry.eventType}</strong><span>{entry.fromStatus ?? "—"} → {entry.toStatus} · Version {entry.reportVersion}</span></li>)}</ol>}</section>
+      </div>}
+    </section>
+  </main>;
+}
+
+function CaptureReview({ api, report, items, onBack, onRetake }: { api: ApiClient; report: ReportDraft; items: ChecklistItem[]; onBack(): void; onRetake(item: ChecklistItem): void }) {
+  const [images, setImages] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let active = true; const urls: string[] = [];
+    void Promise.all(items.map(async (item) => {
+      if (!item.screenshotType) return;
+      const url = URL.createObjectURL(await api.getScreenshotImage(report.id, item.screenshotType));
+      urls.push(url); if (active) setImages((current) => ({ ...current, [item.section]: url }));
+    })).catch(() => { if (active) setError("One or more stored screenshots could not be loaded."); });
+    return () => { active = false; urls.forEach((url) => URL.revokeObjectURL(url)); };
+  }, [api, items, report.id]);
+  return <main><section className="card report-hero"><p className="kicker">Capture review</p><h1>All required screenshots captured ✓</h1><p className="support-copy">Review each stored image before moving on. PDF generation is not available in this phase.</p></section>
+    {error && <p role="alert" className="notice error-notice">{error}</p>}
+    <section className="card review-grid">{items.map((item) => <article key={item.section}><h2>{item.label}</h2>{images[item.section] ? <img src={images[item.section]} alt={`Stored ${item.label} screenshot`} /> : <p className="support-copy">Loading screenshot…</p>}<button onClick={() => onRetake(item)}>Retake</button></article>)}</section>
+    <div className="actions"><button className="primary" onClick={onBack}>Complete Capture Review</button><button onClick={onBack}>Back to report</button></div>
   </main>;
 }
 
@@ -232,4 +275,15 @@ function checklistText(state: string, requirement: string): string {
   if (state === "unapproved") return "Captured — Approval required";
   if (state === "not_required") return "No screenshot required";
   return requirement === "required" ? "Required · Missing" : "Optional";
+}
+function klaviyoAccountUrlKey(reportId: string): string { return `tention.klaviyo-account-url.${reportId}`; }
+function loadKlaviyoAccountUrl(reportId: string): string {
+  try { return sessionStorage.getItem(klaviyoAccountUrlKey(reportId)) ?? ""; }
+  catch { return ""; }
+}
+function saveKlaviyoAccountUrl(reportId: string, value: string): void {
+  try {
+    if (value.trim()) sessionStorage.setItem(klaviyoAccountUrlKey(reportId), value.trim());
+    else sessionStorage.removeItem(klaviyoAccountUrlKey(reportId));
+  } catch { /* Session storage is a convenience, never a report-data dependency. */ }
 }

@@ -69,7 +69,7 @@ In Chrome, open `chrome://extensions`, enable **Developer mode**, choose **Load 
 
 The `activeTab` permission is used only after the employee clicks **Capture Current Tab**. It temporarily permits inspecting the active URL and capturing its visible PNG without broad `tabs`, `scripting`, or Klaviyo host permissions.
 
-The Phase 1E workspace adds user-initiated visible-tab PNG capture, manual crop, explicit report-period confirmation, approved-asset upload, retrieval, replacement, and development-only local filesystem storage. Human confirmation is an audit control; it is not machine verification of screenshot pixels. Provider fetching, OCR, automatic Klaviyo navigation, and PDF generation remain unimplemented.
+The Phase 1E workspace adds user-initiated visible-tab PNG capture, manual crop, explicit report-period confirmation, approved-asset upload, retrieval, replacement, and development-only local filesystem storage. Phase 1E.1 adds a required-section report runner plus an optional, session-scoped Klaviyo account URL opener. The opener uses Chrome's tab creation API and does not require provider host access, script injection, selectors, or a guessed Klaviyo route. `activeTab` remains limited to the employee-initiated current-tab inspection and PNG capture; the localhost host permission remains limited to the local API. Human confirmation is an audit control; it is not machine verification of screenshot pixels. Provider fetching, date automation, OCR, and PDF generation remain unimplemented.
 
 Real PostgreSQL integration tests require a dedicated `TEST_DATABASE_URL` whose database name contains `test`. These tests clear their dedicated test tables.
 
