@@ -3,6 +3,7 @@
   "name": "Tention Reports",
   "version": "0.1.0",
   "description": "Tention monthly performance reporting workspace.",
+  "permissions": ["activeTab"],
   "host_permissions": ["http://127.0.0.1:3000/*"],
   "action": { "default_title": "Tention Reports", "default_popup": "index.html" }
 }

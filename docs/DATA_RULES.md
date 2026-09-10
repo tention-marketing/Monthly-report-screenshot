@@ -32,13 +32,13 @@ The backend derives `startDate`, `endDate`, `previousStartDate`, and `previousEn
 - A report month must be complete in the client's IANA timezone.
 - Stored period boundaries must match the report month.
 - Unknown section keys are errors.
-- Required screenshot-backed sections need matching, approved metadata.
+- Required screenshot-backed sections need matching, approved PNG asset metadata and explicit human period confirmation.
 - Optional screenshots may be absent; when present, their metadata must still match.
 - Disabled-section screenshot metadata creates a warning.
 - Duplicate screenshot types and client/month mismatches are errors.
 - Errors block review submission; warnings do not.
 
-Screenshot metadata proves only that the system recorded a client, report month, and screenshot type. It does not prove that the screenshot pixels visibly show that client or month. Visual date-range verification belongs to later extension work.
+Screenshot metadata proves only that the system recorded a client, report month, screenshot type, PNG asset hash, and storage key. It does not prove that the screenshot pixels visibly show that client or month. Phase 1E requires an employee to explicitly confirm the selected report period before upload; this is an audit control, not machine pixel verification.
 
 ## Stable validation issue codes
 
@@ -50,6 +50,8 @@ Screenshot metadata proves only that the system recorded a client, report month,
 - `SCREENSHOT_TYPE_MISMATCH`
 - `REQUIRED_SCREENSHOT_MISSING`
 - `REQUIRED_SCREENSHOT_UNAPPROVED`
+- `REQUIRED_SCREENSHOT_PERIOD_UNCONFIRMED`
+- `REQUIRED_SCREENSHOT_ASSET_MISSING`
 - `DUPLICATE_SCREENSHOT_TYPE`
 - `DISABLED_SECTION_SCREENSHOT_PRESENT`
 - `UNKNOWN_SECTION_CONFIGURATION`

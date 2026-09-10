@@ -6,6 +6,9 @@ import {
 } from "@tention/report-schema";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
 import { buildReportChecklist, summarizeChecklist } from "../features/report-checklist/checklist.js";
+import type { ChecklistItem } from "../features/report-checklist/checklist.js";
+import { CaptureWorkflow } from "../features/screenshot-capture/CaptureWorkflow.js";
+import { unavailableCaptureService, type CaptureService } from "../features/screenshot-capture/capture-service.js";
 import {
   formatCalendarRange, formatReportMonth, getCompletedMonthOptions, normalizeSelectedMonth,
   parseMonthValue, toMonthValue,
@@ -20,9 +23,9 @@ const sectionLabels: Record<string, string> = {
   list_growth: "List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
 };
 
-export interface AppProps { api: ApiClient; now?: () => Date }
+export interface AppProps { api: ApiClient; captureService?: CaptureService; now?: () => Date }
 
-export function App({ api, now = () => new Date() }: AppProps) {
+export function App({ api, captureService = unavailableCaptureService, now = () => new Date() }: AppProps) {
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [recent, setRecent] = useState<ReportDraft[]>([]);
   const [report, setReport] = useState<ReportDraft | null>(null);
@@ -54,7 +57,7 @@ export function App({ api, now = () => new Date() }: AppProps) {
     {connection === "unavailable" && <section className="notice error-notice"><p>The reporting API could not be reached.</p><button onClick={() => void connect()}>Retry connection</button></section>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
     {loadingReport ? <p className="loading">Loading report…</p> : report
-      ? <ReportDetail api={api} report={report} onReport={setReport} />
+      ? <ReportDetail api={api} captureService={captureService} report={report} onReport={setReport} />
       : <Home api={api} connected={connection === "connected"} recent={recent} now={now} onCreated={(created) => { setReport(created); setRecent((items) => [created, ...items]); }} onOpen={openReport} />}
   </div>;
 }
@@ -132,13 +135,15 @@ function RecentReports({ reports, onOpen }: { reports: ReportDraft[]; onOpen(id:
   return <section className="card"><h2>Recent Reports</h2>{reports.length === 0 ? <p className="empty">No reports yet.</p> : <ul className="recent-list">{reports.map((report) => <li key={report.id}><button onClick={() => onOpen(report.id)}><strong>{report.client.name}</strong><span>{formatReportMonth(report.reportMonth)} · {humanize(report.status)}</span><small>Updated {new Date(report.updatedAt).toLocaleString()}</small></button></li>)}</ul>}</section>;
 }
 
-function ReportDetail({ api, report, onReport }: { api: ApiClient; report: ReportDraft; onReport(report: ReportDraft): void }) {
+function ReportDetail({ api, captureService, report, onReport }: { api: ApiClient; captureService: CaptureService; report: ReportDraft; onReport(report: ReportDraft): void }) {
   const [validation, setValidation] = useState<ReportValidationState>(report.validation);
   const [history, setHistory] = useState<Awaited<ReturnType<ApiClient["getReportHistory"]>>>([]);
   const [busy, setBusy] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [conflict, setConflict] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [captureItem, setCaptureItem] = useState<ChecklistItem | null>(null);
+  const [viewedImage, setViewedImage] = useState<string | null>(null);
   const checklist = buildReportChecklist(report);
   const summary = summarizeChecklist(checklist);
 
@@ -149,6 +154,7 @@ function ReportDetail({ api, report, onReport }: { api: ApiClient; report: Repor
     finally { setHistoryLoading(false); }
   }, [api, report.id]);
   useEffect(() => { void loadHistory(); }, [loadHistory]);
+  useEffect(() => () => { if (viewedImage) URL.revokeObjectURL(viewedImage); }, [viewedImage]);
 
   async function validate() {
     setBusy(true); setActionError(null);
@@ -170,6 +176,19 @@ function ReportDetail({ api, report, onReport }: { api: ApiClient; report: Repor
     catch { setActionError("Latest report version could not be loaded."); }
     finally { setBusy(false); }
   }
+  async function viewScreenshot(item: ChecklistItem) {
+    if (!item.screenshotType) return;
+    setBusy(true); setActionError(null);
+    try { setViewedImage(URL.createObjectURL(await api.getScreenshotImage(report.id, item.screenshotType))); }
+    catch (caught) { setActionError(caught instanceof ApiError ? caught.message : "Screenshot preview could not be loaded."); }
+    finally { setBusy(false); }
+  }
+
+  if (captureItem?.screenshotType) return <CaptureWorkflow
+    api={api} captureService={captureService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
+    onComplete={(updated) => { onReport(updated); setValidation(updated.validation); setCaptureItem(null); }}
+    onVersionConflict={() => { setCaptureItem(null); setConflict(true); }} onCancel={() => setCaptureItem(null)}
+  />;
 
   return <main>
     <section className="card report-hero"><p className="kicker">Monthly report</p><h1>{report.client.name}</h1><p className="report-month">{formatReportMonth(report.reportMonth)}</p>
@@ -177,7 +196,7 @@ function ReportDetail({ api, report, onReport }: { api: ApiClient; report: Repor
       <div className="metadata"><span>Status<strong>{humanize(report.status)}</strong></span><span>Version<strong>{report.version}</strong></span><span>Updated<strong>{new Date(report.updatedAt).toLocaleString()}</strong></span></div>
     </section>
     <section className="card"><div className="section-heading"><h2>Report Checklist</h2><span className="count">{summary.requiredComplete} / {summary.requiredTotal} required</span></div>
-      <ul className="checklist">{checklist.filter(({ state }) => state !== "disabled").map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.state === "unapproved" ? "◐" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{item.screenshotType && <button disabled title="Screenshot capture arrives in Phase 1E">Capture — Coming next</button>}</li>)}</ul>
+      <ul className="checklist">{checklist.filter(({ state }) => state !== "disabled").map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.state === "unapproved" ? "◐" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{item.screenshotType && (item.state === "approved" ? <span className="check-actions"><button disabled={busy} onClick={() => void viewScreenshot(item)}>View</button><button disabled={busy} onClick={() => setCaptureItem(item)}>Retake</button></span> : <button disabled={busy} onClick={() => setCaptureItem(item)}>Capture</button>)}</li>)}</ul>
       {checklist.some(({ state }) => state === "disabled") && <details><summary>Disabled sections</summary><p>{checklist.filter(({ state }) => state === "disabled").map(({ label }) => label).join(", ")}</p></details>}
       <div className="validation-summary"><span>Errors <strong>{validation.errors.length}</strong></span><span>Warnings <strong>{validation.warnings.length}</strong></span></div>
       <button className="primary" disabled={busy} onClick={() => void validate()}>{busy ? "Working…" : "Validate Report"}</button>
@@ -185,6 +204,7 @@ function ReportDetail({ api, report, onReport }: { api: ApiClient; report: Repor
     </section>
     {conflict && <section role="alert" className="card conflict"><h2>This report was updated somewhere else.</h2><p>Reload the latest version before deciding what to do next.</p><button onClick={() => void reload()}>Reload Latest Version</button></section>}
     {actionError && <p role="alert" className="notice error-notice">{actionError}</p>}
+    {viewedImage && <section className="card screenshot-view"><div className="section-heading"><h2>Stored Screenshot</h2><button onClick={() => setViewedImage(null)}>Close</button></div><img src={viewedImage} alt="Stored report screenshot" /></section>}
     <section className="card"><h2>Development workflow</h2><p className="support-copy">These actions test report states only. Provider fetching and PDF generation are not implemented.</p><div className="actions">{lifecycleActions(report.status).map(([event, label]) => <button key={event} disabled={busy} onClick={() => void applyEvent(event)}>{label}</button>)}</div></section>
     <section className="card"><h2>History</h2>{historyLoading ? <p>Loading history…</p> : history.length === 0 ? <p className="empty">No history available.</p> : <ol className="history">{history.map((entry) => <li key={entry.id}><time>{new Date(entry.createdAt).toLocaleString()}</time><strong>{entry.eventType}</strong><span>{entry.fromStatus ?? "—"} → {entry.toStatus} · Version {entry.reportVersion}</span></li>)}</ol>}</section>
   </main>;

@@ -20,7 +20,8 @@ function overview(overrides: Partial<ScreenshotRecord> = {}): ScreenshotRecord {
   return {
     id: "shot-1", clientId: "client-1", reportMonth: { year: 2026, month: 8 },
     type: "overview", capturedAt: now.toISOString(), sourceUrl: "https://example.com/report",
-    width: 1440, height: 720, approved: true, storageLocation: null, ...overrides,
+    width: 1440, height: 720, approved: true, storageKey: "reports/11111111-1111-4111-8111-111111111111/overview/22222222-2222-4222-8222-222222222222.png",
+    mimeType: "image/png", byteSize: 100, sha256: "a".repeat(64), approvedAt: now.toISOString(), periodConfirmed: true, ...overrides,
   };
 }
 
@@ -29,6 +30,12 @@ describe("report validation", () => {
     expect(validateReportDraft(draft(), { now }).errors.map(({ code }) => code)).toContain("REQUIRED_SCREENSHOT_MISSING");
     const withShot = { ...draft(), screenshots: [overview({ approved: false })] };
     expect(validateReportDraft(withShot, { now }).errors.map(({ code }) => code)).toContain("REQUIRED_SCREENSHOT_UNAPPROVED");
+  });
+  it("requires human period confirmation and stored PNG asset metadata", () => {
+    const unconfirmed = { ...draft(), screenshots: [overview({ periodConfirmed: false })] };
+    expect(validateReportDraft(unconfirmed, { now }).errors.map(({ code }) => code)).toContain("REQUIRED_SCREENSHOT_PERIOD_UNCONFIRMED");
+    const withoutAsset = { ...draft(), screenshots: [overview({ storageKey: null, sha256: null })] };
+    expect(validateReportDraft(withoutAsset, { now }).errors.map(({ code }) => code)).toContain("REQUIRED_SCREENSHOT_ASSET_MISSING");
   });
   it("allows a missing optional screenshot", () => expect(validateReportDraft(draft({ executive_summary: "optional" }), { now }).status).toBe("valid"));
   it("warns when a disabled section has a screenshot", () => {

@@ -48,6 +48,7 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .checklist li { display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 11px 0; }
 .checklist li > span:nth-child(2) { display: grid; gap: 2px; }
 .checklist button { padding: 5px 7px; border: 1px solid #d3d5d2; border-radius: 7px; background: #f7f7f5; font-size: 10px; }
+.check-actions { display: flex; gap: 5px; }
 .check-icon { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; background: #eceeeb; font-weight: 900; }
 .check-icon.approved { color: #fff; background: #248259; }
 .check-icon.unapproved { color: #835b0c; background: #fff0c7; }
@@ -58,8 +59,21 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .issues .error > strong { color: #a62b21; }
 .issues .warning > strong { color: #8a650e; }
 .conflict { border-color: #e8b45d; background: #fff9ec; }
+.warning-notice { margin: 12px 0; border: 1px solid #ecd28d; color: #6d5208; background: #fff9e8; }
+.warning-notice button { margin-top: 8px; padding: 7px 9px; border: 1px solid #b99d50; border-radius: 7px; background: #fff; font-weight: 700; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .actions button, .conflict button, .error-notice button { padding: 8px 10px; border: 1px solid #adb5b0; border-radius: 8px; background: #fff; font-weight: 700; }
+.capture-workflow { padding-bottom: 24px; }
+.crop-image { position: relative; margin: 14px 0; line-height: 0; touch-action: none; user-select: none; }
+.crop-image img, .crop-preview, .screenshot-view img { display: block; width: 100%; max-height: 65vh; object-fit: contain; border: 1px solid #deddd7; border-radius: 8px; background: #f5f5f3; }
+.crop-selection { position: absolute; border: 2px solid #1e6148; background: rgba(30, 97, 72, .16); pointer-events: none; }
+.capture-details { display: grid; gap: 8px; margin: 14px 0; }
+.capture-details div { display: grid; grid-template-columns: 96px 1fr; gap: 8px; font-size: 12px; }
+.capture-details dt { color: #68706c; font-weight: 700; }
+.capture-details dd { margin: 0; overflow-wrap: anywhere; }
+.confirmation { display: flex; grid-template-columns: none; align-items: flex-start; gap: 8px; margin: 14px 0 8px; font-size: 13px; }
+.confirmation input { width: 18px; min-height: 18px; margin: 0; }
+.screenshot-view { display: grid; gap: 10px; }
 .history { display: grid; gap: 13px; }
 .history li { display: grid; gap: 3px; padding-left: 11px; border-left: 2px solid #b7c9c0; font-size: 12px; }
 .history time, .history span { color: #68706c; font-size: 11px; }

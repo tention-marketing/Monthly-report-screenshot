@@ -66,7 +66,8 @@ suite("PostgresReportDraftRepository with real PostgreSQL", () => {
     const updated = upsertScreenshotMetadata(initial, {
       id: "shot-1", clientId: "client-1", reportMonth: initial.reportMonth, type: "overview",
       capturedAt: now.toISOString(), sourceUrl: "https://example.com", width: 100, height: 100,
-      approved: true, storageLocation: null,
+      approved: true, storageKey: "reports/11111111-1111-4111-8111-111111111111/overview/22222222-2222-4222-8222-222222222222.png",
+      mimeType: "image/png", byteSize: 100, sha256: "a".repeat(64), approvedAt: now.toISOString(), periodConfirmed: true,
     }, "overview", { now });
     const results = await Promise.allSettled([repository.save(updated, 1), repository.save(updated, 1)]);
     expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);

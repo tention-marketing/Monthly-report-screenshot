@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
 import type { ReportDraft } from "@tention/report-schema";
+import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
 import { App } from "./App.js";
 
 const NOW = new Date("2026-09-09T12:00:00Z");
@@ -24,12 +25,13 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
     listReportDrafts: vi.fn().mockResolvedValue([]),
     validateReportDraft: vi.fn().mockResolvedValue(report.validation),
     getReportHistory: vi.fn().mockResolvedValue([]),
-    upsertScreenshot: vi.fn().mockResolvedValue(report),
+    uploadScreenshotImage: vi.fn().mockResolvedValue(report),
+    getScreenshotImage: vi.fn().mockResolvedValue(new Blob()),
     applyEvent: vi.fn().mockResolvedValue({ ...report, status: "data_fetching", version: 2 }),
     ...overrides,
   } as ApiClient;
 }
-const renderApp = (api: ApiClient) => render(<App api={api} now={() => new Date(NOW)} />);
+const renderApp = (api: ApiClient, captureService?: CaptureService) => render(<App api={api} {...(captureService ? { captureService } : {})} now={() => new Date(NOW)} />);
 
 describe("extension report workflow", () => {
   it("shows API unavailable state and retry", async () => {
@@ -80,6 +82,22 @@ describe("extension report workflow", () => {
     expect(screen.getByText("Optional")).toBeInTheDocument();
     await user.click(screen.getByText("Disabled sections"));
     expect(screen.getByText("Deliverability")).toBeInTheDocument();
+  });
+  it("offers capture only for screenshot-backed sections and warns before a non-Klaviyo capture", async () => {
+    const captureService: CaptureService = {
+      getActiveTab: vi.fn().mockResolvedValue({ sourceUrl: "https://example.com/private", isKlaviyo: false }),
+      captureVisibleTab: vi.fn(),
+    };
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }), captureService);
+    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    expect(screen.getAllByRole("button", { name: "Capture" })).toHaveLength(2);
+    const analysis = screen.getByText("Analysis").closest("li")!;
+    expect(within(analysis).queryByRole("button", { name: "Capture" })).toBeNull();
+    await user.click(screen.getAllByRole("button", { name: "Capture" })[0]!);
+    await user.click(await screen.findByRole("button", { name: "Capture Current Tab" }));
+    expect(await screen.findByText("This capture is intended for a Klaviyo page.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Capture anyway" })).toBeInTheDocument();
+    expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
   });
   it("renders readable validation errors", async () => {
     const validation = { status: "invalid" as const, errors: [{ code: "REQUIRED_SCREENSHOT_MISSING", severity: "error" as const, message: "Top Campaigns screenshot is missing." }], warnings: [] };

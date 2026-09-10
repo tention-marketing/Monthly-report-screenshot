@@ -42,4 +42,4 @@ Not every client requires every section. Each report draft carries its own secti
 
 The report should be visual, easy to skim, friendly to tightly cropped screenshots, and free of long text blocks and accidental blank pages. Structured validated data supplies numeric values; approved screenshots supply visual context. AI narrative, if enabled later, receives only validated data.
 
-PDF rendering, binary screenshot capture, preview, template versioning, and finalization are not implemented in Phase 1B.
+Phase 1E supports user-initiated visible-tab PNG capture, manual crop, explicit human period confirmation, review, replacement, and local development storage. It does not use OCR, pixel interpretation, or automatic Klaviyo navigation. PDF rendering, template versioning, and finalization remain unimplemented.

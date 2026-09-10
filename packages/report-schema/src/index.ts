@@ -80,11 +80,16 @@ export const screenshotRecordSchema = z.object({
   reportMonth: reportMonthSchema,
   type: screenshotTypeSchema,
   capturedAt: z.string().datetime({ offset: true }),
-  sourceUrl: z.string().url(),
+  sourceUrl: z.string().url().nullable(),
   width: z.number().int().positive(),
   height: z.number().int().positive(),
   approved: z.boolean(),
-  storageLocation: z.string().min(1).nullable(),
+  storageKey: z.string().min(1).nullable().default(null),
+  mimeType: z.literal("image/png").nullable().default(null),
+  byteSize: z.number().int().positive().nullable().default(null),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/, "Expected a SHA-256 hex digest").nullable().default(null),
+  approvedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  periodConfirmed: z.boolean().default(false),
 });
 export type ScreenshotRecord = z.infer<typeof screenshotRecordSchema>;
 

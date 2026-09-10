@@ -67,7 +67,9 @@ VITE_API_BASE_URL=http://127.0.0.1:3000 npm run build --workspace @tention/exten
 
 In Chrome, open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `apps/extension/dist`. The manifest currently grants access only to `http://127.0.0.1:3000/*`; update the manifest deliberately if the configured API origin changes.
 
-The Phase 1D workspace supports API connectivity status and retry, temporary manual client identity, timezone-aware selection of the most recent 24 completed months, per-draft section settings, durable draft creation/loading, recent drafts, the shared screenshot checklist, authoritative validation, lifecycle history, and safe version-conflict reload. Screenshot capture, image upload, provider fetching, and PDF generation are not implemented yet.
+The `activeTab` permission is used only after the employee clicks **Capture Current Tab**. It temporarily permits inspecting the active URL and capturing its visible PNG without broad `tabs`, `scripting`, or Klaviyo host permissions.
+
+The Phase 1E workspace adds user-initiated visible-tab PNG capture, manual crop, explicit report-period confirmation, approved-asset upload, retrieval, replacement, and development-only local filesystem storage. Human confirmation is an audit control; it is not machine verification of screenshot pixels. Provider fetching, OCR, automatic Klaviyo navigation, and PDF generation remain unimplemented.
 
 Real PostgreSQL integration tests require a dedicated `TEST_DATABASE_URL` whose database name contains `test`. These tests clear their dedicated test tables.
 

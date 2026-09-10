@@ -11,6 +11,7 @@ export type ValidationIssueCode =
   | "REPORT_MONTH_INCOMPLETE" | "INVALID_CLIENT_TIMEZONE" | "REPORT_PERIOD_MISMATCH"
   | "SCREENSHOT_CLIENT_MISMATCH" | "SCREENSHOT_MONTH_MISMATCH" | "SCREENSHOT_TYPE_MISMATCH"
   | "REQUIRED_SCREENSHOT_MISSING" | "REQUIRED_SCREENSHOT_UNAPPROVED"
+  | "REQUIRED_SCREENSHOT_PERIOD_UNCONFIRMED" | "REQUIRED_SCREENSHOT_ASSET_MISSING"
   | "DUPLICATE_SCREENSHOT_TYPE" | "DISABLED_SECTION_SCREENSHOT_PRESENT"
   | "UNKNOWN_SECTION_CONFIGURATION";
 
@@ -100,6 +101,10 @@ export function validateReportDraft(draft: ReportDraft, context: DomainContext):
       issue("REQUIRED_SCREENSHOT_MISSING", "error", "A required section is missing screenshot metadata.", { section, screenshotType: type });
     } else if (!candidates.some(({ approved }) => approved)) {
       issue("REQUIRED_SCREENSHOT_UNAPPROVED", "error", "A required screenshot has not been approved.", { section, screenshotType: type });
+    } else if (!candidates.some(({ approved, periodConfirmed }) => approved && periodConfirmed)) {
+      issue("REQUIRED_SCREENSHOT_PERIOD_UNCONFIRMED", "error", "A required screenshot needs human report-period confirmation.", { section, screenshotType: type });
+    } else if (!candidates.some(hasStoredApprovedAsset)) {
+      issue("REQUIRED_SCREENSHOT_ASSET_MISSING", "error", "A required screenshot is missing its stored PNG asset metadata.", { section, screenshotType: type });
     }
   }
   return { status: errors.length === 0 ? "valid" : "invalid", errors, warnings };
@@ -210,6 +215,11 @@ export class InMemoryReportDraftRepository implements ReportDraftRepository {
 }
 
 function sameMonth(left: ReportMonth, right: ReportMonth): boolean { return left.year === right.year && left.month === right.month; }
+function hasStoredApprovedAsset(screenshot: ScreenshotRecord): boolean {
+  return screenshot.approved && screenshot.periodConfirmed && screenshot.storageKey !== null &&
+    screenshot.mimeType === "image/png" && screenshot.byteSize !== null && screenshot.sha256 !== null &&
+    screenshot.approvedAt !== null && screenshot.width > 0 && screenshot.height > 0;
+}
 function validInstant(value: Date): Date {
   if (Number.isNaN(value.getTime())) throw new Error("now must be a valid Date");
   return value;

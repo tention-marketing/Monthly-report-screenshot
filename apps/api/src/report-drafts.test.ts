@@ -19,17 +19,16 @@ async function create(overrides: Record<string, unknown> = {}) {
   return app.inject({ method: "POST", url: "/api/v1/report-drafts", payload: body(overrides) });
 }
 
-function shot(overrides: Record<string, unknown> = {}) {
-  return {
-    id: "shot-1", clientId: "client-1", reportMonth: { year: 2026, month: 8 }, type: "overview",
-    capturedAt: NOW.toISOString(), sourceUrl: "https://example.com/report", width: 1440, height: 720,
-    approved: true, storageLocation: null, ...overrides,
-  };
+const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9J5c0AAAAASUVORK5CYII=", "base64");
+async function upload(id: string, type = "overview", expectedVersion = 1, sourceUrl = "https://www.klaviyo.com/reports?token=secret") {
+  return app.inject({
+    method: "PUT", url: `/api/v1/report-drafts/${id}/screenshots/${type}/image`, payload: PNG,
+    headers: {
+      "content-type": "image/png", "x-expected-version": String(expectedVersion),
+      "x-period-confirmed": "true", "x-source-url": sourceUrl,
+    },
+  });
 }
-
-const screenshotPayload = (expectedVersion: number, overrides: Record<string, unknown> = {}) => ({
-  expectedVersion, screenshot: shot(overrides),
-});
 const eventPayload = (expectedVersion: number, event: string) => ({ expectedVersion, event });
 
 describe("report draft API", () => {
@@ -114,13 +113,19 @@ describe("report draft API", () => {
     expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/api/v1/report-drafts/missing" })).statusCode).toBe(404);
   });
-  it("validates missing and unapproved required screenshots", async () => {
+  it("validates a missing required screenshot until an approved stored PNG is uploaded", async () => {
     const created = (await create({ sections: { executive_summary: "required" } })).json();
     let response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
     expect(response.json().errors.map(({ code }: { code: string }) => code)).toContain("REQUIRED_SCREENSHOT_MISSING");
-    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1, { approved: false }) });
+    const uploaded = await upload(created.id);
+    expect(uploaded.statusCode).toBe(200);
+    expect(uploaded.json().screenshots[0]).toMatchObject({
+      clientId: "client-1", reportMonth: { year: 2026, month: 8 }, type: "overview",
+      approved: true, periodConfirmed: true, mimeType: "image/png", width: 1, height: 1,
+      sourceUrl: "https://www.klaviyo.com/reports",
+    });
     response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
-    expect(response.json().errors.map(({ code }: { code: string }) => code)).toContain("REQUIRED_SCREENSHOT_UNAPPROVED");
+    expect(response.json().status).toBe("valid");
   });
   it("allows a missing optional screenshot", async () => {
     const created = (await create()).json();
@@ -129,19 +134,30 @@ describe("report draft API", () => {
   });
   it("warns for metadata attached to a disabled section", async () => {
     const created = (await create({ sections: { executive_summary: "disabled" } })).json();
-    await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1) });
+    await upload(created.id);
     const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/validate` });
     expect(response.json().warnings.map(({ code }: { code: string }) => code)).toContain("DISABLED_SECTION_SCREENSHOT_PRESENT");
   });
-  it.each([
-    ["overview", { type: "overview", clientId: "other" }, "SCREENSHOT_CLIENT_MISMATCH"],
-    ["overview", { type: "overview", reportMonth: { year: 2026, month: 7 } }, "SCREENSHOT_MONTH_MISMATCH"],
-    ["overview", { type: "top_flows" }, "SCREENSHOT_TYPE_MISMATCH"],
-  ])("rejects inconsistent screenshot metadata", async (routeType, overrides, error) => {
+  it("rejects invalid screenshot types and non-PNG uploads", async () => {
     const created = (await create()).json();
-    const response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/${routeType}`, payload: screenshotPayload(1, overrides) });
+    let response = await upload(created.id, "not-a-type");
     expect(response.statusCode).toBe(400);
-    expect(response.json().error).toBe(error);
+    expect(response.json().error).toBe("INVALID_SCREENSHOT_TYPE");
+    response = await app.inject({
+      method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview/image`, payload: Buffer.from("not a png"),
+      headers: { "content-type": "image/png", "x-expected-version": "1", "x-period-confirmed": "true", "x-source-url": "https://www.klaviyo.com/reports" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("INVALID_SCREENSHOT_CONTENT");
+    response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview/image`, payload: PNG, headers: { "content-type": "image/jpeg" } });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("INVALID_SCREENSHOT_CONTENT");
+    response = await app.inject({
+      method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview/image`, payload: PNG,
+      headers: { "content-type": "image/png", "x-expected-version": "1", "x-period-confirmed": "false", "x-source-url": "https://www.klaviyo.com/reports" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toBe("INVALID_REQUEST");
   });
   it("rejects illegal lifecycle events", async () => {
     const created = (await create()).json();
@@ -164,10 +180,7 @@ describe("report draft API", () => {
       client: { id: "client-2", name: "Second Client", timezone: "Asia/Kolkata" },
       sections: { executive_summary: "required" },
     })).json();
-    const uploaded = await app.inject({
-      method: "PUT", url: `/api/v1/report-drafts/${valid.id}/screenshots/overview`,
-      payload: screenshotPayload(1, { clientId: "client-2" }),
-    });
+    const uploaded = await upload(valid.id);
     let validVersion = uploaded.json().version;
     for (const event of ["START_DATA_FETCH", "DATA_FETCH_SUCCEEDED", "SUBMIT_FOR_REVIEW"]) {
       response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${valid.id}/events`, payload: eventPayload(validVersion, event) });
@@ -178,16 +191,26 @@ describe("report draft API", () => {
   });
   it("increments versions and rejects stale screenshot and lifecycle writes", async () => {
     const created = (await create()).json();
-    let response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1) });
+    let response = await upload(created.id);
     expect(response.json().version).toBe(2);
-    response = await app.inject({ method: "PUT", url: `/api/v1/report-drafts/${created.id}/screenshots/overview`, payload: screenshotPayload(1, { id: "shot-2" }) });
+    response = await upload(created.id, "overview", 1);
     expect(response.statusCode).toBe(409);
     expect(response.json()).toMatchObject({ error: "REPORT_VERSION_CONFLICT", expectedVersion: 1, currentVersion: 2 });
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/screenshots/overview/image` })).statusCode).toBe(200);
     response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(2, "START_DATA_FETCH") });
     expect(response.json().version).toBe(3);
     response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(2, "DATA_FETCH_SUCCEEDED") });
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe("REPORT_VERSION_CONFLICT");
+  });
+  it("serves the current stored screenshot image without exposing its storage key", async () => {
+    const created = (await create()).json();
+    await upload(created.id);
+    const image = await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/screenshots/overview/image` });
+    expect(image.statusCode).toBe(200);
+    expect(image.headers["content-type"]).toContain("image/png");
+    expect(image.rawPayload).toEqual(PNG);
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/screenshots/top_flows/image` })).json().error).toBe("SCREENSHOT_NOT_FOUND");
   });
   it("returns creation and transition history, and 404 for unknown history", async () => {
     const created = (await create()).json();

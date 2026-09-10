@@ -14,7 +14,8 @@ const createDraft = (id = crypto.randomUUID(), clientId = "client-1", month = 8)
 const mutate = (draft: ReportDraft) => upsertScreenshotMetadata(draft, {
   id: "shot-1", clientId: draft.client.id, reportMonth: draft.reportMonth, type: "overview",
   capturedAt: now.toISOString(), sourceUrl: "https://example.com/report", width: 100, height: 100,
-  approved: true, storageLocation: null,
+  approved: true, storageKey: "reports/11111111-1111-4111-8111-111111111111/overview/22222222-2222-4222-8222-222222222222.png",
+  mimeType: "image/png", byteSize: 100, sha256: "a".repeat(64), approvedAt: now.toISOString(), periodConfirmed: true,
 }, "overview", { now });
 
 describe("InMemoryReportDraftRepository contract", () => {

@@ -32,6 +32,14 @@ Calendar reporting boundaries use PostgreSQL `DATE` and round-trip as `YYYY-MM-D
 
 `DATABASE_URL` selects PostgreSQL. A configured but unavailable database fails loudly. Memory mode requires explicit `REPORT_STORAGE_MODE=memory` and is non-production. There is no fallback from PostgreSQL to memory.
 
+## Screenshot assets
+
+Phase 1E keeps the current screenshot metadata in `report_drafts.screenshots` and stores the PNG binary through a `ScreenshotStorage` adapter. The local filesystem adapter is explicitly DEVELOPMENT / NON-PRODUCTION storage; `SCREENSHOT_STORAGE_DIR` defaults to `./data/screenshots`, which is gitignored. Server-generated keys use `reports/{reportId}/{screenshotType}/{assetId}.png`; client paths, IDs, report months, dimensions, storage keys, and hashes are never trusted.
+
+The API accepts only PNG uploads up to 10 MB, derives identity and dimensions from the report/PNG, records a SHA-256 digest, and requires `periodConfirmed=true` before it writes approved metadata. The prior metadata-only approval route is removed.
+
+Filesystem writes and database compare-and-swap updates are not one ACID transaction. The service writes a unique new asset, performs the versioned metadata update, deletes the new asset best-effort if that update fails, and deletes an old replaced asset best-effort only after success. A process crash can leave an orphan asset; reconciliation is deferred.
+
 ## Current limitations
 
-There is no authentication, production deployment configuration, backup policy, financial data snapshot, screenshot binary storage, or report revision model. Real PostgreSQL tests require a safe dedicated database through `TEST_DATABASE_URL`.
+There is no authentication, production object storage, backup policy, financial data snapshot, screenshot revision history, or report revision model. Real PostgreSQL tests require a safe dedicated database through `TEST_DATABASE_URL`.

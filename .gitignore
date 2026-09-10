@@ -9,3 +9,4 @@ playwright-report/
 test-results/
 *.tsbuildinfo
 apps/extension/.vite/
+data/screenshots/

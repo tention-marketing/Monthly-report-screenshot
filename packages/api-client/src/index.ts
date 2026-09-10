@@ -1,6 +1,6 @@
 import {
   reportDraftSchema, reportLifecycleEventSchema, type ReportDraft, type ReportLifecycleEvent,
-  type ReportLifecycleEventType, type ScreenshotRecord, type ScreenshotType,
+  type ReportLifecycleEventType, type ScreenshotType,
 } from "@tention/report-schema";
 import { z } from "zod";
 
@@ -15,7 +15,15 @@ export interface ReportDraftFilters { clientId?: string; year?: number; month?: 
 export type ApiErrorCode =
   | "NETWORK_ERROR" | "REPORT_NOT_FOUND" | "REPORT_VERSION_CONFLICT"
   | "REPORT_DRAFT_ALREADY_EXISTS" | "INVALID_REQUEST" | "REPORT_VALIDATION_FAILED"
-  | "ILLEGAL_REPORT_TRANSITION" | "UNKNOWN_API_ERROR" | string;
+  | "ILLEGAL_REPORT_TRANSITION" | "SCREENSHOT_TOO_LARGE" | "INVALID_SCREENSHOT_TYPE"
+  | "INVALID_SCREENSHOT_CONTENT" | "SCREENSHOT_NOT_FOUND" | "STORAGE_ERROR" | "UNKNOWN_API_ERROR" | string;
+
+export interface UploadScreenshotImageRequest {
+  expectedVersion: number;
+  periodConfirmed: true;
+  sourceUrl: string | null;
+  image: Blob;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -62,8 +70,25 @@ export function createApiClient(options: ApiClientOptions) {
     async getReportHistory(id: string): Promise<ReportLifecycleEvent[]> {
       return z.array(reportLifecycleEventSchema).parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/history`));
     },
-    async upsertScreenshot(id: string, type: ScreenshotType, expectedVersion: number, screenshot: ScreenshotRecord): Promise<ReportDraft> {
-      return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/screenshots/${type}`, jsonRequest("PUT", { expectedVersion, screenshot })));
+    async uploadScreenshotImage(id: string, type: ScreenshotType, input: UploadScreenshotImageRequest): Promise<ReportDraft> {
+      return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/screenshots/${type}/image`, {
+        method: "PUT",
+        headers: {
+          "content-type": "image/png",
+          "x-expected-version": String(input.expectedVersion),
+          "x-period-confirmed": "true",
+          ...(input.sourceUrl ? { "x-source-url": input.sourceUrl } : {}),
+        },
+        body: input.image,
+      }));
+    },
+    async getScreenshotImage(id: string, type: ScreenshotType): Promise<Blob> {
+      const response = await requestResponse(request, `${baseUrl}/api/v1/report-drafts/${id}/screenshots/${type}/image`);
+      if (!response.ok) throw await toApiError(response);
+      if (!response.headers.get("content-type")?.startsWith("image/png")) {
+        throw new ApiError("INVALID_SCREENSHOT_CONTENT", "Screenshot image response was not PNG.", response.status);
+      }
+      return response.blob();
     },
     async applyEvent(id: string, event: ReportMutationEvent, expectedVersion: number): Promise<ReportDraft> {
       return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/events`, jsonRequest("POST", { expectedVersion, event })));
@@ -77,16 +102,21 @@ function isHealthResponse(value: unknown): value is HealthResponse {
 }
 
 async function requestJson(request: typeof globalThis.fetch, url: string, init?: RequestInit): Promise<unknown> {
-  let response: Response;
-  try { response = await request(url, init); }
+  const response = await requestResponse(request, url, init);
+  if (!response.ok) throw await toApiError(response);
+  return response.json();
+}
+
+async function requestResponse(request: typeof globalThis.fetch, url: string, init?: RequestInit): Promise<Response> {
+  try { return await request(url, init); }
   catch (error) { throw new ApiError("NETWORK_ERROR", "The API could not be reached.", null, error); }
+}
+
+async function toApiError(response: Response): Promise<ApiError> {
   const data = await response.json().catch(() => null) as { error?: unknown; message?: unknown } | null;
-  if (!response.ok) {
-    const code = typeof data?.error === "string" ? data.error : "UNKNOWN_API_ERROR";
-    const message = typeof data?.message === "string" ? data.message : `API request failed with status ${response.status}.`;
-    throw new ApiError(code, message, response.status, data);
-  }
-  return data;
+  const code = typeof data?.error === "string" ? data.error : "UNKNOWN_API_ERROR";
+  const message = typeof data?.message === "string" ? data.message : `API request failed with status ${response.status}.`;
+  return new ApiError(code, message, response.status, data);
 }
 
 function jsonRequest(method: "POST" | "PUT", body: unknown): RequestInit {
