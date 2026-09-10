@@ -33,6 +33,37 @@ const screenshotPayload = (expectedVersion: number, overrides: Record<string, un
 const eventPayload = (expectedVersion: number, event: string) => ({ expectedVersion, event });
 
 describe("report draft API", () => {
+  it("lists an empty repository", async () => {
+    const response = await app.inject({ method: "GET", url: "/api/v1/report-drafts" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual([]);
+  });
+  it("lists drafts deterministically and filters by safe fields", async () => {
+    const first = (await create()).json();
+    const second = (await create({
+      client: { id: "client-2", name: "Second", timezone: "Asia/Kolkata" },
+      reportMonth: { year: 2026, month: 7 },
+    })).json();
+    const third = (await create({
+      client: { id: "client-1", name: "Orion", timezone: "Asia/Kolkata" },
+      reportMonth: { year: 2025, month: 8 },
+    })).json();
+    const all = (await app.inject({ method: "GET", url: "/api/v1/report-drafts" })).json();
+    expect(all.map(({ id }: { id: string }) => id)).toEqual([first.id, second.id, third.id].sort());
+    expect((await app.inject({ method: "GET", url: "/api/v1/report-drafts?clientId=client-1" })).json()).toHaveLength(2);
+    expect((await app.inject({ method: "GET", url: "/api/v1/report-drafts?year=2026" })).json()).toHaveLength(2);
+    expect((await app.inject({ method: "GET", url: "/api/v1/report-drafts?month=8" })).json()).toHaveLength(2);
+    const combined = (await app.inject({ method: "GET", url: "/api/v1/report-drafts?clientId=client-2&year=2026&month=7" })).json();
+    expect(combined).toHaveLength(1);
+    expect(combined[0].id).toBe(second.id);
+  });
+  it.each(["year=not-a-year", "year=1999", "month=0", "month=13", "month=1%20OR%201=1"])(
+    "rejects invalid list query %s", async (query) => {
+      const response = await app.inject({ method: "GET", url: `/api/v1/report-drafts?${query}` });
+      expect(response.statusCode).toBe(400);
+      expect(response.json().error).toBe("INVALID_REQUEST");
+    },
+  );
   it("creates a completed-month draft with a backend-derived period", async () => {
     const response = await create();
     expect(response.statusCode).toBe(201);

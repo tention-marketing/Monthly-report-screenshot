@@ -24,8 +24,25 @@ const eventRequestSchema = z.object({ event: z.enum([
 const screenshotMutationSchema = z.object({
   expectedVersion: z.number().int().positive(), screenshot: screenshotRecordSchema,
 }).strict();
+const listQuerySchema = z.object({
+  clientId: z.string().min(1).optional(),
+  year: z.coerce.number().int().min(2000).max(9999).optional(),
+  month: z.coerce.number().int().min(1).max(12).optional(),
+}).strict();
 
 export const reportDraftRoutes: FastifyPluginAsync<RouteOptions> = async (app, options) => {
+  app.get("/report-drafts", async (request, reply) => {
+    try {
+      const query = listQuerySchema.parse(request.query);
+      const drafts = (await options.repository.list())
+        .filter((draft) => query.clientId === undefined || draft.client.id === query.clientId)
+        .filter((draft) => query.year === undefined || draft.reportMonth.year === query.year)
+        .filter((draft) => query.month === undefined || draft.reportMonth.month === query.month)
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+      return drafts;
+    } catch (error) { return sendError(reply, error); }
+  });
+
   app.post("/report-drafts", async (request, reply) => {
     try {
       const body = createRequestSchema.parse(request.body);

@@ -6,7 +6,8 @@ const host = process.env.HOST ?? "127.0.0.1";
 
 try {
   const repository = createConfiguredRepository(process.env);
-  await buildApp({ logger: true, repository }).listen({ port, host });
+  const allowedOrigins = process.env.EXTENSION_ORIGIN ? [process.env.EXTENSION_ORIGIN] : [];
+  await buildApp({ logger: true, repository, allowedOrigins }).listen({ port, host });
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

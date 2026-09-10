@@ -12,4 +12,12 @@ describe("health routes", () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ ok: true });
   });
+  it("allows extension origins without opening CORS to arbitrary websites", async () => {
+    const app = buildApp();
+    apps.push(app);
+    const extension = await app.inject({ method: "GET", url: "/api/v1/health", headers: { origin: "chrome-extension://abcdefghijklmnop" } });
+    const website = await app.inject({ method: "GET", url: "/api/v1/health", headers: { origin: "https://example.com" } });
+    expect(extension.headers["access-control-allow-origin"]).toBe("chrome-extension://abcdefghijklmnop");
+    expect(website.headers["access-control-allow-origin"]).toBeUndefined();
+  });
 });
