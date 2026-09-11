@@ -44,8 +44,12 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .count { padding: 5px 8px; border-radius: 999px; color: #315d4d; background: #e9f3ee; font-size: 11px; font-weight: 800; white-space: nowrap; }
 .recent-list, .checklist, .issues, .history { padding: 0; margin: 0; list-style: none; }
 .recent-list li + li, .checklist li + li, .issues li + li { border-top: 1px solid #eeede8; }
-.recent-list button { display: grid; width: 100%; gap: 3px; padding: 11px 2px; border: 0; text-align: left; background: transparent; }
+.recent-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 11px 2px; }
+.recent-report { display: grid; gap: 3px; }
 .recent-list span { color: #4f5853; font-size: 12px; }
+.recent-actions { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; }
+.recent-actions button { padding: 6px 8px; border: 1px solid #adb5b0; border-radius: 7px; background: #fff; font-size: 11px; font-weight: 700; }
+.recent-actions button.danger { border-color: #c53a32; color: #a62b21; }
 .metadata { display: grid; grid-template-columns: 1fr 70px 1.3fr; gap: 8px; margin-top: 12px; }
 .checklist li { display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 11px 0; }
 .checklist li > span:nth-child(2) { display: grid; gap: 2px; }
@@ -103,4 +107,4 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .history time, .history span { color: #68706c; font-size: 11px; }
 details { margin: 8px 0 12px; color: #68706c; font-size: 12px; }
 details p { margin: 7px 0; }
-@media (max-width: 400px) { body { min-width: 320px; } .period-preview { grid-template-columns: 1fr; } .checklist li { grid-template-columns: 25px 1fr; } .checklist button { grid-column: 2; justify-self: start; } }
+@media (max-width: 400px) { body { min-width: 320px; } .period-preview { grid-template-columns: 1fr; } .checklist li { grid-template-columns: 25px 1fr; } .checklist button { grid-column: 2; justify-self: start; } .recent-list li { grid-template-columns: 1fr; } .recent-actions { justify-content: start; } }

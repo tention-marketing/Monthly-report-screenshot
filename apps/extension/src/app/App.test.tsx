@@ -99,7 +99,7 @@ describe("extension report workflow", () => {
   });
   it("shows compact required progress and keeps optional and disabled sections out of the runner", async () => {
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }));
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await screen.findByRole("heading", { name: "Orion Supplements" });
     expect(screen.getByText("0 / 1 required screenshots completed")).toBeInTheDocument();
     expect(screen.getByText("Next required capture")).toBeInTheDocument();
@@ -113,7 +113,7 @@ describe("extension report workflow", () => {
       captureVisibleTab: vi.fn(),
     };
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }), captureService);
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 1 of 1")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
@@ -124,7 +124,7 @@ describe("extension report workflow", () => {
   it("opens the first required July capture from Start Report without selecting a checklist row", async () => {
     const fullRunnerReport = runnerReport();
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
-    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     expect(screen.getByText("0 / 8 required screenshots completed")).toBeInTheDocument();
     expect(screen.getByText("Next required capture")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Start Report" }));
@@ -135,7 +135,7 @@ describe("extension report workflow", () => {
   it("resumes Start Report at the next incomplete required section", async () => {
     const fullRunnerReport = runnerReport(["overview"]);
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
-    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 2 of 8")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Top Campaigns" })).toBeInTheDocument();
@@ -143,7 +143,7 @@ describe("extension report workflow", () => {
   it("shows review instead of restarting Start Report when all required captures are approved", async () => {
     const fullRunnerReport = runnerReport(runnerScreenshotTypes);
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
-    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     expect(screen.getByText("8 / 8 required screenshots completed")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start Report" })).toBeNull();
     expect(screen.getByRole("button", { name: "Review Report" })).toBeInTheDocument();
@@ -151,11 +151,56 @@ describe("extension report workflow", () => {
   it("returns to setup without deleting the current report when starting a new report", async () => {
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) });
     const user = userEvent.setup(); renderApp(api);
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start New Report" }));
     expect(await screen.findByRole("heading", { name: "Report setup" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ New Monthly Report" })).toBeInTheDocument();
     expect(api.deleteReportDraft).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: /Orion Supplements/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Report" })).toBeInTheDocument();
+  });
+  it("shows explicit recent report actions and deletes only the confirmed report", async () => {
+    const otherReport: ReportDraft = {
+      ...report, id: "22222222-2222-4222-8222-222222222222",
+      client: { id: "client-2", name: "Second Client", timezone: "America/New_York", currency: null },
+      reportMonth: { year: 2026, month: 7 },
+    };
+    const api = mockApi({
+      listReportDrafts: vi.fn().mockResolvedValueOnce([report, otherReport]).mockResolvedValueOnce([otherReport]),
+      deleteReportDraft: vi.fn().mockResolvedValue(undefined),
+    });
+    const user = userEvent.setup(); renderApp(api);
+    const firstReport = (await screen.findByText("Orion Supplements")).closest("li")!;
+    expect(within(firstReport).getByRole("button", { name: "Open Report" })).toBeInTheDocument();
+    await user.click(within(firstReport).getByRole("button", { name: "Delete Report" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete report?" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "wrong");
+    expect(within(dialog).getByRole("button", { name: "Delete Report" })).toBeDisabled();
+    expect(api.deleteReportDraft).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(api.deleteReportDraft).not.toHaveBeenCalled();
+    await user.click(within(firstReport).getByRole("button", { name: "Delete Report" }));
+    const confirmedDialog = screen.getByRole("dialog", { name: "Delete report?" });
+    await user.type(within(confirmedDialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
+    await user.click(within(confirmedDialog).getByRole("button", { name: "Delete Report" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Report deleted.");
+    expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
+    expect(screen.queryByText("Orion Supplements")).toBeNull();
+    expect(screen.getByText("Second Client")).toBeInTheDocument();
+  });
+  it("keeps a recent report visible when its delete version is stale", async () => {
+    const api = mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([report]),
+      deleteReportDraft: vi.fn().mockRejectedValue(new ApiError("REPORT_VERSION_CONFLICT", "stale", 409)),
+    });
+    const user = userEvent.setup(); renderApp(api);
+    const recentReport = (await screen.findByText("Orion Supplements")).closest("li")!;
+    await user.click(within(recentReport).getByRole("button", { name: "Delete Report" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete report?" });
+    await user.type(within(dialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
+    await user.click(within(dialog).getByRole("button", { name: "Delete Report" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("This report was updated somewhere else.");
+    expect(within(recentReport).getByText("Orion Supplements")).toBeInTheDocument();
+    expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
   });
   it("requires DELETE confirmation before deleting a report and refreshes the setup view", async () => {
     const api = mockApi({
@@ -163,7 +208,7 @@ describe("extension report workflow", () => {
       deleteReportDraft: vi.fn().mockResolvedValue(undefined),
     });
     const user = userEvent.setup(); renderApp(api);
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByText("Report options"));
     await user.click(screen.getByRole("button", { name: "Delete Report" }));
     const dialog = screen.getByRole("dialog", { name: "Delete report?" });
@@ -180,12 +225,12 @@ describe("extension report workflow", () => {
     await user.click(within(confirmedDialog).getByRole("button", { name: "Delete Report" }));
     expect(await screen.findByRole("status")).toHaveTextContent("Report deleted.");
     expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
-    expect(screen.queryByRole("button", { name: /Orion Supplements/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open Report" })).toBeNull();
   });
   it("keeps raw validation details out of the normal view and exposes them in Advanced / Debug", async () => {
     const validation = { status: "invalid" as const, errors: [{ code: "REQUIRED_SCREENSHOT_MISSING", severity: "error" as const, message: "Top Campaigns screenshot is missing." }], warnings: [] };
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]), validateReportDraft: vi.fn().mockResolvedValue(validation) }));
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     expect(screen.queryByText("REQUIRED_SCREENSHOT_MISSING")).toBeNull();
     await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
     await user.click(await screen.findByRole("button", { name: "Validate Report" }));
@@ -200,7 +245,7 @@ describe("extension report workflow", () => {
       applyEvent: vi.fn().mockRejectedValue(new ApiError("REPORT_VERSION_CONFLICT", "conflict", 409)),
     });
     const user = userEvent.setup(); renderApp(api);
-    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
     await user.click(await screen.findByRole("button", { name: "Start Data Fetch" }));
     expect(await screen.findByText("This report was updated somewhere else.")).toBeInTheDocument();
@@ -273,7 +318,7 @@ describe("capture workflow cross-section safety", () => {
         .mockResolvedValueOnce({ sourceUrl: "https://www.klaviyo.com/campaigns", isKlaviyo: true, dataUrl: "data:image/png;base64,BBBB" }),
     };
     const user = userEvent.setup(); renderApp(api, captureService);
-    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
@@ -296,7 +341,7 @@ describe("capture workflow cross-section safety", () => {
       captureVisibleTab: vi.fn().mockResolvedValue({ sourceUrl: "https://www.klaviyo.com/signup", isKlaviyo: true, dataUrl: "data:image/png;base64,CCCC" }),
     };
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([optionalReport]), getReportDraft: vi.fn().mockResolvedValue(optionalReport) }), captureService);
-    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByText("Optional Sections · 1 available"));
     await user.click(screen.getByRole("button", { name: "Capture" }));
     expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
