@@ -3,9 +3,10 @@ import type { ApiClient } from "@tention/api-client";
 import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import { formatCalendarRange } from "../../lib/dates/month-options.js";
 import type { CaptureService, ActiveCaptureTab, CapturedImage } from "./capture-service.js";
-import { mapDisplayedCropToImage, selectionFromDrag, type CropRectangle } from "./crop-geometry.js";
+import { mapDisplayedCropToImage, mapViewportCropToImage, selectionFromDrag, type CropRectangle } from "./crop-geometry.js";
 import { createSessionCropTemplateStore, denormalizeCrop, normalizeCrop, type CropTemplateStore } from "./crop-template-store.js";
 import type { KlaviyoNavigationService } from "../klaviyo-navigation/navigation-service.js";
+import type { ExecutiveSummaryTargetBounds, KlaviyoAutomationFailureCode } from "../klaviyo-navigation/executive-summary-adapter.js";
 
 interface CaptureWorkflowProps {
   api: ApiClient;
@@ -39,6 +40,8 @@ export function CaptureWorkflow({
   const [croppedImage, setCroppedImage] = useState<Blob | null>(null);
   const [croppedSize, setCroppedSize] = useState<CropRectangle | null>(null);
   const [periodConfirmed, setPeriodConfirmed] = useState(false);
+  const [detectedPeriod, setDetectedPeriod] = useState<string | null>(null);
+  const [automaticTarget, setAutomaticTarget] = useState<ExecutiveSummaryTargetBounds | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [navigationMessage, setNavigationMessage] = useState<string | null>(null);
@@ -60,8 +63,21 @@ export function CaptureWorkflow({
     setBusy(true); setError(null);
     try {
       const image = await captureService.captureVisibleTab();
-      setCaptured(image); setSelection(null); setCroppedImage(null); setCroppedSize(null); setPeriodConfirmed(false); setStage("crop");
+      setCaptured(image); setSelection(null); setCroppedImage(null); setCroppedSize(null); setPeriodConfirmed(false); setDetectedPeriod(null); setAutomaticTarget(null); setStage("crop");
     } catch (caught) { setError(message(caught, "The current tab could not be captured.")); }
+    finally { setBusy(false); }
+  }
+
+  async function captureAutomatically() {
+    setBusy(true); setError(null); setNavigationMessage(null);
+    try {
+      const prepared = await navigationService.prepareExecutiveSummary(klaviyoAccountUrl.trim() || null, report.period);
+      if (prepared.kind === "failed") { setError(automationMessage(prepared.code)); return; }
+      const image = await captureService.captureVisibleTab();
+      if (!image.isKlaviyo) { setError(automationMessage("KLAVIYO_PAGE_NOT_SUPPORTED")); return; }
+      setCaptured(image); setSelection(null); setCroppedImage(null); setCroppedSize(null);
+      setPeriodConfirmed(true); setDetectedPeriod(prepared.detectedPeriod); setAutomaticTarget(prepared.target); setStage("crop");
+    } catch { setError(automationMessage("CAPTURE_FAILED")); }
     finally { setBusy(false); }
   }
 
@@ -107,6 +123,20 @@ export function CaptureWorkflow({
     finally { setBusy(false); }
   }
 
+  async function createAutomaticCrop(image: HTMLImageElement) {
+    if (!captured || !automaticTarget) return;
+    setBusy(true); setError(null);
+    try {
+      const naturalCrop = mapViewportCropToImage(
+        { x: automaticTarget.x, y: automaticTarget.y, width: automaticTarget.width, height: automaticTarget.height },
+        automaticTarget.viewportWidth, automaticTarget.viewportHeight, image.naturalWidth, image.naturalHeight,
+      );
+      setCroppedImage(await cropToPng(captured.dataUrl, naturalCrop));
+      setCroppedSize(naturalCrop); setStage("review");
+    } catch { setError(automationMessage("CAPTURE_FAILED")); setAutomaticTarget(null); }
+    finally { setBusy(false); }
+  }
+
   async function approveAndUpload() {
     if (!croppedImage || !captured || !periodConfirmed) return;
     setBusy(true); setError(null);
@@ -124,35 +154,35 @@ export function CaptureWorkflow({
   }
 
   function retake() {
-    setStage("instructions"); setCaptured(null); setSelection(null); setCroppedImage(null); setCroppedSize(null); setPeriodConfirmed(false); setActiveTab(null); setError(null);
+    setStage("instructions"); setCaptured(null); setSelection(null); setCroppedImage(null); setCroppedSize(null); setPeriodConfirmed(false); setDetectedPeriod(null); setAutomaticTarget(null); setActiveTab(null); setError(null);
   }
 
   if (stage === "instructions") return <main className="capture-workflow">
     <section className="card report-hero"><p className="kicker">{step ? `Step ${step.current} of ${step.total}` : "Capture screenshot"}</p><h1>{label}</h1><p className="report-month">{report.client.name}</p><p className="support-copy">Expected report period: {period}</p></section>
-    <section className="card"><h2>Open the correct Klaviyo screen</h2><p className="support-copy">The extension can open a configured Klaviyo workspace, but it does not guess account IDs, provider routes, or dates. {" "}Verify the screen and selected month yourself.</p>
+    <section className="card"><h2>Open the correct Klaviyo screen</h2><p className="support-copy">The extension can open a configured Klaviyo workspace, but it does not guess account IDs or provider routes. Verify the screen and selected month yourself whenever automatic verification is unavailable.</p>
       <label>Klaviyo account URL <input type="url" value={klaviyoAccountUrl} onChange={(event) => onKlaviyoAccountUrlChange(event.target.value)} placeholder="https://www.klaviyo.com/..." /></label>
-      <div className="actions"><button disabled={busy} onClick={() => void openKlaviyoWorkspace()}>{busy ? "Opening…" : "Open Klaviyo workspace"}</button></div>
+      <div className="actions">{screenshotType === "overview" && <button className="primary" disabled={busy} onClick={() => void captureAutomatically()}>{busy ? "Preparing…" : "Capture Automatically"}</button>}<button disabled={busy} onClick={() => void openKlaviyoWorkspace()}>{busy ? "Opening…" : "Open Klaviyo"}</button></div>
       {navigationMessage && <p className="notice warning-notice">{navigationMessage}</p>}
       {activeTab && <div className="notice warning-notice"><p>This capture is intended for a Klaviyo page.</p><small>Current tab: {hostLabel(activeTab.sourceUrl)}</small><button disabled={busy} onClick={() => void capture()}>Capture anyway</button></div>}
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <div className="actions"><button className="primary" disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Capture Current Tab"}</button><button onClick={onCancel}>Back to report</button></div>
+      <div className="actions"><button disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Capture Manually"}</button><button onClick={onCancel}>Back to report</button></div>
     </section>
   </main>;
 
   if (stage === "crop" && captured) return <main className="capture-workflow">
     <section className="card"><p className="kicker">Crop screenshot</p><h1>{label}</h1><p className="support-copy">Drag across the exact Klaviyo card, chart, or table. Crop coordinates are mapped to the full PNG resolution.</p>
-      <div className="crop-image" onPointerDown={beginSelection} onPointerMove={moveSelection} onPointerUp={endSelection} onPointerCancel={endSelection}>
+      {automaticTarget && <p className="support-copy">Creating the Growth overview crop from the verified visible target…</p>}
+      <div className="crop-image" onPointerDown={automaticTarget ? undefined : beginSelection} onPointerMove={automaticTarget ? undefined : moveSelection} onPointerUp={automaticTarget ? undefined : endSelection} onPointerCancel={automaticTarget ? undefined : endSelection}>
         <img src={captured.dataUrl} alt="Captured browser tab" draggable={false} onLoad={(event) => {
           const image = event.currentTarget; const bounds = image.getBoundingClientRect();
           setDisplaySize({ width: bounds.width, height: bounds.height }); setNaturalSize({ width: image.naturalWidth, height: image.naturalHeight });
-          const saved = cropTemplateStore.get(screenshotType);
-          if (saved) setSelection(denormalizeCrop(saved, bounds.width, bounds.height));
+          if (automaticTarget) void createAutomaticCrop(image);
+          else { const saved = cropTemplateStore.get(screenshotType); if (saved) setSelection(denormalizeCrop(saved, bounds.width, bounds.height)); }
         }} />
         {selection && <span className="crop-selection" style={{ left: selection.x, top: selection.y, width: selection.width, height: selection.height }} />}
       </div>
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <p className="support-copy">A saved crop suggestion may appear for this section. It is never approved automatically.</p>
-      <div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue to Review"}</button></div>
+      {!automaticTarget && <><p className="support-copy">A saved crop suggestion may appear for this section. It is never approved automatically.</p><div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue to Review"}</button></div></>}
     </section>
   </main>;
 
@@ -160,8 +190,8 @@ export function CaptureWorkflow({
     <section className="card"><p className="kicker">Review screenshot</p><h1>{label}</h1><p className="support-copy">{report.client.name} · {period}</p>
       {previewUrl && <img className="crop-preview" src={previewUrl} alt={`Cropped ${label} screenshot`} />}
       <dl className="capture-details"><div><dt>Source</dt><dd>{hostLabel(captured?.sourceUrl ?? null)}</dd></div><div><dt>Dimensions</dt><dd>{croppedSize ? `${croppedSize.width} × ${croppedSize.height} PNG` : "—"}</dd></div><div><dt>Reporting Period</dt><dd>{period}</dd></div></dl>
-      <label className="confirmation"><input type="checkbox" checked={periodConfirmed} onChange={(event) => setPeriodConfirmed(event.target.checked)} />I confirm this screenshot shows the selected report period.</label>
-      <p className="support-copy">This is a human audit control; the extension does not verify dates from screenshot pixels.</p>
+      {detectedPeriod ? <p className="notice success-notice">Period detected: {detectedPeriod}</p> : <label className="confirmation"><input type="checkbox" checked={periodConfirmed} onChange={(event) => setPeriodConfirmed(event.target.checked)} />I confirm this screenshot shows the selected report period.</label>}
+      <p className="support-copy">Review the crop before approval. The extension never approves or uploads a screenshot automatically.</p>
       {error && <p role="alert" className="notice error-notice">{error}</p>}
       <div className="actions"><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !periodConfirmed} onClick={() => void approveAndUpload()}>{busy ? "Uploading…" : continueLabel}</button></div>
     </section>
@@ -189,3 +219,15 @@ function useObjectUrl(blob: Blob | null): string | null {
 function hostLabel(value: string | null): string { try { return value ? new URL(value).hostname : "Unavailable"; } catch { return "Unavailable"; } }
 function isVersionConflict(error: unknown): error is { code: string } { return typeof error === "object" && error !== null && "code" in error && error.code === "REPORT_VERSION_CONFLICT"; }
 function message(error: unknown, fallback: string): string { return error instanceof Error && error.message ? error.message : fallback; }
+function automationMessage(code: KlaviyoAutomationFailureCode): string {
+  const messages: Record<KlaviyoAutomationFailureCode, string> = {
+    KLAVIYO_PAGE_NOT_SUPPORTED: "Open the Klaviyo Analytics → Dashboards → Business review page, then try again.",
+    TARGET_NOT_FOUND: "Growth overview was not found. Use Capture Manually after locating the card.",
+    PERIOD_NOT_FOUND: "Klaviyo's Time period control was not found. Confirm the selected month and use Capture Manually.",
+    PERIOD_SET_FAILED: "The required report period could not be selected safely. Confirm it manually before capturing.",
+    PERIOD_VERIFY_FAILED: "Klaviyo did not verify the selected report period. No screenshot was captured.",
+    TARGET_NOT_FULLY_VISIBLE: "Growth overview is not fully visible in the viewport. Resize or scroll it into view, then use Capture Manually.",
+    CAPTURE_FAILED: "The verified Growth overview could not be captured. Use Capture Manually.",
+  };
+  return messages[code];
+}

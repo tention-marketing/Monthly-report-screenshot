@@ -1,5 +1,11 @@
 import type { ReportPeriod, ScreenshotType } from "@tention/report-schema";
 import { isKlaviyoUrl } from "../screenshot-capture/capture-service.js";
+import {
+  prepareExecutiveSummaryDocument,
+  type ExecutiveSummaryAdapterResult,
+  type ExecutiveSummaryTargetBounds,
+  type KlaviyoAutomationFailureCode,
+} from "./executive-summary-adapter.js";
 
 export interface KlaviyoNavigationTarget {
   label: string;
@@ -32,17 +38,31 @@ export type NavigationResult =
   | { kind: "account_context_required"; target: KlaviyoNavigationTarget }
   | { kind: "open_failed"; target: KlaviyoNavigationTarget; message: string };
 
-interface ChromeTabsApi { create(properties: { url: string; active: boolean }): Promise<unknown> }
-interface ChromeApi { tabs?: ChromeTabsApi }
+interface ChromeTab { id?: number; url?: string }
+interface ChromeTabsApi {
+  create(properties: { url: string; active: boolean }): Promise<ChromeTab>;
+  query?(queryInfo: { active?: boolean; currentWindow?: boolean }): Promise<ChromeTab[]>;
+  update?(tabId: number, properties: { active: boolean }): Promise<ChromeTab>;
+}
+interface ChromeScriptingApi {
+  executeScript<Result>(details: { target: { tabId: number }; func: (expectedPeriod: string) => Promise<Result>; args: [string] }): Promise<Array<{ result?: Result }>>;
+}
+interface ChromeApi { tabs?: ChromeTabsApi; scripting?: ChromeScriptingApi }
+
+export type ExecutiveSummaryPreparation =
+  | { kind: "ready"; detectedPeriod: string; target: ExecutiveSummaryTargetBounds }
+  | { kind: "failed"; code: KlaviyoAutomationFailureCode };
 
 export interface KlaviyoNavigationService {
   openSection(type: ScreenshotType, accountUrl: string | null, period: ReportPeriod): Promise<NavigationResult>;
   preparePeriod(period: ReportPeriod): { kind: "manual_period_required" };
+  prepareExecutiveSummary(accountUrl: string | null, period: ReportPeriod): Promise<ExecutiveSummaryPreparation>;
 }
 
 export const unavailableKlaviyoNavigationService: KlaviyoNavigationService = {
   async openSection(type) { return { kind: "open_failed", target: klaviyoNavigationTargets[type], message: "Chrome tab navigation is unavailable in this environment." }; },
   preparePeriod() { return { kind: "manual_period_required" }; },
+  async prepareExecutiveSummary() { return { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED" }; },
 };
 
 export class ChromeKlaviyoNavigationService implements KlaviyoNavigationService {
@@ -62,4 +82,47 @@ export class ChromeKlaviyoNavigationService implements KlaviyoNavigationService 
   }
 
   preparePeriod(_period: ReportPeriod): { kind: "manual_period_required" } { return { kind: "manual_period_required" }; }
+
+  async prepareExecutiveSummary(accountUrl: string | null, period: ReportPeriod): Promise<ExecutiveSummaryPreparation> {
+    const tabs = this.chromeApi?.tabs;
+    const scripting = this.chromeApi?.scripting;
+    if (!tabs?.query || !tabs.update || !scripting) return { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED" };
+    const expectedPeriod = formatPeriod(period);
+    try {
+      const currentTabs = await tabs.query({ currentWindow: true });
+      const candidates = currentTabs.filter((tab) => typeof tab.id === "number" && isKlaviyoUrl(tab.url ?? null));
+      let lastFailure: ExecutiveSummaryPreparation | null = null;
+      for (const tab of candidates) {
+        const prepared = await this.runExecutiveSummaryAdapter(scripting, tab.id!, expectedPeriod);
+        if (prepared.kind === "ready") {
+          await tabs.update(tab.id!, { active: true });
+          return this.runExecutiveSummaryAdapter(scripting, tab.id!, expectedPeriod);
+        }
+        lastFailure = prepared;
+      }
+      if (accountUrl && isKlaviyoUrl(accountUrl)) {
+        const opened = await tabs.create({ url: accountUrl, active: true });
+        if (typeof opened.id === "number") return this.runExecutiveSummaryAdapter(scripting, opened.id, expectedPeriod);
+      }
+      return lastFailure ?? { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED" };
+    } catch {
+      return { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED" };
+    }
+  }
+
+  private async runExecutiveSummaryAdapter(scripting: ChromeScriptingApi, tabId: number, expectedPeriod: string): Promise<ExecutiveSummaryPreparation> {
+    const result = await scripting.executeScript<ExecutiveSummaryAdapterResult>({
+      target: { tabId }, func: prepareExecutiveSummaryDocument, args: [expectedPeriod],
+    });
+    const prepared = result[0]?.result;
+    return prepared?.kind === "ready" || prepared?.kind === "failed"
+      ? prepared
+      : { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED" };
+  }
+}
+
+function formatPeriod(period: ReportPeriod): string {
+  const date = (value: string) => new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" })
+    .format(new Date(`${value}T00:00:00.000Z`));
+  return `${date(period.startDate)} – ${date(period.endDate)}`;
 }

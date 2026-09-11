@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
 import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
+import type { KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
 import { App } from "./App.js";
 
@@ -54,7 +55,7 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
     ...overrides,
   } as ApiClient;
 }
-const renderApp = (api: ApiClient, captureService?: CaptureService) => render(<App api={api} {...(captureService ? { captureService } : {})} now={() => new Date(NOW)} />);
+const renderApp = (api: ApiClient, captureService?: CaptureService, navigationService?: KlaviyoNavigationService) => render(<App api={api} {...(captureService ? { captureService } : {})} {...(navigationService ? { navigationService } : {})} now={() => new Date(NOW)} />);
 
 describe("extension report workflow", () => {
   it("shows API unavailable state and retry", async () => {
@@ -116,7 +117,7 @@ describe("extension report workflow", () => {
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 1 of 1")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    await user.click(screen.getByRole("button", { name: "Capture Manually" }));
     expect(await screen.findByText("This capture is intended for a Klaviyo page.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Capture anyway" })).toBeInTheDocument();
     expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
@@ -139,6 +140,7 @@ describe("extension report workflow", () => {
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 2 of 8")).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Top Campaigns" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Capture Automatically" })).toBeNull();
   });
   it("shows review instead of restarting Start Report when all required captures are approved", async () => {
     const fullRunnerReport = runnerReport(runnerScreenshotTypes);
@@ -320,16 +322,16 @@ describe("capture workflow cross-section safety", () => {
     const user = userEvent.setup(); renderApp(api, captureService);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
-    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Capture Manually" }));
     await cropAndConfirm(user);
     await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
     expect(await screen.findByRole("heading", { name: "Top Campaigns" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
     expect(screen.queryByAltText("Cropped Executive Summary screenshot")).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "I confirm this screenshot shows the selected report period." })).toBeNull();
     expect(vi.mocked(api.uploadScreenshotImage)).toHaveBeenLastCalledWith(initial.id, "overview", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/overview", periodConfirmed: true }));
-    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    await user.click(screen.getByRole("button", { name: "Capture Manually" }));
     await cropAndConfirm(user);
     await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
     expect(vi.mocked(api.uploadScreenshotImage)).toHaveBeenLastCalledWith(initial.id, "top_campaigns", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/campaigns", periodConfirmed: true }));
@@ -344,9 +346,48 @@ describe("capture workflow cross-section safety", () => {
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByText("Optional Sections · 1 available"));
     await user.click(screen.getByRole("button", { name: "Capture" }));
-    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
-    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Capture Manually" }));
     await cropAndConfirm(user, false);
     expect(screen.getByRole("button", { name: "Approve & Upload" })).toBeDisabled();
+  });
+  it("automatically crops a verified Executive Summary target but still requires human approval", async () => {
+    const initial = runnerReport(); const uploaded = runnerReport(["overview"]);
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), uploadScreenshotImage: vi.fn().mockResolvedValue(uploaded) });
+    const captureService: CaptureService = {
+      getActiveTab: vi.fn(),
+      captureVisibleTab: vi.fn().mockResolvedValue({ sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" }),
+    };
+    const navigationService: KlaviyoNavigationService = {
+      openSection: vi.fn(), preparePeriod: vi.fn(() => ({ kind: "manual_period_required" as const })),
+      prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "ready", detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 } }),
+    };
+    const user = userEvent.setup(); renderApp(api, captureService, navigationService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
+    const image = await screen.findByAltText("Captured browser tab");
+    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } });
+    fireEvent.load(image);
+    expect(await screen.findByText("Period detected: Jul 1, 2026 – Jul 31, 2026")).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "I confirm this screenshot shows the selected report period." })).toBeNull();
+    expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
+    expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "overview", expect.objectContaining({ periodConfirmed: true, sourceUrl: "https://www.klaviyo.com/analytics/dashboards" }));
+  });
+  it("keeps manual capture available and does not upload when automatic verification fails", async () => {
+    const initial = runnerReport();
+    const captureService: CaptureService = { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() };
+    const navigationService: KlaviyoNavigationService = {
+      openSection: vi.fn(), preparePeriod: vi.fn(() => ({ kind: "manual_period_required" as const })),
+      prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "failed", code: "PERIOD_VERIFY_FAILED" }),
+    };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) });
+    const user = userEvent.setup(); renderApp(api, captureService, navigationService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
+    expect(await screen.findByText("Klaviyo did not verify the selected report period. No screenshot was captured.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+    expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
+    expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
   });
 });

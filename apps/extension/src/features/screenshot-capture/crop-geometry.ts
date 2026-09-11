@@ -21,4 +21,9 @@ export function mapDisplayedCropToImage(selection: CropRectangle, displayWidth: 
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
+/** Maps a DOM target measured in viewport CSS pixels to the captured visible-tab PNG. */
+export function mapViewportCropToImage(selection: CropRectangle, viewportWidth: number, viewportHeight: number, naturalWidth: number, naturalHeight: number): CropRectangle {
+  return mapDisplayedCropToImage(selection, viewportWidth, viewportHeight, naturalWidth, naturalHeight);
+}
+
 function clamp(value: number, lower: number, upper: number): number { return Math.min(Math.max(value, lower), upper); }
