@@ -63,6 +63,9 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .warning-notice button { margin-top: 8px; padding: 7px 9px; border: 1px solid #b99d50; border-radius: 7px; background: #fff; font-weight: 700; }
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .actions button, .conflict button, .error-notice button { padding: 8px 10px; border: 1px solid #adb5b0; border-radius: 8px; background: #fff; font-weight: 700; }
+.actions button.primary { border: 0; color: #fff; background: #1e6148; }
+.actions button.primary:hover:not(:disabled) { background: #174e3a; }
+.actions button.primary:disabled { color: #fff; background: #1e6148; }
 .capture-workflow { padding-bottom: 24px; }
 .progress-copy { margin: 14px 0; color: #315d4d; font-size: 13px; font-weight: 800; }
 .runner-checklist .current-step { margin: 0 -8px; padding: 11px 8px; border-radius: 9px; background: #edf7f1; }

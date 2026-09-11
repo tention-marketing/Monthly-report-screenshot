@@ -135,7 +135,7 @@ export function CaptureWorkflow({
       {navigationMessage && <p className="notice warning-notice">{navigationMessage}</p>}
       {activeTab && <div className="notice warning-notice"><p>This capture is intended for a Klaviyo page.</p><small>Current tab: {hostLabel(activeTab.sourceUrl)}</small><button disabled={busy} onClick={() => void capture()}>Capture anyway</button></div>}
       {error && <p role="alert" className="notice error-notice">{error}</p>}
-      <div className="actions"><button className="primary" disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Period Correct — Capture"}</button><button onClick={onCancel}>Back to report</button></div>
+      <div className="actions"><button className="primary" disabled={busy} onClick={() => void requestCapture()}>{busy ? "Checking…" : "Capture Current Tab"}</button><button onClick={onCancel}>Back to report</button></div>
     </section>
   </main>;
 
@@ -152,7 +152,7 @@ export function CaptureWorkflow({
       </div>
       {error && <p role="alert" className="notice error-notice">{error}</p>}
       <p className="support-copy">A saved crop suggestion may appear for this section. It is never approved automatically.</p>
-      <div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue"}</button></div>
+      <div className="actions"><button onClick={() => setSelection(null)}>Reset</button><button onClick={retake}>Retake</button><button className="primary" disabled={busy || !selection} onClick={() => void continueToReview()}>{busy ? "Cropping…" : "Continue to Review"}</button></div>
     </section>
   </main>;
 

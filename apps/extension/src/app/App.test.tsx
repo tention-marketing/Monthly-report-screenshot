@@ -1,6 +1,6 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
 import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
@@ -115,7 +115,7 @@ describe("extension report workflow", () => {
     await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 1 of 1")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Period Correct — Capture" }));
+    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
     expect(await screen.findByText("This capture is intended for a Klaviyo page.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Capture anyway" })).toBeInTheDocument();
     expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
@@ -173,5 +173,100 @@ describe("extension report workflow", () => {
     await waitFor(() => expect(api.getReportDraft).toHaveBeenCalledTimes(2));
     const metadata = screen.getByText("Version").parentElement!;
     expect(within(metadata).getByText("2")).toBeInTheDocument();
+  });
+});
+
+describe("capture workflow cross-section safety", () => {
+  beforeEach(() => {
+    class TestUrl extends URL {
+      static override createObjectURL = vi.fn(() => "blob:test-crop");
+      static override revokeObjectURL = vi.fn();
+    }
+    class LoadedImage {
+      onload: ((event: Event) => void) | null = null;
+      onerror: ((event: Event) => void) | null = null;
+      set src(_value: string) { queueMicrotask(() => this.onload?.(new Event("load"))); }
+    }
+    vi.stubGlobal("URL", TestUrl);
+    vi.stubGlobal("Image", LoadedImage);
+    const bounds = { x: 0, y: 0, width: 100, height: 100, top: 0, right: 100, bottom: 100, left: 0, toJSON: () => ({}) } as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue(bounds);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => callback?.(new Blob(["crop"], { type: "image/png" })));
+  });
+  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  async function cropAndConfirm(user: ReturnType<typeof userEvent.setup>, confirm = true) {
+    const image = await screen.findByAltText("Captured browser tab");
+    Object.defineProperties(image, {
+      naturalWidth: { configurable: true, value: 100 },
+      naturalHeight: { configurable: true, value: 100 },
+    });
+    fireEvent.load(image);
+    const cropSurface = image.parentElement!;
+    Object.assign(cropSurface, {
+      setPointerCapture: vi.fn(), hasPointerCapture: vi.fn(() => true), releasePointerCapture: vi.fn(),
+    });
+    const pointer = (type: string, clientX: number, clientY: number) => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperties(event, { pointerId: { value: 1 }, clientX: { value: clientX }, clientY: { value: clientY } });
+      fireEvent(cropSurface, event);
+    };
+    pointer("pointerdown", 10, 10); pointer("pointermove", 90, 90); pointer("pointerup", 90, 90);
+    const continueButton = screen.getByRole("button", { name: "Continue to Review" });
+    expect(continueButton).toBeEnabled();
+    await user.click(continueButton);
+    const confirmation = await screen.findByRole("checkbox", { name: "I confirm this screenshot shows the selected report period." });
+    expect(confirmation).not.toBeChecked();
+    if (confirm) await user.click(confirmation);
+    return confirmation;
+  }
+
+  it("starts each runner section with a fresh capture and uploads the image for its current screenshot type", async () => {
+    const initial = runnerReport();
+    const afterOverview = runnerReport(["overview"]);
+    const afterCampaigns = runnerReport(["overview", "top_campaigns"]);
+    const api = mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]),
+      getReportDraft: vi.fn().mockResolvedValue(initial),
+      uploadScreenshotImage: vi.fn().mockImplementation((_reportId: string, type: ScreenshotType) => Promise.resolve(type === "overview" ? afterOverview : afterCampaigns)),
+    });
+    const captureService: CaptureService = {
+      getActiveTab: vi.fn().mockResolvedValue({ sourceUrl: "https://www.klaviyo.com/account", isKlaviyo: true }),
+      captureVisibleTab: vi.fn()
+        .mockResolvedValueOnce({ sourceUrl: "https://www.klaviyo.com/overview", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" })
+        .mockResolvedValueOnce({ sourceUrl: "https://www.klaviyo.com/campaigns", isKlaviyo: true, dataUrl: "data:image/png;base64,BBBB" }),
+    };
+    const user = userEvent.setup(); renderApp(api, captureService);
+    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    await cropAndConfirm(user);
+    await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
+    expect(await screen.findByRole("heading", { name: "Top Campaigns" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
+    expect(screen.queryByAltText("Cropped Executive Summary screenshot")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "I confirm this screenshot shows the selected report period." })).toBeNull();
+    expect(vi.mocked(api.uploadScreenshotImage)).toHaveBeenLastCalledWith(initial.id, "overview", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/overview", periodConfirmed: true }));
+    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    await cropAndConfirm(user);
+    await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
+    expect(vi.mocked(api.uploadScreenshotImage)).toHaveBeenLastCalledWith(initial.id, "top_campaigns", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/campaigns", periodConfirmed: true }));
+  });
+  it("keeps every capture action visibly named, including disabled approval", async () => {
+    const optionalReport: ReportDraft = { ...runnerReport(), sections: { signup_form: "optional" } };
+    const captureService: CaptureService = {
+      getActiveTab: vi.fn().mockResolvedValue({ sourceUrl: "https://www.klaviyo.com/signup", isKlaviyo: true }),
+      captureVisibleTab: vi.fn().mockResolvedValue({ sourceUrl: "https://www.klaviyo.com/signup", isKlaviyo: true, dataUrl: "data:image/png;base64,CCCC" }),
+    };
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([optionalReport]), getReportDraft: vi.fn().mockResolvedValue(optionalReport) }), captureService);
+    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(screen.getByText("Optional Sections · 1 available"));
+    await user.click(screen.getByRole("button", { name: "Capture" }));
+    expect(screen.getByRole("button", { name: "Capture Current Tab" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Capture Current Tab" }));
+    await cropAndConfirm(user, false);
+    expect(screen.getByRole("button", { name: "Approve & Upload" })).toBeDisabled();
   });
 });

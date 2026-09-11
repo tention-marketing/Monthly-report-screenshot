@@ -194,6 +194,7 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
   }
 
   if (captureItem?.screenshotType) return <CaptureWorkflow
+    key={`${report.id}:${captureItem.screenshotType}`}
     api={api} captureService={captureService} navigationService={navigationService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
     klaviyoAccountUrl={klaviyoAccountUrl} onKlaviyoAccountUrlChange={setKlaviyoAccountUrl}
     {...(runnerStarted ? { step: { current: runner.required.findIndex(({ section }) => section === captureItem.section) + 1, total: runner.required.length } } : {})}
