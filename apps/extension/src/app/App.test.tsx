@@ -2,8 +2,9 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
-import type { ReportDraft } from "@tention/report-schema";
+import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
+import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
 import { App } from "./App.js";
 
 const NOW = new Date("2026-09-09T12:00:00Z");
@@ -16,6 +17,27 @@ const report: ReportDraft = {
   screenshots: [], validation: { status: "valid", errors: [], warnings: [] },
   createdAt: NOW.toISOString(), updatedAt: NOW.toISOString(),
 };
+
+const runnerScreenshotTypes = [
+  "overview", "top_campaigns", "top_flows", "month_comparison",
+  "deliverability", "campaign_metrics", "flow_metrics", "list_growth",
+] as const satisfies readonly ScreenshotType[];
+
+function runnerReport(approvedTypes: readonly ScreenshotType[] = []): ReportDraft {
+  return {
+    ...report,
+    client: { id: "autoled", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null },
+    reportMonth: { year: 2026, month: 7 },
+    period: { startDate: "2026-07-01", endDate: "2026-07-31", previousStartDate: "2026-06-01", previousEndDate: "2026-06-30" },
+    sections: { ...DEFAULT_DRAFT_SECTION_CONFIGURATION },
+    screenshots: approvedTypes.map((type, index) => ({
+      id: `screenshot-${index}`, clientId: "autoled", reportMonth: { year: 2026, month: 7 }, type,
+      capturedAt: NOW.toISOString(), sourceUrl: "https://www.klaviyo.com", width: 100, height: 100,
+      approved: true, periodConfirmed: true, storageKey: `reports/${type}.png`, mimeType: "image/png",
+      byteSize: 100, sha256: "a".repeat(64), approvedAt: NOW.toISOString(),
+    })),
+  };
+}
 
 function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): ApiClient {
   return {
@@ -97,6 +119,33 @@ describe("extension report workflow", () => {
     expect(await screen.findByText("This capture is intended for a Klaviyo page.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Capture anyway" })).toBeInTheDocument();
     expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
+  });
+  it("opens the first required July capture from Start Report without selecting a checklist row", async () => {
+    const fullRunnerReport = runnerReport();
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
+    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    expect(screen.getByText("0 / 8 required screenshots completed")).toBeInTheDocument();
+    expect(screen.getByText("Next required capture")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(await screen.findByText("Step 1 of 8")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Executive Summary" })).toBeInTheDocument();
+    expect(screen.getByText("Expected report period: Jul 1, 2026 – Jul 31, 2026")).toBeInTheDocument();
+  });
+  it("resumes Start Report at the next incomplete required section", async () => {
+    const fullRunnerReport = runnerReport(["overview"]);
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
+    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(await screen.findByText("Step 2 of 8")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Top Campaigns" })).toBeInTheDocument();
+  });
+  it("shows review instead of restarting Start Report when all required captures are approved", async () => {
+    const fullRunnerReport = runnerReport(runnerScreenshotTypes);
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
+    await user.click(await screen.findByRole("button", { name: /AutoLEDTech\.com/ }));
+    expect(screen.getByText("8 / 8 required screenshots completed")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start Report" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Review Report" })).toBeInTheDocument();
   });
   it("keeps raw validation details out of the normal view and exposes them in Advanced / Debug", async () => {
     const validation = { status: "invalid" as const, errors: [{ code: "REQUIRED_SCREENSHOT_MISSING", severity: "error" as const, message: "Top Campaigns screenshot is missing." }], warnings: [] };
