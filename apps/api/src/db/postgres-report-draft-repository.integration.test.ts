@@ -85,6 +85,16 @@ suite("PostgresReportDraftRepository with real PostgreSQL", () => {
     expect((await recreated.getById(initial.id))?.status).toBe("data_fetching");
     expect((await recreated.getHistory(initial.id)).map(({ eventType }) => eventType)).toEqual(["REPORT_CREATED", "START_DATA_FETCH"]);
   });
+  it("transactionally deletes report-owned history and releases client/month identity", async () => {
+    const initial = await repository.create(draft());
+    const transitioned = applyReportEvent(initial, "START_DATA_FETCH", { now });
+    await repository.saveWithLifecycleEvent(transitioned, 1, "START_DATA_FETCH");
+    await expect(repository.delete(initial.id, 1)).rejects.toMatchObject({ code: "REPORT_VERSION_CONFLICT" });
+    await expect(repository.delete(initial.id, 2)).resolves.toMatchObject({ id: initial.id });
+    expect(await repository.getById(initial.id)).toBeNull();
+    await expect(repository.getHistory(initial.id)).rejects.toMatchObject({ code: "REPORT_NOT_FOUND" });
+    await expect(repository.create(draft())).resolves.toMatchObject({ client: { id: "client-1" }, reportMonth: { month: 8 } });
+  });
   it("writes nothing for an illegal lifecycle transition", async () => {
     const initial = await repository.create(draft());
     expect(() => applyReportEvent(initial, "GENERATION_SUCCEEDED", { now })).toThrow();

@@ -40,6 +40,12 @@ The API accepts only PNG uploads up to 10 MB, derives identity and dimensions fr
 
 Filesystem writes and database compare-and-swap updates are not one ACID transaction. The service writes a unique new asset, performs the versioned metadata update, deletes the new asset best-effort if that update fails, and deletes an old replaced asset best-effort only after success. A process crash can leave an orphan asset; reconciliation is deferred.
 
+## Draft deletion
+
+Development report deletion requires the caller's current `expectedVersion`. PostgreSQL locks the draft row, verifies its version, then deletes its report-owned lifecycle rows and draft in one transaction. The lifecycle foreign key does not use a global cascade; dependent history is explicitly deleted only for the selected report.
+
+After the transaction commits, the API best-effort deletes the selected report's recorded screenshot storage keys. Asset cleanup is deliberately after database success because filesystem deletion is not transactional. A cleanup failure is logged and does not restore the deleted draft; a failed database deletion leaves assets intact.
+
 ## Current limitations
 
 There is no authentication, production object storage, backup policy, financial data snapshot, screenshot revision history, or report revision model. Real PostgreSQL tests require a safe dedicated database through `TEST_DATABASE_URL`.

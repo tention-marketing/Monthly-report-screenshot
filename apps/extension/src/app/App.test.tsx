@@ -44,6 +44,7 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
     health: vi.fn().mockResolvedValue({ ok: true }),
     createReportDraft: vi.fn().mockResolvedValue(report),
     getReportDraft: vi.fn().mockResolvedValue(report),
+    deleteReportDraft: vi.fn().mockResolvedValue(undefined),
     listReportDrafts: vi.fn().mockResolvedValue([]),
     validateReportDraft: vi.fn().mockResolvedValue(report.validation),
     getReportHistory: vi.fn().mockResolvedValue([]),
@@ -146,6 +147,40 @@ describe("extension report workflow", () => {
     expect(screen.getByText("8 / 8 required screenshots completed")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start Report" })).toBeNull();
     expect(screen.getByRole("button", { name: "Review Report" })).toBeInTheDocument();
+  });
+  it("returns to setup without deleting the current report when starting a new report", async () => {
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) });
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(screen.getByRole("button", { name: "Start New Report" }));
+    expect(await screen.findByRole("heading", { name: "Report setup" })).toBeInTheDocument();
+    expect(api.deleteReportDraft).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: /Orion Supplements/ })).toBeInTheDocument();
+  });
+  it("requires DELETE confirmation before deleting a report and refreshes the setup view", async () => {
+    const api = mockApi({
+      listReportDrafts: vi.fn().mockResolvedValueOnce([report]).mockResolvedValueOnce([]),
+      deleteReportDraft: vi.fn().mockResolvedValue(undefined),
+    });
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: /Orion Supplements/ }));
+    await user.click(screen.getByText("Report options"));
+    await user.click(screen.getByRole("button", { name: "Delete Report" }));
+    const dialog = screen.getByRole("dialog", { name: "Delete report?" });
+    expect(within(dialog).getByText("Orion Supplements")).toBeInTheDocument();
+    const confirmation = within(dialog).getByRole("textbox", { name: "Type DELETE to confirm" });
+    await user.type(confirmation, "delete");
+    expect(within(dialog).getByRole("button", { name: "Delete Report" })).toBeDisabled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(api.deleteReportDraft).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Delete Report" }));
+    const confirmedDialog = screen.getByRole("dialog", { name: "Delete report?" });
+    await user.type(within(confirmedDialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
+    await user.click(within(confirmedDialog).getByRole("button", { name: "Delete Report" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Report deleted.");
+    expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
+    expect(screen.queryByRole("button", { name: /Orion Supplements/ })).toBeNull();
   });
   it("keeps raw validation details out of the normal view and exposes them in Advanced / Debug", async () => {
     const validation = { status: "invalid" as const, errors: [{ code: "REQUIRED_SCREENSHOT_MISSING", severity: "error" as const, message: "Top Campaigns screenshot is missing." }], warnings: [] };

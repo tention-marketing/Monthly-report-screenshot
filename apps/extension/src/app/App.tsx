@@ -33,6 +33,7 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
   const [report, setReport] = useState<ReportDraft | null>(null);
   const [loadingReport, setLoadingReport] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const connect = useCallback(async () => {
     setConnection("checking"); setError(null);
@@ -50,6 +51,11 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
     catch (caught) { setError(caught instanceof ApiError && caught.code === "REPORT_NOT_FOUND" ? "Report not found." : "The report could not be loaded."); }
     finally { setLoadingReport(false); }
   }, [api]);
+  const startNewReport = useCallback(() => { setReport(null); }, []);
+  const reportDeleted = useCallback((id: string) => {
+    setReport(null); setNotice("Report deleted.");
+    void api.listReportDrafts().then(setRecent).catch(() => setRecent((items) => items.filter((item) => item.id !== id)));
+  }, [api]);
 
   return <div className="app-shell">
     <header className="brand-row">
@@ -59,17 +65,18 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
     {connection === "unavailable" && <section className="notice error-notice"><p>The reporting API could not be reached.</p><button onClick={() => void connect()}>Retry connection</button></section>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
     {loadingReport ? <p className="loading">Loading report…</p> : report
-      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} report={report} onReport={setReport} />
-      : <Home api={api} connected={connection === "connected"} recent={recent} now={now} onCreated={(created) => { setReport(created); setRecent((items) => [created, ...items]); }} onOpen={openReport} />}
+      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} report={report} onReport={setReport} onStartNew={startNewReport} onDeleted={reportDeleted} />
+      : <Home api={api} connected={connection === "connected"} recent={recent} notice={notice} now={now} onCreated={(created) => { setReport(created); setRecent((items) => [created, ...items]); }} onOpen={openReport} />}
   </div>;
 }
 
 interface HomeProps {
   api: ApiClient; connected: boolean; recent: ReportDraft[]; now: () => Date;
+  notice: string | null;
   onCreated(report: ReportDraft): void; onOpen(id: string): void;
 }
 
-function Home({ api, connected, recent, now, onCreated, onOpen }: HomeProps) {
+function Home({ api, connected, recent, notice, now, onCreated, onOpen }: HomeProps) {
   const [clientId, setClientId] = useState("");
   const [clientName, setClientName] = useState("");
   const [timeZone, setTimeZone] = useState("");
@@ -102,6 +109,7 @@ function Home({ api, connected, recent, now, onCreated, onOpen }: HomeProps) {
   }
 
   return <main>
+    {notice && <p role="status" className="notice success-notice">{notice}</p>}
     <section className="card">
       <div className="section-heading"><div><p className="kicker">Create monthly report</p><h1>Report setup</h1></div></div>
       <p className="support-copy">Client directory and connection management come in a later phase.</p>
@@ -137,7 +145,7 @@ function RecentReports({ reports, onOpen }: { reports: ReportDraft[]; onOpen(id:
   return <section className="card"><h2>Recent Reports</h2>{reports.length === 0 ? <p className="empty">No reports yet.</p> : <ul className="recent-list">{reports.map((report) => <li key={report.id}><button onClick={() => onOpen(report.id)}><strong>{report.client.name}</strong><span>{formatReportMonth(report.reportMonth)} · {humanize(report.status)}</span><small>Updated {new Date(report.updatedAt).toLocaleString()}</small></button></li>)}</ul>}</section>;
 }
 
-function ReportDetail({ api, captureService, navigationService, report, onReport }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; report: ReportDraft; onReport(report: ReportDraft): void }) {
+function ReportDetail({ api, captureService, navigationService, report, onReport, onStartNew, onDeleted }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; report: ReportDraft; onReport(report: ReportDraft): void; onStartNew(): void; onDeleted(id: string): void }) {
   const [validation, setValidation] = useState<ReportValidationState>(report.validation);
   const [history, setHistory] = useState<Awaited<ReturnType<ApiClient["getReportHistory"]>>>([]);
   const [busy, setBusy] = useState(false);
@@ -148,6 +156,8 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
   const [runnerStarted, setRunnerStarted] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [klaviyoAccountUrl, setKlaviyoAccountUrl] = useState(() => loadKlaviyoAccountUrl(report.id));
   const checklist = buildReportChecklist(report);
   const runner = getReportRunnerState(report);
@@ -188,6 +198,15 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
     setRunnerStarted(true); setCaptureItem(runner.next);
   }
   function selectManualCapture(item: ChecklistItem) { setRunnerStarted(false); setCaptureItem(item); }
+  async function deleteReport() {
+    if (deleteConfirmation !== "DELETE") return;
+    setBusy(true); setActionError(null); setConflict(false);
+    try { await api.deleteReportDraft(report.id, report.version); onDeleted(report.id); }
+    catch (caught) {
+      if (caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT") { setDeleteOpen(false); setConflict(true); }
+      else setActionError(caught instanceof ApiError ? caught.message : "Report could not be deleted.");
+    } finally { setBusy(false); }
+  }
   function toggleAdvanced() {
     const next = !advancedOpen; setAdvancedOpen(next);
     if (next && history.length === 0) void loadHistory();
@@ -215,11 +234,14 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
       <div className="period-preview"><span>Reporting Period<strong>{formatCalendarRange(report.period.startDate, report.period.endDate)}</strong></span><span>Previous Comparison<strong>{formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}</strong></span></div>
       <p className="progress-copy">{runner.completed} / {runner.required.length} required screenshots completed</p>
       {runner.isComplete ? <button className="primary" onClick={() => setReviewOpen(true)}>Review Report</button> : <button className="primary" onClick={startRunner}>Start Report</button>}
+      <button className="secondary" onClick={onStartNew}>Start New Report</button>
     </section>
     <section className="card"><div className="section-heading"><h2>Report Progress</h2><span className="count">{runner.completed} / {runner.required.length} completed</span></div>
       <ul className="checklist runner-checklist">{runner.required.map((item) => <li key={item.section} className={item.section === runner.next?.section ? "current-step" : ""}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.section === runner.next?.section ? "→" : "○"}</span><span><strong>{item.label}</strong><small>{item.section === runner.next?.section ? "Next required capture" : checklistText(item.state, item.requirement)}</small></span>{item.state === "approved" && <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button>}</li>)}</ul>
     </section>
     {optional.length > 0 && <details className="card optional-sections"><summary>Optional Sections · {optional.length} available</summary><ul className="checklist">{optional.map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{item.state === "approved" ? <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button> : <button disabled={busy} onClick={() => selectManualCapture(item)}>Capture</button>}</li>)}</ul></details>}
+    <details className="card report-options"><summary>Report options</summary><button className="danger" disabled={busy} onClick={() => { setDeleteConfirmation(""); setDeleteOpen(true); }}>Delete Report</button></details>
+    {deleteOpen && <section role="dialog" aria-modal="true" aria-labelledby="delete-report-title" className="card delete-dialog"><h2 id="delete-report-title">Delete report?</h2><p><strong>{report.client.name}</strong><br />{formatReportMonth(report.reportMonth)}</p><p className="support-copy">This permanently deletes this report and its development screenshot assets.</p><label>Type DELETE to confirm<input aria-label="Type DELETE to confirm" value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoComplete="off" /></label><div className="actions"><button onClick={() => setDeleteOpen(false)}>Cancel</button><button className="danger" disabled={busy || deleteConfirmation !== "DELETE"} onClick={() => void deleteReport()}>{busy ? "Deleting…" : "Delete Report"}</button></div></section>}
     {conflict && <section role="alert" className="card conflict"><h2>This report was updated somewhere else.</h2><p>Reload the latest version before deciding what to do next.</p><button onClick={() => void reload()}>Reload Latest Version</button></section>}
     {actionError && <p role="alert" className="notice error-notice">{actionError}</p>}
     <section className="card advanced"><button className="text-button" aria-expanded={advancedOpen} onClick={toggleAdvanced}>{advancedOpen ? "Hide Advanced / Debug" : "Show Advanced / Debug"}</button>

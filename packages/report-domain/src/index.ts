@@ -147,13 +147,14 @@ export interface ReportDraftRepository {
   getById(id: string): Promise<ReportDraft | null>;
   save(draft: ReportDraft, expectedVersion: number): Promise<ReportDraft>;
   saveWithLifecycleEvent(draft: ReportDraft, expectedVersion: number, eventType: ReportEvent): Promise<ReportDraft>;
+  delete(id: string, expectedVersion: number): Promise<ReportDraft>;
   list(): Promise<ReportDraft[]>;
   getHistory(reportId: string): Promise<ReportLifecycleEvent[]>;
 }
 
 export type PersistenceErrorCode =
   | "REPORT_NOT_FOUND" | "REPORT_VERSION_CONFLICT" | "REPORT_DRAFT_ALREADY_EXISTS"
-  | "PERSISTENCE_DATA_INVALID" | "DATABASE_UNAVAILABLE";
+  | "REPORT_DELETE_FAILED" | "PERSISTENCE_DATA_INVALID" | "DATABASE_UNAVAILABLE";
 
 export class ReportPersistenceError extends Error {
   constructor(
@@ -186,6 +187,12 @@ export class InMemoryReportDraftRepository implements ReportDraftRepository {
     const event = createHistoryEvent(saved, eventType, current.status, saved.status);
     this.history.set(draft.id, [...(this.history.get(draft.id) ?? []), event]);
     return saved;
+  }
+  async delete(id: string, expectedVersion: number): Promise<ReportDraft> {
+    const current = this.requireCurrent(id, expectedVersion);
+    this.history.delete(id);
+    this.drafts.delete(id);
+    return structuredClone(current);
   }
   async list(): Promise<ReportDraft[]> { return [...this.drafts.values()].map((draft) => structuredClone(draft)); }
   async getHistory(reportId: string): Promise<ReportLifecycleEvent[]> {

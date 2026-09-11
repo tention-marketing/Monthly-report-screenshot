@@ -1,11 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { InMemoryReportDraftRepository, ReportPersistenceError } from "@tention/report-domain";
 import { buildApp } from "./app.js";
+import { InMemoryScreenshotStorage } from "./storage/screenshot-storage.js";
 
 const NOW = new Date("2026-09-09T12:00:00Z");
 let app: FastifyInstance;
+let screenshotStorage: InMemoryScreenshotStorage;
 
-beforeEach(() => { app = buildApp({ now: () => new Date(NOW) }); });
+beforeEach(() => { screenshotStorage = new InMemoryScreenshotStorage(); app = buildApp({ now: () => new Date(NOW), screenshotStorage }); });
 afterEach(async () => app.close());
 
 const body = (overrides: Record<string, unknown> = {}) => ({
@@ -30,6 +33,10 @@ async function upload(id: string, type = "overview", expectedVersion = 1, source
   });
 }
 const eventPayload = (expectedVersion: number, event: string) => ({ expectedVersion, event });
+const deletePayload = (expectedVersion: number) => ({ expectedVersion });
+async function deleteDraft(id: string, expectedVersion: number) {
+  return app.inject({ method: "DELETE", url: `/api/v1/report-drafts/${id}`, payload: deletePayload(expectedVersion) });
+}
 
 describe("report draft API", () => {
   it("lists an empty repository", async () => {
@@ -77,6 +84,12 @@ describe("report draft API", () => {
     const duplicate = await create();
     expect(duplicate.statusCode).toBe(409);
     expect(duplicate.json().error).toBe("REPORT_DRAFT_ALREADY_EXISTS");
+  });
+  it("releases the client/month uniqueness constraint after deleting a report", async () => {
+    const original = await create();
+    expect((await create()).json().error).toBe("REPORT_DRAFT_ALREADY_EXISTS");
+    expect((await deleteDraft(original.json().id, 1)).statusCode).toBe(200);
+    expect((await create()).statusCode).toBe(201);
   });
   it.each([
     [{ year: 2026, month: 9 }, "current"],
@@ -202,6 +215,45 @@ describe("report draft API", () => {
     response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(2, "DATA_FETCH_SUCCEEDED") });
     expect(response.statusCode).toBe(409);
     expect(response.json().error).toBe("REPORT_VERSION_CONFLICT");
+  });
+  it("does not delete a stale report or its screenshot asset", async () => {
+    const created = (await create()).json();
+    const uploaded = (await upload(created.id)).json();
+    const storageKey = uploaded.screenshots[0].storageKey;
+    const response = await deleteDraft(created.id, 1);
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "REPORT_VERSION_CONFLICT", expectedVersion: 1, currentVersion: 2 });
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).statusCode).toBe(200);
+    expect(await screenshotStorage.get(storageKey)).not.toBeNull();
+  });
+  it("deletes report-owned history and assets without touching unrelated assets", async () => {
+    const created = (await create()).json();
+    const overview = (await upload(created.id, "overview", 1)).json();
+    const campaigns = (await upload(created.id, "top_campaigns", 2)).json();
+    const keys = campaigns.screenshots.map(({ storageKey }: { storageKey: string }) => storageKey);
+    const unrelatedKey = "reports/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/overview/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.png";
+    await screenshotStorage.put(unrelatedKey, PNG);
+    expect(overview.screenshots).toHaveLength(1);
+    expect((await deleteDraft(created.id, 3)).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/history` })).statusCode).toBe(404);
+    await Promise.all(keys.map(async (key: string) => expect(await screenshotStorage.get(key)).toBeNull()));
+    expect(await screenshotStorage.get(unrelatedKey)).not.toBeNull();
+  });
+  it("leaves screenshot assets intact when report deletion fails", async () => {
+    await app.close();
+    const repository = new InMemoryReportDraftRepository();
+    vi.spyOn(repository, "delete").mockRejectedValue(new ReportPersistenceError("REPORT_DELETE_FAILED", "Report draft could not be deleted."));
+    screenshotStorage = new InMemoryScreenshotStorage();
+    app = buildApp({ now: () => new Date(NOW), repository, screenshotStorage });
+    const created = (await create()).json();
+    const uploaded = (await upload(created.id)).json();
+    const storageKey = uploaded.screenshots[0].storageKey;
+    const response = await deleteDraft(created.id, 2);
+    expect(response.statusCode).toBe(500);
+    expect(response.json().error).toBe("REPORT_DELETE_FAILED");
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).statusCode).toBe(200);
+    expect(await screenshotStorage.get(storageKey)).not.toBeNull();
   });
   it("serves the current stored screenshot image without exposing its storage key", async () => {
     const created = (await create()).json();

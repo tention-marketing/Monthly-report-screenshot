@@ -90,6 +90,32 @@ export class PostgresReportDraftRepository implements ReportDraftRepository {
     });
   }
 
+  async delete(id: string, expectedVersion: number): Promise<ReportDraft> {
+    try {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const current = await currentDraft(client, id, true);
+        if (current.version !== expectedVersion) {
+          throw new ReportPersistenceError(
+            "REPORT_VERSION_CONFLICT", "Report draft has changed since it was read.",
+            { expectedVersion, currentVersion: current.version },
+          );
+        }
+        await client.query("DELETE FROM report_lifecycle_events WHERE report_id = $1", [id]);
+        await client.query("DELETE FROM report_drafts WHERE id = $1 AND version = $2", [id, expectedVersion]);
+        await client.query("COMMIT");
+        return current;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally { client.release(); }
+    } catch (error) {
+      if (error instanceof ReportPersistenceError) throw error;
+      throw new ReportPersistenceError("REPORT_DELETE_FAILED", "Report draft could not be deleted.");
+    }
+  }
+
   async list(): Promise<ReportDraft[]> {
     return this.withErrors(async () => {
       const result = await this.pool.query<DraftRow>("SELECT * FROM report_drafts ORDER BY created_at ASC, id ASC");
@@ -152,8 +178,8 @@ async function updateDraft(db: Queryable, draft: ReportDraft, expectedVersion: n
   throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Immutable report identity cannot be changed.");
 }
 
-async function currentDraft(db: Queryable, id: string): Promise<ReportDraft> {
-  const result = await db.query<DraftRow>("SELECT * FROM report_drafts WHERE id = $1", [id]);
+async function currentDraft(db: Queryable, id: string, lock = false): Promise<ReportDraft> {
+  const result = await db.query<DraftRow>(`SELECT * FROM report_drafts WHERE id = $1${lock ? " FOR UPDATE" : ""}`, [id]);
   if (!result.rows[0]) throw new ReportPersistenceError("REPORT_NOT_FOUND", "Report draft was not found.");
   return parseDraftRow(result.rows[0]);
 }

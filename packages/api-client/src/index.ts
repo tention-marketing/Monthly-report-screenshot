@@ -15,6 +15,7 @@ export interface ReportDraftFilters { clientId?: string; year?: number; month?: 
 export type ApiErrorCode =
   | "NETWORK_ERROR" | "REPORT_NOT_FOUND" | "REPORT_VERSION_CONFLICT"
   | "REPORT_DRAFT_ALREADY_EXISTS" | "INVALID_REQUEST" | "REPORT_VALIDATION_FAILED"
+  | "REPORT_DELETE_FAILED"
   | "ILLEGAL_REPORT_TRANSITION" | "SCREENSHOT_TOO_LARGE" | "INVALID_SCREENSHOT_TYPE"
   | "INVALID_SCREENSHOT_CONTENT" | "SCREENSHOT_NOT_FOUND" | "STORAGE_ERROR" | "UNKNOWN_API_ERROR" | string;
 
@@ -54,6 +55,9 @@ export function createApiClient(options: ApiClientOptions) {
     },
     async getReportDraft(id: string): Promise<ReportDraft> {
       return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}`));
+    },
+    async deleteReportDraft(id: string, expectedVersion: number): Promise<void> {
+      await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}`, jsonRequest("DELETE", { expectedVersion }));
     },
     async listReportDrafts(filters: ReportDraftFilters = {}): Promise<ReportDraft[]> {
       const query = new URLSearchParams();
@@ -119,6 +123,6 @@ async function toApiError(response: Response): Promise<ApiError> {
   return new ApiError(code, message, response.status, data);
 }
 
-function jsonRequest(method: "POST" | "PUT", body: unknown): RequestInit {
+function jsonRequest(method: "POST" | "PUT" | "DELETE", body: unknown): RequestInit {
   return { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) };
 }

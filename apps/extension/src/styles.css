@@ -32,9 +32,11 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .period-preview span, .metadata span { display: grid; gap: 4px; color: #67706b; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
 .period-preview strong, .metadata strong { color: #26302b; font-size: 11px; letter-spacing: 0; text-transform: none; }
 .primary { min-height: 43px; border: 0; border-radius: 9px; color: #fff; background: #1e6148; font-weight: 800; }
+.secondary { width: 100%; min-height: 40px; margin-top: 8px; border: 1px solid #9ba6a0; border-radius: 9px; color: #245d48; background: #fff; font-weight: 750; }
 .text-button { border: 0; color: #245d48; background: transparent; font-weight: 750; }
 .notice { margin: 12px; padding: 12px 14px; border-radius: 9px; }
 .error-notice { border: 1px solid #f0b8b2; color: #8f2119; background: #fff4f2; }
+.success-notice { margin: 0; border: 1px solid #b9dbc9; color: #17633f; background: #eff9f2; }
 .error-notice p { margin-bottom: 8px; }
 .field-error { margin: -8px 0 0; color: #a62b21; font-size: 12px; }
 .loading { padding: 28px; color: #68706c; }
@@ -66,11 +68,16 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .actions button.primary { border: 0; color: #fff; background: #1e6148; }
 .actions button.primary:hover:not(:disabled) { background: #174e3a; }
 .actions button.primary:disabled { color: #fff; background: #1e6148; }
+.danger { padding: 8px 10px; border: 1px solid #c53a32; border-radius: 8px; color: #a62b21; background: #fff; font-weight: 800; }
+.danger:disabled { color: #a62b21; background: #fff; }
 .capture-workflow { padding-bottom: 24px; }
 .progress-copy { margin: 14px 0; color: #315d4d; font-size: 13px; font-weight: 800; }
 .runner-checklist .current-step { margin: 0 -8px; padding: 11px 8px; border-radius: 9px; background: #edf7f1; }
 .optional-sections summary { cursor: pointer; color: #315d4d; font-weight: 800; }
 .optional-sections .checklist { margin-top: 10px; }
+.report-options summary { cursor: pointer; color: #5b433f; font-weight: 800; }
+.report-options .danger { margin-top: 12px; }
+.delete-dialog { border-color: #e8b3ad; }
 .advanced { padding: 10px 14px; }
 .advanced-content { display: grid; gap: 14px; margin-top: 12px; }
 .advanced-content section { padding-top: 12px; border-top: 1px solid #eeede8; }

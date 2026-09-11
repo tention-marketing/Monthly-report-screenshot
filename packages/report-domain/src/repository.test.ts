@@ -53,6 +53,17 @@ describe("InMemoryReportDraftRepository contract", () => {
       code: "REPORT_VERSION_CONFLICT", details: { expectedVersion: 1, currentVersion: 2 },
     });
   });
+  it("deletes only the current-version draft and its report-owned history", async () => {
+    const repository = new InMemoryReportDraftRepository();
+    const first = await repository.create(createDraft());
+    const second = await repository.create(createDraft(crypto.randomUUID(), "client-2"));
+    await expect(repository.delete(first.id, 2)).rejects.toMatchObject({ code: "REPORT_VERSION_CONFLICT" });
+    expect(await repository.getById(first.id)).not.toBeNull();
+    await expect(repository.delete(first.id, 1)).resolves.toMatchObject({ id: first.id });
+    expect(await repository.getById(first.id)).toBeNull();
+    await expect(repository.getHistory(first.id)).rejects.toMatchObject({ code: "REPORT_NOT_FOUND" });
+    expect(await repository.getById(second.id)).not.toBeNull();
+  });
   it("rejects immutable identity changes and invalid persisted data", async () => {
     const repository = new InMemoryReportDraftRepository();
     const initial = await repository.create(createDraft());

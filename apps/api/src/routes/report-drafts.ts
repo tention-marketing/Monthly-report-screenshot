@@ -23,6 +23,7 @@ const eventRequestSchema = z.object({ event: z.enum([
   "SUBMIT_FOR_REVIEW", "APPROVE", "START_GENERATION", "GENERATION_SUCCEEDED",
   "GENERATION_FAILED", "RESET_TO_DRAFT",
 ]), expectedVersion: z.number().int().positive() }).strict();
+const deleteRequestSchema = z.object({ expectedVersion: z.number().int().positive() }).strict();
 const imageUploadHeadersSchema = z.object({
   "x-expected-version": z.coerce.number().int().positive(),
   "x-period-confirmed": z.literal("true"),
@@ -63,6 +64,22 @@ export const reportDraftRoutes: FastifyPluginAsync<RouteOptions> = async (app, o
     try {
       const draft = await options.repository.getById(request.params.id);
       return draft ?? reply.code(404).send({ error: "REPORT_NOT_FOUND" });
+    } catch (error) { return sendError(reply, error); }
+  });
+
+  app.delete<{ Params: { id: string } }>("/report-drafts/:id", async (request, reply) => {
+    try {
+      const { expectedVersion } = deleteRequestSchema.parse(request.body);
+      const draft = await options.repository.getById(request.params.id);
+      if (!draft) return reply.code(404).send({ error: "REPORT_NOT_FOUND" });
+      ensureExpectedVersion(draft.version, expectedVersion);
+      const storageKeys = [...new Set(draft.screenshots.flatMap(({ storageKey }) => storageKey ? [storageKey] : []))];
+      await options.repository.delete(draft.id, expectedVersion);
+      await Promise.all(storageKeys.map(async (storageKey) => {
+        try { await options.screenshotStorage.delete(storageKey); }
+        catch (error) { app.log.warn({ error, reportId: draft.id, storageKey }, "Report screenshot asset cleanup failed."); }
+      }));
+      return { deleted: true };
     } catch (error) { return sendError(reply, error); }
   });
 
@@ -164,7 +181,8 @@ function sendError(reply: FastifyReply, error: unknown) {
     const status = error.code === "REPORT_NOT_FOUND" ? 404
       : error.code === "REPORT_VERSION_CONFLICT" || error.code === "REPORT_DRAFT_ALREADY_EXISTS" ? 409 : 500;
     const payload = status === 500
-      ? { error: error.code, message: error.code === "DATABASE_UNAVAILABLE" ? "Report storage is unavailable." : "Stored report data could not be processed." }
+      ? { error: error.code, message: error.code === "DATABASE_UNAVAILABLE" ? "Report storage is unavailable."
+        : error.code === "REPORT_DELETE_FAILED" ? "Report could not be deleted." : "Stored report data could not be processed." }
       : { error: error.code, message: error.message, ...error.details };
     return reply.code(status).send(payload);
   }
