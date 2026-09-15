@@ -11,6 +11,8 @@ import { CaptureWorkflow } from "../features/screenshot-capture/CaptureWorkflow.
 import { unavailableCaptureService, type CaptureService } from "../features/screenshot-capture/capture-service.js";
 import { getReportRunnerState } from "../features/report-runner/runner.js";
 import { unavailableKlaviyoNavigationService, type KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
+import { unavailableAutoCaptureService, type AutoCaptureService } from "../features/automatic-capture/auto-capture-service.js";
+import type { ToolbarInvocationDiagnostics } from "../features/klaviyo-navigation/active-tab-grant.js";
 import {
   formatCalendarRange, formatReportMonth, getCompletedMonthOptions, normalizeSelectedMonth,
   parseMonthValue, toMonthValue,
@@ -25,9 +27,9 @@ const sectionLabels: Record<string, string> = {
   list_growth: "List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
 };
 
-export interface AppProps { api: ApiClient; captureService?: CaptureService; navigationService?: KlaviyoNavigationService; now?: () => Date }
+export interface AppProps { api: ApiClient; captureService?: CaptureService; navigationService?: KlaviyoNavigationService; automaticCaptureService?: AutoCaptureService; now?: () => Date }
 
-export function App({ api, captureService = unavailableCaptureService, navigationService = unavailableKlaviyoNavigationService, now = () => new Date() }: AppProps) {
+export function App({ api, captureService = unavailableCaptureService, navigationService = unavailableKlaviyoNavigationService, automaticCaptureService = unavailableAutoCaptureService, now = () => new Date() }: AppProps) {
   const [connection, setConnection] = useState<ConnectionState>("checking");
   const [recent, setRecent] = useState<ReportDraft[]>([]);
   const [report, setReport] = useState<ReportDraft | null>(null);
@@ -86,7 +88,7 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
     {connection === "unavailable" && <section className="notice error-notice"><p>The reporting API could not be reached.</p><button onClick={() => void connect()}>Retry connection</button></section>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
     {loadingReport ? <p className="loading">Loading report…</p> : report
-      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} report={report} onReport={setReport} onStartNew={startNewReport} onRequestDelete={requestReportDeletion} />
+      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} automaticCaptureService={automaticCaptureService} report={report} onReport={setReport} onStartNew={startNewReport} onRequestDelete={requestReportDeletion} />
       : <Home api={api} connected={connection === "connected"} recent={recent} notice={notice} now={now} onCreated={(created) => { setReport(created); setRecent((items) => [created, ...items]); }} onOpen={openReport} onRequestDelete={requestReportDeletion} />}
     {deleteTarget && <ReportDeleteDialog report={deleteTarget} confirmation={deleteConfirmation} busy={deleteBusy} error={deleteError} onConfirmation={setDeleteConfirmation} onCancel={cancelReportDeletion} onDelete={() => void deleteReport()} />}
   </div>;
@@ -167,7 +169,7 @@ function RecentReports({ reports, onOpen, onRequestDelete }: { reports: ReportDr
   return <section className="card"><h2>Recent Reports</h2>{reports.length === 0 ? <p className="empty">No reports yet.</p> : <ul className="recent-list">{reports.map((report) => <li key={report.id}><div className="recent-report"><strong>{report.client.name}</strong><span>{formatReportMonth(report.reportMonth)} · {humanize(report.status)}</span><small>Updated {new Date(report.updatedAt).toLocaleString()}</small></div><div className="recent-actions"><button onClick={() => onOpen(report.id)}>Open Report</button><button className="danger" onClick={() => onRequestDelete(report)}>Delete Report</button></div></li>)}</ul>}</section>;
 }
 
-function ReportDetail({ api, captureService, navigationService, report, onReport, onStartNew, onRequestDelete }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; report: ReportDraft; onReport(report: ReportDraft): void; onStartNew(): void; onRequestDelete(report: ReportDraft): void }) {
+function ReportDetail({ api, captureService, navigationService, automaticCaptureService, report, onReport, onStartNew, onRequestDelete }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; automaticCaptureService: AutoCaptureService; report: ReportDraft; onReport(report: ReportDraft): void; onStartNew(): void; onRequestDelete(report: ReportDraft): void }) {
   const [validation, setValidation] = useState<ReportValidationState>(report.validation);
   const [history, setHistory] = useState<Awaited<ReturnType<ApiClient["getReportHistory"]>>>([]);
   const [busy, setBusy] = useState(false);
@@ -178,6 +180,7 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
   const [runnerStarted, setRunnerStarted] = useState(false);
   const [reviewOpen, setReviewOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [toolbarDiagnostics, setToolbarDiagnostics] = useState<ToolbarInvocationDiagnostics | null>(null);
   const [klaviyoAccountUrl, setKlaviyoAccountUrl] = useState(() => loadKlaviyoAccountUrl(report.id));
   const checklist = buildReportChecklist(report);
   const runner = getReportRunnerState(report);
@@ -221,11 +224,12 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
   function toggleAdvanced() {
     const next = !advancedOpen; setAdvancedOpen(next);
     if (next && history.length === 0) void loadHistory();
+    if (next && automaticCaptureService.getToolbarDiagnostics) void automaticCaptureService.getToolbarDiagnostics().then(setToolbarDiagnostics).catch(() => setToolbarDiagnostics(null));
   }
 
   if (captureItem?.screenshotType) return <CaptureWorkflow
     key={`${report.id}:${captureItem.screenshotType}`}
-    api={api} captureService={captureService} navigationService={navigationService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
+    api={api} captureService={captureService} navigationService={navigationService} automaticCaptureService={automaticCaptureService} report={report} screenshotType={captureItem.screenshotType} label={captureItem.label}
     klaviyoAccountUrl={klaviyoAccountUrl} onKlaviyoAccountUrlChange={setKlaviyoAccountUrl}
     {...(runnerStarted ? { step: { current: runner.required.findIndex(({ section }) => section === captureItem.section) + 1, total: runner.required.length } } : {})}
     continueLabel={runnerStarted ? "Confirm & Continue" : "Approve & Upload"}
@@ -257,6 +261,7 @@ function ReportDetail({ api, captureService, navigationService, report, onReport
     <section className="card advanced"><button className="text-button" aria-expanded={advancedOpen} onClick={toggleAdvanced}>{advancedOpen ? "Hide Advanced / Debug" : "Show Advanced / Debug"}</button>
       {advancedOpen && <div className="advanced-content"><p className="support-copy">Technical report state and validation details. These controls are not part of the capture workflow.</p>
         <div className="metadata"><span>Status<strong>{humanize(report.status)}</strong></span><span>Version<strong>{report.version}</strong></span><span>Updated<strong>{new Date(report.updatedAt).toLocaleString()}</strong></span></div>
+        <section><h2>Toolbar capture diagnostics</h2><div className="metadata"><span>Action handler fired<strong>{toolbarDiagnostics?.actionInvocation ? "Yes" : "No"}</strong></span><span>Granted tab<strong>{toolbarDiagnostics?.grantedTabId ?? "—"}</strong></span><span>Current active tab<strong>{toolbarDiagnostics?.currentActiveTabId ?? "—"}</strong></span><span>Granted page<strong>{toolbarDiagnostics?.actionInvocation?.pathname ?? "—"}</strong></span><span>Route matched<strong>{toolbarDiagnostics?.routeMatched ? "Yes" : "No"}</strong></span></div></section>
         <div className="validation-summary"><span>Errors <strong>{validation.errors.length}</strong></span><span>Warnings <strong>{validation.warnings.length}</strong></span></div>
         <button disabled={busy} onClick={() => void validate()}>{busy ? "Working…" : "Validate Report"}</button>
         {(validation.errors.length > 0 || validation.warnings.length > 0) && <ul className="issues">{[...validation.errors, ...validation.warnings].map((issue, index) => <li key={`${issue.code}-${index}`} className={issue.severity}><strong>{issue.severity.toUpperCase()}</strong><span>{issue.message}<small>{issue.code}</small></span></li>)}</ul>}

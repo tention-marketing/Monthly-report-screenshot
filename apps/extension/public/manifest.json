@@ -3,7 +3,9 @@
   "name": "Tention Reports",
   "version": "0.1.0",
   "description": "Tention monthly performance reporting workspace.",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": ["activeTab", "scripting", "sidePanel", "storage"],
   "host_permissions": ["http://127.0.0.1:3000/*", "https://www.klaviyo.com/*"],
-  "action": { "default_title": "Tention Reports", "default_popup": "index.html" }
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Tention Reports" },
+  "side_panel": { "default_path": "index.html" }
 }

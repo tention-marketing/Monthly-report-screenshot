@@ -5,6 +5,7 @@ import { ApiError, type ApiClient } from "@tention/api-client";
 import type { ReportDraft, ScreenshotType } from "@tention/report-schema";
 import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
 import type { KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
+import type { AutoCaptureService, AutoCaptureState } from "../features/automatic-capture/auto-capture-service.js";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
 import { App } from "./App.js";
 
@@ -55,7 +56,14 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
     ...overrides,
   } as ApiClient;
 }
-const renderApp = (api: ApiClient, captureService?: CaptureService, navigationService?: KlaviyoNavigationService) => render(<App api={api} {...(captureService ? { captureService } : {})} {...(navigationService ? { navigationService } : {})} now={() => new Date(NOW)} />);
+const renderApp = (api: ApiClient, captureService?: CaptureService, navigationService?: KlaviyoNavigationService, automaticCaptureService?: AutoCaptureService) => render(<App api={api} {...(captureService ? { captureService } : {})} {...(navigationService ? { navigationService } : {})} {...(automaticCaptureService ? { automaticCaptureService } : {})} now={() => new Date(NOW)} />);
+
+function automaticRequest(initial: ReportDraft) {
+  return { reportId: initial.id, screenshotType: "overview" as const, accountUrl: null, period: initial.period };
+}
+function automaticService(state: AutoCaptureState, restored: AutoCaptureState | null = null): AutoCaptureService {
+  return { start: vi.fn().mockResolvedValue(state), get: vi.fn().mockResolvedValue(restored), clear: vi.fn().mockResolvedValue(undefined) };
+}
 
 describe("extension report workflow", () => {
   it("shows API unavailable state and retry", async () => {
@@ -239,6 +247,20 @@ describe("extension report workflow", () => {
     expect(await screen.findByText("Top Campaigns screenshot is missing.")).toBeInTheDocument();
     expect(screen.getByText("REQUIRED_SCREENSHOT_MISSING")).toBeInTheDocument();
   });
+  it("shows persisted toolbar invocation diagnostics only in Advanced / Debug", async () => {
+    const automaticCaptureService = automaticService({ request: automaticRequest(report), stage: "failed", code: "ACTION_NOT_INVOKED", message: "not started" });
+    automaticCaptureService.getToolbarDiagnostics = vi.fn().mockResolvedValue({
+      actionInvocation: { tabId: 7, windowId: 4, origin: "https://www.klaviyo.com", pathname: "/analytics/dashboards/business-review", invokedAt: 1 },
+      grantedTabId: 7, currentActiveTabId: 7, routeMatched: true,
+    });
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }), undefined, undefined, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(screen.queryByText("Toolbar capture diagnostics")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
+    expect(await screen.findByText("Toolbar capture diagnostics")).toBeInTheDocument();
+    expect(screen.getByText("Action handler fired").parentElement).toHaveTextContent("Yes");
+    expect(screen.getByText("Granted page").parentElement).toHaveTextContent("/analytics/dashboards/business-review");
+  });
   it("shows a version conflict and reloads the server version", async () => {
     const latest = { ...report, version: 2, updatedAt: "2026-09-09T13:00:00.000Z" };
     const api = mockApi({
@@ -362,7 +384,8 @@ describe("capture workflow cross-section safety", () => {
       openSection: vi.fn(), preparePeriod: vi.fn(() => ({ kind: "manual_period_required" as const })),
       prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "ready", detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 } }),
     };
-    const user = userEvent.setup(); renderApp(api, captureService, navigationService);
+    const automaticCaptureService = automaticService({ request: automaticRequest(initial), stage: "review_ready", sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } });
+    const user = userEvent.setup(); renderApp(api, captureService, navigationService, automaticCaptureService);
     await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
     await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
     const image = await screen.findByAltText("Captured browser tab");
@@ -374,6 +397,18 @@ describe("capture workflow cross-section safety", () => {
     await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
     expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "overview", expect.objectContaining({ periodConfirmed: true, sourceUrl: "https://www.klaviyo.com/analytics/dashboards" }));
   });
+  it("restores a persisted worker capture into review after the UI remounts", async () => {
+    const initial = runnerReport();
+    const saved: AutoCaptureState = { request: automaticRequest(initial), stage: "review_ready", sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } };
+    const automaticCaptureService = automaticService(saved, saved);
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    const image = await screen.findByAltText("Captured browser tab");
+    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } });
+    fireEvent.load(image);
+    expect(await screen.findByText("Period detected: Jul 1, 2026 – Jul 31, 2026")).toBeInTheDocument();
+    expect(automaticCaptureService.start).not.toHaveBeenCalled();
+  });
   it("keeps manual capture available and does not upload when automatic verification fails", async () => {
     const initial = runnerReport();
     const captureService: CaptureService = { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() };
@@ -382,12 +417,67 @@ describe("capture workflow cross-section safety", () => {
       prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "failed", code: "PERIOD_VERIFY_FAILED" }),
     };
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) });
-    const user = userEvent.setup(); renderApp(api, captureService, navigationService);
+    const automaticCaptureService = automaticService({ request: automaticRequest(initial), stage: "failed", code: "PERIOD_VERIFY_FAILED", message: "Klaviyo did not verify the selected report period. No screenshot was captured." });
+    const user = userEvent.setup(); renderApp(api, captureService, navigationService, automaticCaptureService);
     await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
     await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
-    expect(await screen.findByText("Klaviyo did not verify the selected report period. No screenshot was captured.")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Klaviyo did not verify the selected report period. No screenshot was captured.");
     expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
     expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
     expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
+  });
+  it("leaves Preparing after an automatic-capture Chrome error and keeps manual capture available", async () => {
+    const initial = runnerReport();
+    const captureService: CaptureService = { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() };
+    const navigationService: KlaviyoNavigationService = {
+      openSection: vi.fn(), preparePeriod: vi.fn(() => ({ kind: "manual_period_required" as const })),
+      prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: "checking the Klaviyo Business review page failed: Cannot access contents of URL" }),
+    };
+    const automaticCaptureService = automaticService({ request: automaticRequest(initial), stage: "failed", code: "SCRIPT_INJECTION_FAILED", message: "checking the Klaviyo Business review page failed: Cannot access contents of URL" });
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), captureService, navigationService, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Cannot access contents of URL");
+    expect(screen.getByRole("button", { name: "Try Again" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+    expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
+  });
+  it("makes the activeTab capture denial actionable and leaves Try Again plus manual capture available", async () => {
+    const initial = runnerReport();
+    const captureService: CaptureService = { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() };
+    const permissionMessage = "To allow screenshot capture, keep the Klaviyo tab active and click the Tention Reports toolbar icon once.";
+    const saved: AutoCaptureState = { request: automaticRequest(initial), stage: "failed", code: "KLAVIYO_CAPTURE_PERMISSION_REQUIRED", message: permissionMessage };
+    const automaticCaptureService = automaticService(saved, saved);
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), captureService, undefined, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(permissionMessage);
+    expect(screen.getByRole("button", { name: "Try Again" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+  });
+  it("shows an Apply failure as a manual fallback instead of remaining in Preparing", async () => {
+    const initial = runnerReport();
+    const captureService: CaptureService = { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() };
+    const navigationService: KlaviyoNavigationService = {
+      openSection: vi.fn(), preparePeriod: vi.fn(() => ({ kind: "manual_period_required" as const })),
+      prepareExecutiveSummary: vi.fn().mockResolvedValue({ kind: "failed", code: "KLAVIYO_PERIOD_APPLY_NOT_FOUND" }),
+    };
+    const automaticCaptureService = automaticService({ request: automaticRequest(initial), stage: "failed", code: "KLAVIYO_PERIOD_APPLY_NOT_FOUND", message: "Klaviyo's Apply button was not found. Confirm the month and use Capture Manually." });
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), captureService, navigationService, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    await user.click(screen.getByRole("button", { name: "Capture Automatically" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Apply button was not found");
+    expect(screen.getByRole("button", { name: "Try Again" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
+    expect(captureService.captureVisibleTab).not.toHaveBeenCalled();
+  });
+  it("restores a persisted worker failure with Try Again and Capture Manually available", async () => {
+    const initial = runnerReport();
+    const saved: AutoCaptureState = { request: automaticRequest(initial), stage: "failed", code: "TARGET_NOT_FOUND", message: "Growth overview was not found." };
+    const automaticCaptureService = automaticService(saved, saved);
+    const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService);
+    await user.click(await screen.findByRole("button", { name: "Open Report" })); await user.click(screen.getByRole("button", { name: "Start Report" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Automatic capture couldn't complete. Growth overview was not found.");
+    expect(screen.getByRole("button", { name: "Try Again" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Capture Manually" })).toBeEnabled();
   });
 });
