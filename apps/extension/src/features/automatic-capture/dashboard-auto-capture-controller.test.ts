@@ -16,7 +16,7 @@ describe("dashboard worker capture controller", () => {
     const controller = new DashboardAutoCaptureController(navigation, capture, store);
     await controller.start(request);
     await vi.waitFor(() => expect(store.state).toMatchObject({ stage: "review_ready", request: { screenshotType: "top_flows" }, sourceTabId: 7 }));
-    expect(navigation.prepare).toHaveBeenCalledWith("top_flows", request.period, request.accountUrl);
+    expect(navigation.prepare).toHaveBeenCalledWith("top_flows", request.period, request.accountUrl, undefined);
     expect(capture.captureVisibleTabFor).toHaveBeenCalledWith({ tabId: 7, windowId: 3 });
   });
 

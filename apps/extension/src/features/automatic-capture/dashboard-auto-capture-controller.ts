@@ -15,7 +15,8 @@ export class DashboardAutoCaptureController {
   }
 
   private async run(request: ExecutiveSummaryAutoCaptureRequest): Promise<void> {
-    const key = `${request.reportId}:${request.screenshotType}`;
+    // In flight per attempt: an abandoned attempt never blocks the next one (its late writes are ignored by the store).
+    const key = `${request.reportId}:${request.screenshotType}:${request.attemptId ?? ""}`;
     if (this.running.has(key)) return;
     this.running.add(key);
     let prepared: DashboardPreparation | null = null;
@@ -23,7 +24,7 @@ export class DashboardAutoCaptureController {
       if (!isDashboardScreenshotType(request.screenshotType)) {
         await this.fail(request, "CAPTURE_FAILED", "This section is not a proven Klaviyo dashboard capture."); return;
       }
-      prepared = await this.navigation.prepare(request.screenshotType, request.period, request.accountUrl);
+      prepared = await this.navigation.prepare(request.screenshotType, request.period, request.accountUrl, request.recovery);
       if (prepared.kind === "failed") { await this.fail(request, prepared.code, prepared.message, prepared.diagnostics); return; }
       if (!this.capture.captureVisibleTabFor) { await this.fail(request, "CAPTURE_FAILED", "The verified Klaviyo tab could not be captured safely."); return; }
       await this.store.set({ request, stage: "capturing" });
@@ -37,8 +38,11 @@ export class DashboardAutoCaptureController {
         expectedSourceIdentity: DASHBOARD_TARGETS[request.screenshotType as keyof typeof DASHBOARD_TARGETS]?.sourceIdentity ?? null,
         expectedPeriod: { startDate: request.period.startDate, endDate: request.period.endDate }, observedPeriod: prepared.observedPeriod,
         visibleControls: prepared.target.visibleControls ?? [], targetBounds: prepared.target, stageTimingsMs: prepared.target.stageTimingsMs ?? {},
+        tabId: prepared.sourceTabId, viewport: { width: prepared.target.viewportWidth, height: prepared.target.viewportHeight },
       } : undefined;
-      await this.fail(request, code, error instanceof Error && error.message ? error.message : "Automatic capture could not complete.", diagnostics);
+      // The exact browser/capture error is kept, never only a generic CAPTURE_FAILED.
+      const captureApiError = { CAPTURE_API_ERROR: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500), captureErrorCode: typeof raw === "string" ? raw : null };
+      await this.fail(request, code, error instanceof Error && error.message ? error.message : "Automatic capture could not complete.", { ...(diagnostics ?? {}), ...captureApiError });
     } finally { this.running.delete(key); }
   }
 

@@ -8,6 +8,7 @@ export interface AutoCaptureStateStore {
   get(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<AutoCaptureState | null>;
   set(state: AutoCaptureState): Promise<void>;
   clear(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<void>;
+  clearAll?(): Promise<void>;
 }
 
 /**

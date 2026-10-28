@@ -21,7 +21,8 @@ export class BusinessReviewAutoCaptureController {
   async clear(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<void> { await this.store.clear(request); }
 
   private async run(request: ExecutiveSummaryAutoCaptureRequest): Promise<void> {
-    const key = `${request.reportId}:${request.screenshotType}`;
+    // In flight per attempt: an abandoned attempt never blocks the next one (its late writes are ignored by the store).
+    const key = `${request.reportId}:${request.screenshotType}:${request.attemptId ?? ""}`;
     if (this.running.has(key)) return;
     this.running.add(key);
     let prepared: BusinessReviewPreparation | null = null;
@@ -29,7 +30,7 @@ export class BusinessReviewAutoCaptureController {
       if (!isBusinessReviewScreenshotType(request.screenshotType)) {
         await this.fail(request, "CAPTURE_FAILED", "This section is manual-required until its source is proven."); return;
       }
-      prepared = await this.navigation.prepare(request.screenshotType, request.period, request.accountUrl);
+      prepared = await this.navigation.prepare(request.screenshotType, request.period, request.accountUrl, request.recovery);
       if (prepared.kind === "failed") { await this.fail(request, prepared.code, prepared.message, prepared.diagnostics); return; }
       if (!this.capture.captureVisibleTabFor) { await this.fail(request, "CAPTURE_FAILED", "The verified Klaviyo tab could not be captured safely."); return; }
       await this.store.set({ request, stage: "capturing" });
@@ -43,8 +44,11 @@ export class BusinessReviewAutoCaptureController {
         expectedSourceIdentity: BUSINESS_REVIEW_TARGETS[request.screenshotType as keyof typeof BUSINESS_REVIEW_TARGETS]?.sourceIdentity ?? null,
         expectedPeriod: { startDate: request.period.startDate, endDate: request.period.endDate }, observedPeriod: prepared.observedPeriod,
         visibleControls: prepared.target.visibleControls ?? [], targetBounds: prepared.target, stageTimingsMs: prepared.target.stageTimingsMs ?? {},
+        tabId: prepared.sourceTabId, viewport: { width: prepared.target.viewportWidth, height: prepared.target.viewportHeight },
       } : undefined;
-      await this.fail(request, code, error instanceof Error && error.message ? error.message : "Automatic capture could not complete.", diagnostics);
+      // The exact browser/capture error is kept, never only a generic CAPTURE_FAILED.
+      const captureApiError = { CAPTURE_API_ERROR: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500), captureErrorCode: typeof raw === "string" ? raw : null };
+      await this.fail(request, code, error instanceof Error && error.message ? error.message : "Automatic capture could not complete.", { ...(diagnostics ?? {}), ...captureApiError });
     } finally { this.running.delete(key); }
   }
   private async fail(request: ExecutiveSummaryAutoCaptureRequest, code: AutoCaptureFailureState["code"], message: string, diagnostics?: Record<string, unknown>): Promise<void> {

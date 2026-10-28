@@ -20,6 +20,10 @@ export interface ExecutiveSummaryAutoCaptureRequest {
   clientTimezone?: string;
   conversionMetric?: string;
   desiredCampaignCount?: number;
+  /** Identifies one attempt; a state written by any older attempt of the same section is ignored. */
+  attemptId?: string;
+  /** What the shared recovery policy changes for this attempt (see recovery-policy.ts). */
+  recovery?: { level: number; actions: readonly string[]; previousFailure: string | null };
 }
 
 export interface AutoCapturePendingState {
@@ -54,6 +58,7 @@ export type AutoCaptureMessage =
   | { type: "START_KLAVIYO_AUTO_CAPTURE"; request: ExecutiveSummaryAutoCaptureRequest }
   | { type: "GET_KLAVIYO_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
   | { type: "CLEAR_KLAVIYO_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
+  | { type: "CLEAR_ALL_KLAVIYO_AUTO_CAPTURE" }
   | { type: "START_BUSINESS_REVIEW_AUTO_CAPTURE"; request: ExecutiveSummaryAutoCaptureRequest }
   | { type: "GET_BUSINESS_REVIEW_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
   | { type: "CLEAR_BUSINESS_REVIEW_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
@@ -82,6 +87,7 @@ export interface AutoCaptureService {
   inspectCampaignsSource?(): Promise<CampaignsSourceInspectionResult | null>;
   /** The build the service worker is actually executing; null when it cannot say. */
   getExtensionBuild?(): Promise<string | null>;
+  clearAll?(): Promise<void>;
 }
 
 interface ChromeRuntimeApi {
@@ -102,6 +108,11 @@ export class ChromeAutoCaptureService implements AutoCaptureService {
 
   async get(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<AutoCaptureState | null> {
     return await this.send({ type: "GET_KLAVIYO_AUTO_CAPTURE", request }) as AutoCaptureState | null;
+  }
+
+  /** Releases every stored capture state (each holds a full-viewport screenshot) left by earlier sections and runs. */
+  async clearAll(): Promise<void> {
+    await this.send({ type: "CLEAR_ALL_KLAVIYO_AUTO_CAPTURE" });
   }
 
   async clear(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<void> {
@@ -135,8 +146,9 @@ export const unavailableAutoCaptureService: AutoCaptureService = {
   async clear() {},
 };
 
+export const AUTO_CAPTURE_KEY_PREFIX = "tention.business-review-auto-capture.";
 export function autoCaptureKey(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): string {
-  return `tention.business-review-auto-capture.${request.reportId}.${request.screenshotType}`;
+  return `${AUTO_CAPTURE_KEY_PREFIX}${request.reportId}.${request.screenshotType}`;
 }
 
 function isToolbarInvocationDiagnostics(value: unknown): value is ToolbarInvocationDiagnostics {

@@ -1,5 +1,7 @@
 import { REPORT_CAPTURE_SPEC_V1, type ReportPeriod } from "@tention/report-schema";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
+import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
+import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
 import {
   ChromeSessionKlaviyoActiveTabGrantStore, activeTabGrantFailureMessage,
   isKlaviyoBusinessReviewDashboardUrl, type ActiveTabGrantFailureCode, type KlaviyoActiveTabGrantStore, verifyKlaviyoActiveTabGrant,
@@ -14,7 +16,7 @@ export type BusinessReviewPreparation =
   | { kind: "failed"; code: BusinessReviewFailureCode | ActiveTabGrantFailureCode | "BUSINESS_REVIEW_URL_REQUIRED" | "BUSINESS_REVIEW_NAVIGATION_FAILED" | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED" | "PAGE_READY_TIMEOUT"; message: string; sourceTabId?: number; windowId?: number; diagnostics?: Record<string, unknown> };
 
 export interface BusinessReviewCaptureNavigation {
-  prepare(screenshotType: BusinessReviewScreenshotType, period: ReportPeriod, businessReviewUrl: string | null): Promise<BusinessReviewPreparation>;
+  prepare(screenshotType: BusinessReviewScreenshotType, period: ReportPeriod, businessReviewUrl: string | null, recovery?: AttemptRecovery): Promise<BusinessReviewPreparation>;
 }
 
 interface ChromeTab { id?: number; windowId?: number; url?: string; active?: boolean; status?: string }
@@ -24,7 +26,7 @@ interface ChromeTabsApi {
   update(tabId: number, properties: { url: string }): Promise<ChromeTab>;
   onUpdated: { addListener(listener: (tabId: number, change: { status?: string }, tab: ChromeTab) => void): void; removeListener(listener: (tabId: number, change: { status?: string }, tab: ChromeTab) => void): void };
 }
-interface ChromeScriptingApi { executeScript<Result>(details: { target: { tabId: number; frameIds: [number] }; func: (target: typeof BUSINESS_REVIEW_TARGETS[BusinessReviewScreenshotType], period: { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }) => Promise<Result>; args: [typeof BUSINESS_REVIEW_TARGETS[BusinessReviewScreenshotType], { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }] }): Promise<Array<{ frameId?: number; result?: Result }>> }
+interface ChromeScriptingApi { executeScript<Result>(details: { target: { tabId: number; frameIds: [number] }; func: (target: typeof BUSINESS_REVIEW_TARGETS[BusinessReviewScreenshotType], period: { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }) => Promise<Result>; args: [typeof BUSINESS_REVIEW_TARGETS[BusinessReviewScreenshotType], { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }, ...number[]] }): Promise<Array<{ frameId?: number; result?: Result }>> }
 interface ChromeApi { tabs?: ChromeTabsApi; scripting?: ChromeScriptingApi }
 
 /** Uses the already toolbar-authorized tab; it never opens or substitutes a dashboard. */
@@ -35,9 +37,10 @@ export class ChromeBusinessReviewCaptureNavigation implements BusinessReviewCapt
     private readonly grantStore: KlaviyoActiveTabGrantStore = new ChromeSessionKlaviyoActiveTabGrantStore(),
   ) {}
 
-  async prepare(screenshotType: BusinessReviewScreenshotType, period: ReportPeriod, businessReviewUrl: string | null): Promise<BusinessReviewPreparation> {
+  async prepare(screenshotType: BusinessReviewScreenshotType, period: ReportPeriod, businessReviewUrl: string | null, recovery?: AttemptRecovery): Promise<BusinessReviewPreparation> {
     const tabs = this.chromeApi?.tabs; const scripting = this.chromeApi?.scripting;
     if (!tabs || !scripting) return { kind: "failed", code: "KLAVIYO_PAGE_NOT_SUPPORTED", message: "Chrome Business Review automation is unavailable in this environment." };
+    let injection: { tabId: number; urlBefore: string | null } | null = null;
     try {
       if (businessReviewUrl === null || !isKlaviyoBusinessReviewDashboardUrl(businessReviewUrl)) return { kind: "failed", code: "BUSINESS_REVIEW_URL_REQUIRED", message: "A configured HTTPS Klaviyo Business Review URL is required for this canonical capture." };
       // This section always reloads the saved Business Review URL next, so a tab left on another Klaviyo route
@@ -55,20 +58,24 @@ export class ChromeBusinessReviewCaptureNavigation implements BusinessReviewCapt
       // React/view settling. Keep that browser operation separate from the
       // shorter route-load timeout so a legitimate delayed dashboard card is
       // not cut off immediately after the readiness window.
+      if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
+      injection = { tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null };
       const results = await withTimeout(() => scripting.executeScript<unknown>({
         target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareBusinessReviewCaptureDocument,
-        args: [BUSINESS_REVIEW_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }],
+        args: [BUSINESS_REVIEW_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }, ...(recoveryRequests(recovery, "extended-readiness") ? [6_000, 30_000] as const : [] as const)],
       }), "preparing the Klaviyo Business Review target", Math.max(this.timeoutMs, 90_000));
       const main = results.find((result) => result.frameId === 0) ?? results[0];
-      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The Business Review helper returned no result." };
-      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The Business Review helper returned an undefined result." };
-      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The Business Review helper returned an invalid result.", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { failureStage: "PAGE_READY", navigationMs, expectedUrl: safeUrl(businessReviewUrl), observedUrl: safeUrl(tab.url), expectedSourceIdentity: expectedIdentity(screenshotType), resultShape: summarizeAdapterResult(main.result) } };
+      const describe = (found: InjectionResultLike | null) => injectionFailureDiagnostics({ section: screenshotType, scripting: scripting as never, tabs: tabs as never, tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null, results, main: found, cardAliases: [...BUSINESS_REVIEW_TARGETS[screenshotType].cardAliases], failureStage: "SCRIPT_RESULT" });
+      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The Business Review helper returned no result.", diagnostics: { injection: await describe(null) } };
+      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The Business Review helper returned an undefined result.", diagnostics: { injection: await describe(main) } };
+      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The Business Review helper returned an invalid result.", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { injection: await describe(main), failureStage: "PAGE_READY", navigationMs, expectedUrl: safeUrl(businessReviewUrl), observedUrl: safeUrl(tab.url), expectedSourceIdentity: expectedIdentity(screenshotType), resultShape: summarizeAdapterResult(main.result) } };
       if (!main.result.ok) return { kind: "failed", code: main.result.code, message: main.result.message, sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { ...(main.result.diagnostics ?? {}), navigationMs, stageTimingsMs: { ...mapAdapterStageTimings(main.result.diagnostics?.stageTimingsMs), navigationMs }, expectedUrl: safeUrl(businessReviewUrl), expectedSourceIdentity: expectedIdentity(screenshotType) } };
       const adapterStages = main.result.targetRect.stageTimingsMs ?? {};
       return { kind: "ready", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, detectedPeriod: formatPeriod(period), observedPeriod: main.result.observedPeriod, target: { ...main.result.targetRect, stageTimingsMs: { navigationMs, pageReadyMs: adapterStages.PAGE_READY ?? 0, periodSetMs: adapterStages.PERIOD ?? 0, cardResolveMs: adapterStages.CARD_RESOLUTION ?? 0, viewResolveMs: adapterStages.VIEW_RESOLUTION ?? 0, viewSwitchMs: adapterStages.VIEW_SWITCH ?? 0, contentReadyMs: adapterStages.CONTENT_READY ?? 0, scrollMs: adapterStages.SCROLL ?? 0 } } };
     } catch (error) {
       if (isChromeOperationTimeout(error)) return { kind: "failed", code: "PAGE_READY_TIMEOUT", message: error.message };
-      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Business Review preparation failed: ${chromeErrorMessage(error)}` };
+      const diagnostics = injection && tabs && scripting ? { injection: await injectionFailureDiagnostics({ section: screenshotType, scripting: scripting as never, tabs: tabs as never, tabId: injection.tabId, urlBefore: injection.urlBefore, results: null, main: null, cardAliases: [...BUSINESS_REVIEW_TARGETS[screenshotType].cardAliases], failureStage: "SCRIPT_INJECTION" }), injectionError: chromeErrorMessage(error) } : undefined;
+      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Business Review preparation failed: ${chromeErrorMessage(error)}`, ...(diagnostics ? { diagnostics } : {}) };
     }
   }
 

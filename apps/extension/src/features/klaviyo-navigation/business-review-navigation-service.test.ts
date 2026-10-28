@@ -64,6 +64,54 @@ describe("Business Review capture navigation", () => {
     expect(executeScript).toHaveBeenCalledTimes(1);
   });
 
+  it("explains a null result from a replaced document, then loads the dashboard fresh again on the next attempt and passes", async () => {
+    const targetUrl = "https://www.klaviyo.com/analytics/dashboards/01HWZSHD83RW7CYWQ6EVVQD2BK";
+    const tab = { id: 7, windowId: 3, active: true, status: "complete", url: targetUrl };
+    const update = vi.fn().mockResolvedValue(tab);
+    let attempt = 0;
+    const executeScript = vi.fn().mockImplementation(async (details: { func: { name: string } }) => {
+      if (details.func.name === "probeKlaviyoPage") return [{ frameId: 0, documentId: "document-after-react-replace", result: { url: targetUrl, readyState: "complete", spinnerCount: 1, cardReady: false } }];
+      attempt += 1;
+      return attempt === 1
+        ? [{ frameId: 0, documentId: "document-during-script", result: null }]
+        : [{ frameId: 0, documentId: "fresh-document", result: { ok: true, sourceUrl: targetUrl, targetRect: { x: 10, y: 20, width: 300, height: 200, viewportWidth: 1200, viewportHeight: 800 }, observedPeriod: { startDate: period.startDate, endDate: period.endDate } } }];
+    });
+    const chromeApi = { tabs: { get: vi.fn().mockResolvedValue(tab), update, query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true }]), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } }, scripting: { executeScript } };
+    const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 100, grantStore);
+    await expect(navigation.prepare("month_comparison", period, targetUrl)).resolves.toMatchObject({ kind: "failed", code: "SCRIPT_RESULT_INVALID", diagnostics: { injection: {
+      SECTION: "month_comparison", URL_BEFORE_SCRIPT: targetUrl, URL_AFTER_SCRIPT: targetUrl, FRAME_ID: 0, EXECUTE_SCRIPT_RETURNED: true, RESULT_TYPE: "null", RESULT_KEYS: [], RESULT_JSON_SERIALIZABLE: true,
+      SCHEMA_VALID: false, SCHEMA_ERROR: "result: null", NAVIGATION_DURING_SCRIPT: false, DOM_GENERATION_CHANGED: true, CARD_READY: false, SPINNER_COUNT: 1, FAILURE_STAGE: "SCRIPT_RESULT",
+    } } });
+    await expect(navigation.prepare("month_comparison", period, targetUrl)).resolves.toMatchObject({ kind: "ready" });
+    expect(update).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects an adapter result carrying a DOM object instead of plain geometry, naming the failing path", async () => {
+    const targetUrl = "https://www.klaviyo.com/analytics/dashboards/01HWZSHD83RW7CYWQ6EVVQD2BK";
+    const tab = { id: 7, windowId: 3, active: true, status: "complete", url: targetUrl };
+    const executeScript = vi.fn().mockImplementation(async (details: { func: { name: string } }) => details.func.name === "probeKlaviyoPage"
+      ? [{ frameId: 0, result: { url: targetUrl, readyState: "complete", spinnerCount: 0, cardReady: true } }]
+      : [{ frameId: 0, result: { ok: true, sourceUrl: targetUrl, targetRect: document.createElement("div"), observedPeriod: { startDate: period.startDate, endDate: period.endDate } } }]);
+    const chromeApi = { tabs: { get: vi.fn().mockResolvedValue(tab), update: vi.fn().mockResolvedValue(tab), query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true }]), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } }, scripting: { executeScript } };
+    const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 100, grantStore);
+    await expect(navigation.prepare("campaign_metrics", period, targetUrl)).resolves.toMatchObject({ kind: "failed", code: "SCRIPT_RESULT_INVALID", diagnostics: { injection: { SCHEMA_VALID: false, SCHEMA_ERROR: "result.targetRect.x: not a finite number", CARD_READY: true } } });
+  });
+
+  it("honours the attempt's recovery plan: settles the reloaded page, then injects with the extended readiness window", async () => {
+    const targetUrl = "https://www.klaviyo.com/analytics/dashboards/01HWZSHD83RW7CYWQ6EVVQD2BK";
+    const tab = { id: 7, windowId: 3, active: true, status: "complete", url: targetUrl };
+    const get = vi.fn().mockResolvedValue(tab);
+    const executeScript = vi.fn().mockResolvedValue([{ frameId: 0, result: { ok: true, sourceUrl: targetUrl, targetRect: { x: 10, y: 20, width: 300, height: 200, viewportWidth: 1200, viewportHeight: 800 }, observedPeriod: { startDate: period.startDate, endDate: period.endDate } } }]);
+    const chromeApi = { tabs: { get, update: vi.fn().mockResolvedValue(tab), query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true }]), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } }, scripting: { executeScript } };
+    const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 100, grantStore);
+    await expect(navigation.prepare("campaign_metrics", period, targetUrl)).resolves.toMatchObject({ kind: "ready" });
+    expect(executeScript.mock.calls[0]![0].args).toHaveLength(2);
+    const callsBefore = get.mock.calls.length;
+    await expect(navigation.prepare("campaign_metrics", period, targetUrl, { actions: ["fresh-source", "settle-before-inject", "extended-readiness"] })).resolves.toMatchObject({ kind: "ready" });
+    expect(executeScript.mock.calls[1]![0].args).toEqual([expect.objectContaining({ sectionKey: "campaign_metrics" }), period, 6_000, 30_000]);
+    expect(get.mock.calls.length - callsBefore).toBeGreaterThanOrEqual(6); // polled until loaded for 1.5 s
+  }, 15_000);
+
   it("persists a safe shape diagnosis when Chrome returns an adapter result outside the accepted contract", async () => {
     const targetUrl = "https://www.klaviyo.com/analytics/dashboards/01HWZSHD83RW7CYWQ6EVVQD2BK";
     const chromeApi = {

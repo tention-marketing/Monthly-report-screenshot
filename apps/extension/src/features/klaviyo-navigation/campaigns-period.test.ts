@@ -68,7 +68,7 @@ describe("Campaigns date filter period parsing", () => {
     // Both copies run from the parser through visibleCampaignPeriodText, up to compareDescDate.
     const block = (from: string) => { const start = source.indexOf(from); return source.slice(start, source.indexOf("function compareDescDate(", start)).trimEnd(); };
     const exported = block("export function parseCampaignPeriodText(").replace(/^export /gm, "");
-    const injected = block("  function parseCampaignPeriodText(").replace(/^ {2}/gm, "");
+    const injected = block("      function parseCampaignPeriodText(").replace(/^ {6}/gm, "");
     expect(injected.startsWith("function parseCampaignPeriodText(")).toBe(true);
     expect(injected).toBe(exported);
   });

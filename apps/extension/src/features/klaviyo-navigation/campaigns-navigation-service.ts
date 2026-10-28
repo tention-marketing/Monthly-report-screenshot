@@ -1,12 +1,14 @@
 import type { ReportPeriod } from "@tention/report-schema";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
+import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
+import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
 import { ChromeSessionKlaviyoActiveTabGrantStore, activeTabGrantFailureMessage, type ActiveTabGrantFailureCode, type KlaviyoActiveTabGrantStore, verifyKlaviyoActiveTabGrant } from "./active-tab-grant.js";
 import { prepareCampaignsCaptureDocument, type CampaignsAdapterResult, type CampaignsCaptureRequest, type CampaignsEvidence, type CampaignsFailureCode, type CampaignTargetBounds } from "./campaigns-capture.js";
 
 export type CampaignsPreparation =
   | { kind: "ready"; sourceTabId: number; windowId: number; detectedPeriod: string; observedPeriod: { startDate: string; endDate: string }; target: CampaignTargetBounds; evidence: CampaignsEvidence }
   | { kind: "failed"; code: CampaignsFailureCode | ActiveTabGrantFailureCode | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED"; message: string; diagnostics?: Record<string, unknown> };
-export interface CampaignsCaptureNavigation { prepare(request: CampaignsCaptureRequest, listUrl?: string | null): Promise<CampaignsPreparation>; }
+export interface CampaignsCaptureNavigation { prepare(request: CampaignsCaptureRequest, listUrl?: string | null, recovery?: AttemptRecovery): Promise<CampaignsPreparation>; }
 interface ChromeTab { id?: number; windowId?: number; url?: string; status?: string }
 interface ChromeTabsApi { get(tabId: number): Promise<ChromeTab>; query(query: { active: boolean; windowId: number }): Promise<ChromeTab[]>; update?(tabId: number, properties: { url: string }): Promise<ChromeTab>; }
 interface ChromeScriptingApi { executeScript<Result>(details: { target: { tabId: number; frameIds: [number] }; func: (request: CampaignsCaptureRequest) => Promise<Result>; args: [CampaignsCaptureRequest] }): Promise<Array<{ frameId?: number; result?: Result }>> }
@@ -15,11 +17,12 @@ interface ChromeApi { tabs?: ChromeTabsApi; scripting?: ChromeScriptingApi }
 /** Uses exactly the toolbar-authorized tab and rejects all campaign detail/editor routes. */
 export class ChromeCampaignsCaptureNavigation implements CampaignsCaptureNavigation {
   constructor(private readonly chromeApi: ChromeApi | undefined = (globalThis as typeof globalThis & { chrome?: ChromeApi }).chrome, private readonly timeoutMs = 8_000, private readonly grantStore: KlaviyoActiveTabGrantStore = new ChromeSessionKlaviyoActiveTabGrantStore()) {}
-  async prepare(request: CampaignsCaptureRequest, listUrl: string | null = null): Promise<CampaignsPreparation> {
+  async prepare(request: CampaignsCaptureRequest, listUrl: string | null = null, recovery?: AttemptRecovery): Promise<CampaignsPreparation> {
     const tabs = this.chromeApi?.tabs; const scripting = this.chromeApi?.scripting;
     if (!tabs || !scripting) return { kind: "failed", code: "CAMPAIGNS_PAGE_NOT_READY", message: "Chrome Campaigns automation is unavailable in this extension context." };
+    let injection: { tabId: number; urlBefore: string | null } | null = null;
     try {
-      const grant = await withTimeout(() => verifyKlaviyoActiveTabGrant(tabs, this.grantStore), "checking the Tention toolbar grant", this.timeoutMs);
+      const grant = await withTimeout(() => verifyKlaviyoActiveTabGrant(tabs, this.grantStore, { returningToConfiguredUrl: true }), "checking the Tention toolbar grant", this.timeoutMs);
       if (!grant.ok) return { kind: "failed", code: grant.code, message: activeTabGrantFailureMessage(grant.code) };
       let tab = await tabs.get(grant.grant.grantedTabId);
       // A multi-section run leaves the authorized tab on another verified Klaviyo
@@ -34,15 +37,19 @@ export class ChromeCampaignsCaptureNavigation implements CampaignsCaptureNavigat
         tab = await this.waitForComplete(tabs, grant.grant.grantedTabId, true);
       }
       if (!isCampaignsListUrl(tab.url)) return { kind: "failed", code: "CAMPAIGNS_ROUTE_REQUIRED", message: "Open the Klaviyo Campaigns list (/omnicampaigns), then click the Tention Reports toolbar icon. Individual campaign pages are not permitted." };
+      if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
+      injection = { tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null };
       const results = await withTimeout(() => scripting.executeScript<unknown>({ target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareCampaignsCaptureDocument, args: [request] }), "preparing the Klaviyo Campaigns listing", Math.max(this.timeoutMs, 60_000));
       const main = results.find((result) => result.frameId === 0) ?? results[0];
-      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The Campaigns helper returned no result." };
-      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The Campaigns helper returned an undefined result." };
-      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The Campaigns helper returned an invalid result." };
+      const describe = (found: InjectionResultLike | null) => injectionFailureDiagnostics({ section: "top_campaigns", scripting: scripting as never, tabs: tabs as never, tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null, results, main: found, failureStage: "SCRIPT_RESULT" });
+      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The Campaigns helper returned no result.", diagnostics: { injection: await describe(null) } };
+      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The Campaigns helper returned an undefined result.", diagnostics: { injection: await describe(main) } };
+      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The Campaigns helper returned an invalid result.", diagnostics: { injection: await describe(main) } };
       if (!main.result.ok) return { kind: "failed", code: main.result.code, message: main.result.message, ...(main.result.diagnostics ? { diagnostics: main.result.diagnostics } : {}) };
       return { kind: "ready", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, detectedPeriod: formatPeriod(request.period), observedPeriod: main.result.observedPeriod, target: main.result.targetRect, evidence: main.result.evidence };
     } catch (error) {
-      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Campaigns preparation failed: ${isChromeOperationTimeout(error) ? error.message : chromeErrorMessage(error)}` };
+      const diagnostics = injection ? { injection: await injectionFailureDiagnostics({ section: "top_campaigns", scripting: scripting as never, tabs: tabs as never, tabId: injection.tabId, urlBefore: injection.urlBefore, results: null, main: null, failureStage: "SCRIPT_INJECTION" }), injectionError: chromeErrorMessage(error) } : undefined;
+      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Campaigns preparation failed: ${isChromeOperationTimeout(error) ? error.message : chromeErrorMessage(error)}`, ...(diagnostics ? { diagnostics } : {}) };
     }
   }
   private async waitForComplete(tabs: ChromeTabsApi, tabId: number, afterNavigation = false): Promise<ChromeTab> {

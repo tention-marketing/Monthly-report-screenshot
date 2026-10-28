@@ -23,7 +23,7 @@ describe("Business Review worker capture controller", () => {
     await controller.start(request);
     await vi.waitFor(() => expect(store.state).toMatchObject({ stage: "review_ready", request: { screenshotType: "campaign_metrics" } }));
     expect(capture.captureVisibleTabFor).toHaveBeenCalledWith({ tabId: 7, windowId: 3 });
-    expect(navigation.prepare).toHaveBeenCalledWith("campaign_metrics", request.period, request.accountUrl);
+    expect(navigation.prepare).toHaveBeenCalledWith("campaign_metrics", request.period, request.accountUrl, undefined);
   });
 
   it("persists a typed failure and never substitutes a screenshot", async () => {

@@ -66,7 +66,7 @@ describe("Campaigns send day uses the client's Klaviyo calendar day", () => {
     // Chrome injects a copy inside prepareCampaignsCaptureDocument; it must stay identical to the exports.
     const source = readFileSync(resolve(process.cwd(), "src/features/klaviyo-navigation/campaigns-capture.ts"), "utf8");
     const block = (from: string) => { const start = source.indexOf(from); return source.slice(start, source.indexOf("\n", source.indexOf("function isDateInRange(", start))); };
-    const injected = block("  function campaignSendDay(").replace(/^ {2}/gm, "");
+    const injected = block("      function campaignSendDay(").replace(/^ {6}/gm, "");
     const exported = block("export function campaignSendDay(").replace(/^export /gm, "");
     expect(injected.startsWith("function campaignSendDay(")).toBe(true);
     expect(injected).toBe(exported);

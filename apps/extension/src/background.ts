@@ -2,7 +2,7 @@ import type { AutoCaptureStateStore } from "./features/automatic-capture/auto-ca
 import { BusinessReviewAutoCaptureController } from "./features/automatic-capture/business-review-auto-capture-controller.js";
 import { DashboardAutoCaptureController } from "./features/automatic-capture/dashboard-auto-capture-controller.js";
 import { DeliverabilityScoreAutoCaptureController } from "./features/automatic-capture/deliverability-score-auto-capture-controller.js";
-import { autoCaptureKey, type AutoCaptureMessage, type AutoCaptureState, type ExecutiveSummaryAutoCaptureRequest } from "./features/automatic-capture/auto-capture-service.js";
+import { AUTO_CAPTURE_KEY_PREFIX, autoCaptureKey, type AutoCaptureMessage, type AutoCaptureState, type ExecutiveSummaryAutoCaptureRequest } from "./features/automatic-capture/auto-capture-service.js";
 import { ChromeBusinessReviewCaptureNavigation } from "./features/klaviyo-navigation/business-review-navigation-service.js";
 import { ChromeBusinessReviewDiscovery } from "./features/klaviyo-navigation/business-review-discovery.js";
 import { isCanonicalDashboardScreenshotType } from "./features/klaviyo-navigation/dashboard-capture.js";
@@ -47,20 +47,47 @@ interface BackgroundChromeApi {
   };
 }
 
+/**
+ * The one state store every capture controller writes through. Each state can hold a full-viewport screenshot, and
+ * chrome.storage.session has a 10 MB quota, so states left behind by earlier sections and reports filled it and later
+ * sections failed with "Session storage quota bytes exceeded" — or hung at "capturing" when the failure write was
+ * refused too. Writes therefore never throw: a refused write first releases every other stored capture state, then
+ * falls back to service-worker memory. States from an abandoned attempt (an older `attemptId`) are ignored.
+ */
 export class ChromeSessionAutoCaptureStore implements AutoCaptureStateStore {
+  private readonly currentAttempt = new Map<string, string>();
+  private readonly memory = new Map<string, AutoCaptureState>();
   constructor(private readonly session: ChromeStorageSession) {}
 
   async get(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<AutoCaptureState | null> {
     const key = autoCaptureKey(request);
+    const remembered = this.memory.get(key); if (remembered) return remembered;
     return (await this.session.get(key))[key] as AutoCaptureState | undefined ?? null;
   }
 
   async set(state: AutoCaptureState): Promise<void> {
-    await this.session.set({ [autoCaptureKey(state.request)]: state });
+    const key = autoCaptureKey(state.request); const attemptId = state.request.attemptId;
+    if (state.stage === "preparing" && attemptId) this.currentAttempt.set(key, attemptId);
+    const current = this.currentAttempt.get(key);
+    if (current && attemptId && attemptId !== current) return;
+    try { await this.session.set({ [key]: state }); this.memory.delete(key); return; } catch { /* quota: release stale states below */ }
+    await this.releaseAll(key).catch(() => undefined);
+    try { await this.session.set({ [key]: state }); this.memory.delete(key); return; } catch { this.memory.set(key, state); }
   }
 
   async clear(request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType">): Promise<void> {
-    await this.session.remove(autoCaptureKey(request));
+    const key = autoCaptureKey(request);
+    this.memory.delete(key); this.currentAttempt.delete(key);
+    await this.session.remove(key);
+  }
+
+  async clearAll(): Promise<void> {
+    this.memory.clear(); this.currentAttempt.clear();
+    await this.releaseAll(null);
+  }
+
+  private async releaseAll(keep: string | null): Promise<void> {
+    for (const key of Object.keys(await this.session.get(null))) if (key.startsWith(AUTO_CAPTURE_KEY_PREFIX) && key !== keep) await this.session.remove(key);
   }
 }
 
@@ -126,6 +153,10 @@ export function registerBackgroundAutomation(chromeApi: BackgroundChromeApi): vo
         ? campaignsController.get(message.request)
         : store.get(message.request);
       void state.then(sendResponse).catch(() => sendResponse(null));
+      return true;
+    }
+    if (message.type === "CLEAR_ALL_KLAVIYO_AUTO_CAPTURE") {
+      void store.clearAll().then(() => sendResponse(null)).catch(() => sendResponse(null));
       return true;
     }
     if (message.type === "CLEAR_KLAVIYO_AUTO_CAPTURE" || message.type === "CLEAR_BUSINESS_REVIEW_AUTO_CAPTURE" || message.type === "CLEAR_EXECUTIVE_SUMMARY_AUTO_CAPTURE") {

@@ -37,7 +37,8 @@ export interface KlaviyoActiveTabGrant {
 }
 
 export interface ChromeStorageSession {
-  get(key: string): Promise<Record<string, unknown>>;
+  /** `null` reads every key (Chrome's storage.session.get(null)). */
+  get(key: string | null): Promise<Record<string, unknown>>;
   set(values: Record<string, unknown>): Promise<void>;
   remove(key: string): Promise<void>;
 }
@@ -95,6 +96,8 @@ export interface KlaviyoGrantTab {
 export interface KlaviyoGrantTabsApi {
   get(tabId: number): Promise<KlaviyoGrantTab>;
   query(queryInfo: { active: boolean; windowId: number }): Promise<KlaviyoGrantTab[]>;
+  /** Only used to re-activate the same granted tab (see `returningToConfiguredUrl`). */
+  update?(tabId: number, properties: { active?: boolean; url?: string }): Promise<unknown>;
 }
 
 export type KlaviyoActiveTabGrantCheck =
@@ -122,9 +125,16 @@ export async function verifyKlaviyoActiveTabGrant(tabs: KlaviyoGrantTabsApi, sto
   try {
     const tab = await tabs.get(grant.grantedTabId);
     if (tab.id !== grant.grantedTabId) return invalidate(store, "GRANTED_TAB_CLOSED");
-    if (tab.windowId !== grant.grantedWindowId || tab.active !== true) return invalidate(store, "GRANTED_TAB_NOT_ACTIVE");
-    const active = (await tabs.query({ active: true, windowId: grant.grantedWindowId }))[0];
-    if (active?.id !== grant.grantedTabId) return invalidate(store, "GRANTED_TAB_NOT_ACTIVE");
+    if (tab.windowId !== grant.grantedWindowId) return invalidate(store, "GRANTED_TAB_NOT_ACTIVE");
+    let active = (await tabs.query({ active: true, windowId: grant.grantedWindowId }))[0];
+    // A run that is about to reload a configured source brings the same granted tab back to the front of its own
+    // window instead of destroying the grant because another tab was briefly selected (run d1e11bc9).
+    if ((tab.active !== true || active?.id !== grant.grantedTabId) && options.returningToConfiguredUrl && tabs.update) {
+      await tabs.update(grant.grantedTabId, { active: true });
+      active = (await tabs.query({ active: true, windowId: grant.grantedWindowId }))[0];
+      if (active?.id === grant.grantedTabId) return verifyKlaviyoActiveTabGrant(tabs, store, { ...options, returningToConfiguredUrl: options.returningToConfiguredUrl });
+    }
+    if (tab.active !== true || active?.id !== grant.grantedTabId) return invalidate(store, "GRANTED_TAB_NOT_ACTIVE");
     if (originOf(tab.url) !== grant.grantedOrigin) return invalidate(store, "GRANTED_TAB_CHANGED_ORIGIN");
     if (!isKlaviyoSupportedCaptureUrl(tab.url ?? null) && !options.returningToConfiguredUrl) return invalidate(store, "GRANTED_TAB_ROUTE_NOT_SUPPORTED");
     return { ok: true, grant, invocation, tab };

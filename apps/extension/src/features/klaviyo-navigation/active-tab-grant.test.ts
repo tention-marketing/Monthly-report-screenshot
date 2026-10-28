@@ -24,4 +24,19 @@ describe("toolbar grant after a stray Klaviyo route change", () => {
     const other = setup("https://evil.example.com/analytics/metrics");
     await expect(verifyKlaviyoActiveTabGrant(other.tabs as never, other.store, { returningToConfiguredUrl: true })).resolves.toMatchObject({ ok: false, code: "GRANTED_TAB_CHANGED_ORIGIN" });
   });
+
+  it("re-activates the same granted tab instead of destroying the grant", async () => {
+    const { store } = setup("https://www.klaviyo.com/analytics/dashboards/01H2XYS7EKZT3VVQYBQ19GTVW1");
+    let active = false;
+    const tabs = {
+      get: vi.fn(async () => ({ id: 7, windowId: 3, active, status: "complete", url: "https://www.klaviyo.com/analytics/dashboards/01H2XYS7EKZT3VVQYBQ19GTVW1" })),
+      query: vi.fn(async () => [{ id: active ? 7 : 9, windowId: 3, active: true }]),
+      update: vi.fn(async (_id: number, properties: { active?: boolean }) => { active = Boolean(properties.active); return {}; }),
+    };
+    await expect(verifyKlaviyoActiveTabGrant(tabs as never, store, { returningToConfiguredUrl: true })).resolves.toMatchObject({ ok: true });
+    expect(tabs.update).toHaveBeenCalledWith(7, { active: true });
+    expect(store.clearGrant).not.toHaveBeenCalled(); expect(store.clear).not.toHaveBeenCalled();
+    active = false;
+    await expect(verifyKlaviyoActiveTabGrant({ ...tabs, update: undefined } as never, store)).resolves.toMatchObject({ ok: false, code: "GRANTED_TAB_NOT_ACTIVE" });
+  });
 });

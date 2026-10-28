@@ -482,7 +482,7 @@ describe("Top performing flows inside a single wrapper row", () => {
     const { readFileSync } = await import("node:fs"); const { resolve } = await import("node:path");
     const read = (file: string) => readFileSync(resolve(process.cwd(), `src/features/klaviyo-navigation/${file}`), "utf8");
     const exported = (() => { const source = read("campaigns-capture.ts"); const start = source.indexOf("export function parseCampaignPeriodText("); return source.slice(start, source.indexOf("export function visibleCampaignPeriodText(", start)).trimEnd().replace(/^export /, ""); })();
-    const injected = (() => { const source = read("dashboard-capture.ts"); const start = source.indexOf("    function parseCampaignPeriodText("); return source.slice(start, source.indexOf("    const hasExpectedPeriod = ", start)).trimEnd().replace(/^ {4}/gm, ""); })();
+    const injected = (() => { const source = read("dashboard-capture.ts"); const start = source.indexOf("        function parseCampaignPeriodText("); return source.slice(start, source.indexOf("        const hasExpectedPeriod = ", start)).trimEnd().replace(/^ {8}/gm, ""); })();
     expect(injected.startsWith("function parseCampaignPeriodText(")).toBe(true);
     expect(injected).toBe(exported);
   });

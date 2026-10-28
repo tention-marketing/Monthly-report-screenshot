@@ -310,6 +310,13 @@ describe("Campaigns adapter as Chrome injects it", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it("returns a typed, serializable failure instead of throwing when the adapter hits an exception", async () => {
+    campaignsPage(liveLikeRows);
+    const result = await asChromeInjects()(null as never);
+    expect(result).toMatchObject({ ok: false, code: "KLAVIYO_PAGE_ADAPTER_ERROR", diagnostics: { failureStage: "UNCAUGHT_EXCEPTION", errorName: "TypeError", stack: expect.any(String), currentUrl: expect.stringContaining("/omnicampaigns") } });
+    expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+  });
+
   describe("Top Campaigns is Sent-only evidence", () => {
     const augustRows: Array<[string, string, string, string, string]> = [
       ["TM | SMS | Labor Day Savings Event", "Sent", "SMS", "Aug 30, 2026 6:30 PM", "$7,179.98"],

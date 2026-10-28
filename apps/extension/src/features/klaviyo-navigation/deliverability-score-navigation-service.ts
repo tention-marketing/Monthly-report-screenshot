@@ -6,7 +6,7 @@ const deliverabilityScoreStability: DeliverabilityScoreStabilityOptions = { samp
 
 export type DeliverabilityScorePreparation =
   | { kind: "ready"; sourceTabId: number; windowId: number; detectedPeriod: string; target: DeliverabilityScoreTargetBounds; diagnostics: { observedScoreText: string | null; stableSamples: number } }
-  | { kind: "failed"; code: ActiveTabGrantFailureCode | "DELIVERABILITY_SCORE_URL_REQUIRED" | "DELIVERABILITY_SCORE_NOT_FOUND" | "DELIVERABILITY_SCORE_CONTENT_NOT_RENDERED" | "DELIVERABILITY_SCORE_NOT_STABLE" | "TARGET_BOUNDS_INVALID" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED"; message: string; diagnostics?: Record<string, unknown> };
+  | { kind: "failed"; code: ActiveTabGrantFailureCode | "DELIVERABILITY_SCORE_URL_REQUIRED" | "KLAVIYO_PAGE_ADAPTER_ERROR" | "DELIVERABILITY_SCORE_NOT_FOUND" | "DELIVERABILITY_SCORE_CONTENT_NOT_RENDERED" | "DELIVERABILITY_SCORE_NOT_STABLE" | "TARGET_BOUNDS_INVALID" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED"; message: string; diagnostics?: Record<string, unknown> };
 export interface DeliverabilityScoreNavigation { prepare(period: ReportPeriod, scoreUrl: string | null): Promise<DeliverabilityScorePreparation>; }
 interface Tab { id?: number; windowId?: number; url?: string; active?: boolean; status?: string }
 interface ChromeApi { tabs?: { get(id: number): Promise<Tab>; query(input: { active: boolean; windowId: number }): Promise<Tab[]>; update(id: number, input: { url: string }): Promise<Tab> }; scripting?: { executeScript<R>(input: { target: { tabId: number; frameIds: [number] }; func: (...args: any[]) => R; args: any[] }): Promise<Array<{ frameId?: number; result?: R }>> } }

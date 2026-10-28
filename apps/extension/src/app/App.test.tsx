@@ -1029,14 +1029,14 @@ describe("capture workflow cross-section safety", () => {
     const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, service);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
-    await screen.findByRole("heading", { name: "Automatic capture paused" });
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     expect(service.start).toHaveBeenCalledTimes(5);
     expect(api.startLocalAutomaticCaptureRun).toHaveBeenCalledOnce();
     expect(api.saveLocalAutomaticCaptureSection).toHaveBeenCalledTimes(10);
     expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
     expect(screen.getByText("Fresh captures: 0 / 9 successful", { exact: false })).toBeInTheDocument();
     expect(screen.getAllByText("Not started")).toHaveLength(8);
-  });
+  }, 15_000);
   it("restores a persisted worker capture into review after the UI remounts", async () => {
     const initial = businessReviewAutoReport();
     const saved: AutoCaptureState = { request: automaticRequest(initial), stage: "review_ready", sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } };

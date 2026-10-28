@@ -223,6 +223,148 @@ describe("Business Review semantic capture adapter", () => {
     });
   });
 
+  describe("Metrics capture waits until the final row is clear of Klaviyo's floating Composer bar", () => {
+    const TEN_METRICS = `<table><thead><tr><th>Metric</th><th>Email</th></tr></thead><tbody>${["Total Recipients", "Unique Opens", "Open Rate", "Unique Clicks", "Click Rate", "Unique Conversions", "Conversion Rate", "Conversion Value", "Revenue Per Recipient", "Average Order Value"].map((metric) => `<tr><td>${metric}</td><td>1</td></tr>`).join("")}</tbody></table>`;
+    /**
+     * The card scrolls inside an overflow container; a fixed Composer bar covers the viewport's bottom (top at 690 px).
+     * Unscrolled, the card starts at `cardTop` and its 10th row ends at cardTop + 400, under the bar.
+     */
+    function metricsUnderComposer(kind: "campaign" | "flow", cardTop: number, options: { reasserts?: boolean; contentsRows?: boolean } = {}) {
+      page();
+      const main = document.querySelector("main")!;
+      const scroller = document.createElement("div"); scroller.id = "scroller"; scroller.style.overflowY = "auto";
+      main.replaceWith(scroller); scroller.append(main);
+      let scrollTop = 0;
+      Object.defineProperty(scroller, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = Math.max(0, Math.min(value, 400)); } });
+      document.body.insertAdjacentHTML("beforeend", `<div id="composer-root" style="position: fixed"><div id="composer">Which segments am I over-sending to?</div></div>`);
+      const composer = document.getElementById("composer-root")!;
+      if (options.reasserts) new MutationObserver(() => { if (composer.style.visibility === "hidden") composer.style.visibility = ""; }).observe(composer, { attributes: true });
+      document.querySelector(`#${kind} [role=tab]:nth-child(2)`)!.addEventListener("click", () => { document.querySelector(`#${kind}-panel`)!.innerHTML = TEN_METRICS; });
+      const cardY = () => cardTop - scrollTop;
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+        if (this.closest("#composer-root")) return rect(400, 690, 400, 48);
+        const section = this.closest("section");
+        if (section?.id === kind) {
+          const row = this.closest("tbody tr");
+          // Live Klaviyo rows are `display: contents`: the <tr> has no box, only its cells do (run 4ab3c8e7).
+          if (row && options.contentsRows && this === row) return rect(0, 0, 0, 0);
+          if (row) return rect(20, cardY() + 100 + Array.from(row.parentElement!.children).indexOf(row) * 30, 880, 30);
+          return rect(10, cardY(), 900, 460);
+        }
+        return section ? rect(10, 1_200, 900, 300) : rect(0, 0, 8, 8);
+      });
+      return { scrolled: () => scrollTop, composer };
+    }
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s scrolls the obstructed Average Order Value row above the bar, then crops above it", async (type, kind) => {
+      const live = metricsUnderComposer(kind, 300);
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result).toMatchObject({ ok: true, targetRect: { lastRowProof: { lastMetric: "average order value", visible: true, overlap: "none", hiddenOverlays: 0 } } });
+      if (!result.ok) return;
+      expect(live.scrolled()).toBeGreaterThanOrEqual(18);
+      const proof = result.targetRect.lastRowProof!;
+      expect(Number(proof.lastRowBottom)).toBeLessThanOrEqual(690);
+      // The crop holds the heading, tabs, and the whole table through Average Order Value, and stops above the bar.
+      expect(result.targetRect.y).toBe(300 - live.scrolled());
+      expect(result.targetRect.y + result.targetRect.height).toBeGreaterThanOrEqual(Number(proof.lastRowBottom));
+      expect(result.targetRect.y + result.targetRect.height).toBeLessThanOrEqual(690);
+      expect(live.composer.style.visibility).toBe("");
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s reads the final row from its cells when Klaviyo's rows have no box of their own", async (type, kind) => {
+      metricsUnderComposer(kind, 300, { contentsRows: true });
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result.ok ? "ok" : `${result.code}: ${result.message}`).toBe("ok");
+      expect(result).toMatchObject({ targetRect: { lastRowProof: { lastMetric: "average order value", visible: true, overlap: "none" } } });
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s hides the bar as temporary UI when scrolling cannot clear the row without losing the heading", async (type, kind) => {
+      const live = metricsUnderComposer(kind, 0);
+      // The card is already at the top of the viewport (its last row ends at 400 px); the bar sits at 380 px over it.
+      const original = HTMLElement.prototype.getBoundingClientRect;
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return this.closest("#composer-root") ? rect(400, 380, 400, 48) : original.call(this); });
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result).toMatchObject({ ok: true, targetRect: { lastRowProof: { visible: true, overlap: "none", hiddenOverlays: 1 } } });
+      expect(live.scrolled()).toBe(0);
+      expect(live.composer.style.visibility).toBe("hidden");
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s never accepts an Average Order Value row that stays covered", async (type, kind) => {
+      metricsUnderComposer(kind, 0, { reasserts: true });
+      const original = HTMLElement.prototype.getBoundingClientRect;
+      vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return this.closest("#composer-root") ? rect(400, 380, 400, 48) : original.call(this); });
+      await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period)).resolves.toMatchObject({ ok: false, code: "BUSINESS_REVIEW_TARGET_OCCLUDED" });
+    });
+  });
+
+  describe("Metrics view verification re-queries the live card and accepts an already-selected view", () => {
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s accepts Metrics that is already selected with its table rendered, without clicking", async (type, kind) => {
+      page();
+      const card = document.getElementById(kind)!;
+      card.querySelectorAll("[role=tab]").forEach((tab) => tab.setAttribute("aria-selected", tab.textContent === "Metrics" ? "true" : "false"));
+      card.querySelector(`#${kind}-panel`)!.innerHTML = METRICS;
+      const clicks = vi.fn(); card.querySelectorAll("[role=tab]").forEach((tab) => tab.addEventListener("click", clicks));
+      await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period)).resolves.toMatchObject({ ok: true });
+      expect(clicks).not.toHaveBeenCalled();
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s re-queries the card React replaces after the Metrics click and proves the late Metrics table", async (type, kind) => {
+      page();
+      const original = document.getElementById(kind)!;
+      const staleMetricsTab = original.querySelector("[role=tab]:nth-child(2)")!;
+      staleMetricsTab.addEventListener("click", () => {
+        const replacement = original.cloneNode(true) as HTMLElement; replacement.id = `${kind}-replaced`;
+        replacement.querySelectorAll("[role=tab]").forEach((tab) => tab.setAttribute("aria-selected", tab.textContent === "Metrics" ? "true" : "false"));
+        replacement.querySelector(`#${kind}-panel`)!.innerHTML = "";
+        original.replaceWith(replacement);
+        window.setTimeout(() => { replacement.querySelector(`#${kind}-panel`)!.innerHTML = METRICS; }, 1_200);
+      });
+      await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period)).resolves.toMatchObject({ ok: true });
+      expect(original.isConnected).toBe(false);
+      expect(staleMetricsTab.isConnected).toBe(false);
+      expect(document.getElementById(`${kind}-replaced`)!.textContent).toContain("Revenue Per Recipient");
+    });
+  });
+
+  describe("the injected adapter always returns plain JSON, never an exception Chrome turns into null", () => {
+    const asChromeInjects = () => new Function("target", "expected", "dialog", "ready", `return (${prepareBusinessReviewCaptureDocument.toString()})(target, expected, dialog, ready);`) as typeof prepareBusinessReviewCaptureDocument;
+
+    it("turns an exception whose diagnostics also crash into a typed, serializable failure (the escape path that returned null)", async () => {
+      page();
+      // A null target makes both the adapter and its diagnostics builder throw — exactly the double failure that escaped before.
+      const result = await asChromeInjects()(null as never, period);
+      expect(result).toMatchObject({ ok: false, code: "KLAVIYO_PAGE_ADAPTER_ERROR", message: expect.stringContaining("Cannot read properties of null"), diagnostics: { snapshotError: expect.stringContaining("Cannot read properties of null") } });
+      expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    });
+
+    it("keeps the real failure code when building its diagnostics crashes (run 8fdc5fcc returned null)", async () => {
+      page(); document.getElementById("growth")!.remove();
+      vi.spyOn(HTMLElement.prototype, "cloneNode").mockImplementation(() => { throw new Error("clone failed on this page"); });
+      const result = await asChromeInjects()(BUSINESS_REVIEW_TARGETS.month_comparison, period, 50, 300);
+      expect(result).toMatchObject({ ok: false, code: "BUSINESS_REVIEW_CARD_NOT_FOUND", diagnostics: { snapshotError: "clone failed on this page" } });
+      expect(JSON.parse(JSON.stringify(result))).toEqual(result);
+    });
+  });
+
+  it("does not hang when the tab runs no animation frames (a hidden or background tab)", async () => {
+    page();
+    const original = window.requestAnimationFrame;
+    window.requestAnimationFrame = (() => 0) as typeof window.requestAnimationFrame;
+    try {
+      await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.campaign_metrics, period)).resolves.toMatchObject({ ok: true });
+    } finally { window.requestAnimationFrame = original; }
+  }, 20_000);
+
+  it("waits for its own target card's spinner even when another Business Review card is already ready", async () => {
+    page();
+    // Growth overview is fully rendered; Campaign Performance Summary is still loading.
+    document.getElementById("campaign")!.insertAdjacentHTML("beforeend", `<div id="campaign-spinner" role="progressbar" aria-busy="true"></div>`);
+    let spinnerRemovedAt = Number.POSITIVE_INFINITY;
+    window.setTimeout(() => { document.getElementById("campaign-spinner")!.remove(); spinnerRemovedAt = Date.now(); }, 2_500);
+    await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.campaign_performance, period)).resolves.toMatchObject({ ok: true });
+    expect(Date.now()).toBeGreaterThanOrEqual(spinnerRemovedAt);
+  }, 15_000);
+
   it("fails closed when Growth overview offers no Message type breakdown view", async () => {
     page();
     document.querySelector("#growth")!.innerHTML = `<h2>Growth Overview</h2><button role="tab" aria-selected="true">Conversion summary</button>${CONVERSION_SUMMARY}`;

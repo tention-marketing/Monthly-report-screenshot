@@ -1,5 +1,7 @@
 import type { ReportPeriod } from "@tention/report-schema";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
+import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
+import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
 import {
   ChromeSessionKlaviyoActiveTabGrantStore, activeTabGrantFailureMessage,
   isKlaviyoHomeDashboardUrl, type ActiveTabGrantFailureCode, type KlaviyoActiveTabGrantStore, verifyKlaviyoActiveTabGrant,
@@ -14,7 +16,7 @@ export type DashboardPreparation =
   | { kind: "failed"; code: DashboardFailureCode | ActiveTabGrantFailureCode | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED" | "PAGE_READY_TIMEOUT"; message: string; sourceTabId?: number; windowId?: number; diagnostics?: Record<string, unknown> };
 
 export interface DashboardCaptureNavigation {
-  prepare(screenshotType: DashboardScreenshotType, period: ReportPeriod, dashboardUrl?: string | null): Promise<DashboardPreparation>;
+  prepare(screenshotType: DashboardScreenshotType, period: ReportPeriod, dashboardUrl?: string | null, recovery?: AttemptRecovery): Promise<DashboardPreparation>;
 }
 
 interface ChromeTab { id?: number; windowId?: number; url?: string; active?: boolean; status?: string }
@@ -24,7 +26,7 @@ interface ChromeTabsApi {
   update(tabId: number, properties: { url: string }): Promise<ChromeTab>;
   onUpdated: { addListener(listener: (tabId: number, change: { status?: string }, tab: ChromeTab) => void): void; removeListener(listener: (tabId: number, change: { status?: string }, tab: ChromeTab) => void): void };
 }
-interface ChromeScriptingApi { executeScript<Result>(details: { target: { tabId: number; frameIds: [number] }; func: (target: typeof DASHBOARD_TARGETS[DashboardScreenshotType], period: { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }) => Promise<Result>; args: [typeof DASHBOARD_TARGETS[DashboardScreenshotType], { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }] }): Promise<Array<{ frameId?: number; result?: Result }>> }
+interface ChromeScriptingApi { executeScript<Result>(details: { target: { tabId: number; frameIds: [number] }; func: (target: typeof DASHBOARD_TARGETS[DashboardScreenshotType], period: { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }) => Promise<Result>; args: [typeof DASHBOARD_TARGETS[DashboardScreenshotType], { startDate: string; endDate: string; previousStartDate: string; previousEndDate: string }, ...number[]] }): Promise<Array<{ frameId?: number; result?: Result }>> }
 interface ChromeApi { tabs?: ChromeTabsApi; scripting?: ChromeScriptingApi }
 
 /** Uses only the tab explicitly authorized through the Tention toolbar action. */
@@ -35,36 +37,62 @@ export class ChromeKlaviyoDashboardCaptureNavigation implements DashboardCapture
     private readonly grantStore: KlaviyoActiveTabGrantStore = new ChromeSessionKlaviyoActiveTabGrantStore(),
   ) {}
 
-  async prepare(screenshotType: DashboardScreenshotType, period: ReportPeriod, dashboardUrl: string | null = null): Promise<DashboardPreparation> {
+  async prepare(screenshotType: DashboardScreenshotType, period: ReportPeriod, dashboardUrl: string | null = null, recovery?: AttemptRecovery): Promise<DashboardPreparation> {
     const tabs = this.chromeApi?.tabs; const scripting = this.chromeApi?.scripting;
     if (!tabs || !scripting) return { kind: "failed", code: "DASHBOARD_NOT_FOUND", message: "Chrome dashboard automation is unavailable in this environment." };
+    let injection: { tabId: number; urlBefore: string | null } | null = null;
     try {
-      const grant = await withTimeout(() => verifyKlaviyoActiveTabGrant(tabs, this.grantStore), "checking the Tention toolbar grant", this.timeoutMs);
+      const grant = await withTimeout(() => verifyKlaviyoActiveTabGrant(tabs, this.grantStore, { returningToConfiguredUrl: true }), "checking the Tention toolbar grant", this.timeoutMs);
       if (!grant.ok) return { kind: "failed", code: grant.code, message: activeTabGrantFailureMessage(grant.code) };
       const current = await this.waitForReady(tabs, grant.grant.grantedTabId);
       const navigationStartedAt = performance.now();
       if (!isKlaviyoHomeDashboardUrl(current.url ?? null)) {
         if (!dashboardUrl || !isKlaviyoHomeDashboardUrl(dashboardUrl)) return { kind: "failed", code: "DASHBOARD_URL_REQUIRED", message: "A configured Klaviyo Overview URL is required to navigate the toolbar-authorized tab from its current reporting view." };
         if (!tabs.update) return { kind: "failed", code: "DASHBOARD_URL_REQUIRED", message: "The authorized Klaviyo tab cannot navigate to the configured Overview source." };
-        await withTimeout(() => tabs.update(grant.grant.grantedTabId, { url: dashboardUrl }), "opening the configured Klaviyo Overview in the toolbar-authorized tab", this.timeoutMs);
       }
+      // Every attempt loads the Overview fresh, even when the tab already shows it, so a retry never reuses the
+      // previous attempt's half-rendered or replaced DOM.
+      const freshUrl = dashboardUrl && isKlaviyoHomeDashboardUrl(dashboardUrl) ? dashboardUrl : current.url ?? null;
+      if (typeof tabs.update === "function" && freshUrl && isKlaviyoHomeDashboardUrl(freshUrl)) await this.navigateFresh(tabs, grant.grant.grantedTabId, freshUrl);
       const dashboard = await this.waitForReady(tabs, grant.grant.grantedTabId);
       const navigationMs = Math.max(0, Math.round(performance.now() - navigationStartedAt));
       if (!isKlaviyoHomeDashboardUrl(dashboard.url ?? null)) return { kind: "failed", code: "DASHBOARD_NOT_FOUND", message: "The toolbar-authorized tab did not reach the configured Klaviyo Overview dashboard." };
+      if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
+      injection = { tabId: grant.grant.grantedTabId, urlBefore: dashboard.url ?? null };
       const results = await withTimeout(() => scripting.executeScript<unknown>({
         target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareDashboardCaptureDocument,
-        args: [DASHBOARD_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }],
+        args: [DASHBOARD_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }, ...(recoveryRequests(recovery, "extended-readiness") ? [6_000, 25_000] as const : [] as const)],
       }), "preparing the Klaviyo dashboard target", Math.max(this.timeoutMs, 60_000));
       const main = results.find((result) => result.frameId === 0) ?? results[0];
-      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The dashboard helper returned no result." };
-      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The dashboard helper returned an undefined result." };
-      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The dashboard helper returned an invalid result.", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { failureStage: "PAGE_READY", expectedUrl: safeUrl(dashboardUrl ?? dashboard.url), observedUrl: safeUrl(dashboard.url), expectedSourceIdentity: DASHBOARD_TARGETS[screenshotType].sourceIdentity, resultShape: summarizeAdapterResult(main.result) } };
+      const describe = (found: InjectionResultLike | null) => injectionFailureDiagnostics({ section: screenshotType, scripting: scripting as never, tabs: tabs as never, tabId: grant.grant.grantedTabId, urlBefore: dashboard.url ?? null, results, main: found, cardAliases: [DASHBOARD_TARGETS[screenshotType].heading], failureStage: "SCRIPT_RESULT" });
+      if (!main) return { kind: "failed", code: "SCRIPT_RESULT_EMPTY", message: "The dashboard helper returned no result.", diagnostics: { injection: await describe(null) } };
+      if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The dashboard helper returned an undefined result.", diagnostics: { injection: await describe(main) } };
+      if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The dashboard helper returned an invalid result.", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { injection: await describe(main), failureStage: "PAGE_READY", expectedUrl: safeUrl(dashboardUrl ?? dashboard.url), observedUrl: safeUrl(dashboard.url), expectedSourceIdentity: DASHBOARD_TARGETS[screenshotType].sourceIdentity, resultShape: summarizeAdapterResult(main.result) } };
       if (!main.result.ok) return { kind: "failed", code: main.result.code, message: main.result.message, sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { ...(main.result.diagnostics ?? {}), stageTimingsMs: { ...((main.result.diagnostics?.stageTimingsMs as Record<string, number> | undefined) ?? {}), navigationMs } } };
       return { kind: "ready", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, detectedPeriod: formatPeriod(period), observedPeriod: main.result.observedPeriod, target: { ...main.result.targetRect, stageTimingsMs: { ...(main.result.targetRect.stageTimingsMs ?? {}), navigationMs } } };
     } catch (error) {
       if (isChromeOperationTimeout(error)) return { kind: "failed", code: "PAGE_READY_TIMEOUT", message: error.message };
-      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Dashboard preparation failed: ${chromeErrorMessage(error)}` };
+      const diagnostics = injection ? { injection: await injectionFailureDiagnostics({ section: screenshotType, scripting: scripting as never, tabs: tabs as never, tabId: injection.tabId, urlBefore: injection.urlBefore, results: null, main: null, cardAliases: [DASHBOARD_TARGETS[screenshotType].heading], failureStage: "SCRIPT_INJECTION" }), injectionError: chromeErrorMessage(error) } : undefined;
+      return { kind: "failed", code: "SCRIPT_INJECTION_FAILED", message: `Dashboard preparation failed: ${chromeErrorMessage(error)}`, ...(diagnostics ? { diagnostics } : {}) };
     }
+  }
+
+  /** Navigates and waits for the load it started (loading → complete), so the script never runs in the old document. */
+  private async navigateFresh(tabs: ChromeTabsApi, tabId: number, url: string): Promise<void> {
+    let remove: () => void = () => {}; let sawLoading = false;
+    const loaded = new Promise<void>((resolve) => {
+      const listener = (id: number, change: { status?: string }) => {
+        if (id !== tabId) return;
+        if (change.status === "loading") sawLoading = true;
+        else if (sawLoading && change.status === "complete") resolve();
+      };
+      remove = () => tabs.onUpdated.removeListener(listener); tabs.onUpdated.addListener(listener);
+    });
+    try {
+      await withTimeout(() => tabs.update(tabId, { url }), "opening the Klaviyo Overview in the toolbar-authorized tab", this.timeoutMs);
+      const started = await Promise.race([loaded.then(() => true), new Promise<boolean>((resolve) => setTimeout(() => resolve(sawLoading), Math.min(3_000, this.timeoutMs)))]);
+      if (started || sawLoading) await withTimeout(() => loaded, "waiting for the fresh Klaviyo Overview load", Math.max(this.timeoutMs, 20_000));
+    } finally { remove(); }
   }
 
   private async waitForReady(tabs: ChromeTabsApi, tabId: number): Promise<ChromeTab> {
