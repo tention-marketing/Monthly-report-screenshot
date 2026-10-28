@@ -2,8 +2,13 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { fileURLToPath, URL } from "node:url";
 
+// Lets every live diagnostic run record exactly which extension build produced it; the local API
+// compares it with dist/build.json so a run from a stale, un-reloaded extension is refused.
+const BUILD = new Date().toISOString();
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), { name: "tention-build-stamp", generateBundle() { this.emitFile({ type: "asset", fileName: "build.json", source: `${JSON.stringify({ build: BUILD })}\n` }); } }],
+  define: { __TENTION_BUILD__: JSON.stringify(BUILD) },
   resolve: { alias: {
     "@tention/api-client": fileURLToPath(new URL("../../packages/api-client/src/index.ts", import.meta.url)),
     "@tention/report-core": fileURLToPath(new URL("../../packages/report-core/src/index.ts", import.meta.url)),

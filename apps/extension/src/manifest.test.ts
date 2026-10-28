@@ -12,7 +12,7 @@ describe("extension permission scope", () => {
     expect(JSON.stringify(manifest)).not.toContain("<all_urls>");
   });
   it("limits host permissions to the local API and Klaviyo", () => {
-    expect(manifest.host_permissions).toEqual(["http://127.0.0.1:3000/*", "https://www.klaviyo.com/*"]);
+    expect(manifest.host_permissions).toEqual(["http://127.0.0.1:4000/*", "https://www.klaviyo.com/*"]);
   });
   it("uses a module service worker and shared side-panel UI instead of a focus-closing action popup", () => {
     expect(manifest.background).toEqual({ service_worker: "background.js", type: "module" });

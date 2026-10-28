@@ -64,7 +64,7 @@ Issues carry `error` or `warning` severity and may identify a field, section, or
 - AI may interpret validated metrics but cannot calculate financial values.
 - Screenshots are visual evidence and are not a numeric source of truth.
 - `0` means a confirmed zero, `null` means unavailable or not applicable, and an error means the fetch or calculation failed. Nulls and errors must not become zero.
-- Default display counts are Top 3 Campaigns and Top 5 Flows. Ranking formulas come later.
+- Default display counts are Top 5 Campaigns and Top 5 Flows. Ranking formulas come later.
 - Provider failures and incomplete pagination must never silently become client totals.
 - Internal precision is retained; rounding is a presentation concern.
 

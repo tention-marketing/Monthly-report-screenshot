@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
-import { ChromeCaptureService, isKlaviyoUrl } from "./capture-service.js";
+import { CHROME_CAPTURE_MIN_INTERVAL_MS, ChromeCaptureService, isKlaviyoUrl } from "./capture-service.js";
 import {
+  isKlaviyoSupportedCaptureUrl,
   type KlaviyoActiveTabGrant,
   type KlaviyoActiveTabGrantStore,
 } from "../klaviyo-navigation/active-tab-grant.js";
@@ -44,6 +45,29 @@ describe("Klaviyo source-tab recognition", () => {
   it.each(["https://www.klaviyo.com/analytics", "https://app.klaviyo.com/dashboard"])("recognizes %s", (url) => expect(isKlaviyoUrl(url)).toBe(true));
   it.each(["https://klaviyo.example.com/", "https://example.com/?next=klaviyo.com", null])("does not recognize %s", (url) => expect(isKlaviyoUrl(url)).toBe(false));
 
+  it.each([
+    "https://www.klaviyo.com/omnicampaigns?appBarNav=true",
+    "https://www.klaviyo.com/forms",
+    "https://www.klaviyo.com/forms/",
+    "https://www.klaviyo.com/flows?page=1",
+    "https://www.klaviyo.com/lists?tab=segments",
+    "https://www.klaviyo.com/analytics/dashboards",
+  ])("allows same-tab screenshot grants for safe listing route %s", (url) => {
+    expect(isKlaviyoSupportedCaptureUrl(url)).toBe(true);
+  });
+
+  it.each([
+    "https://www.klaviyo.com/omnicampaigns/01M09SSNTBBB5N5R8SWYZ5X22V",
+    "https://www.klaviyo.com/forms/YaYPH9",
+    "https://www.klaviyo.com/forms/YaYPH9/reports/overview",
+    "https://www.klaviyo.com/flow/Rex4Pp/edit",
+    "https://www.klaviyo.com/list/abc",
+    "https://www.klaviyo.com/lists/segment/abc",
+    "https://evil.example/forms",
+  ])("does not grant access to an individual object or non-Klaviyo route %s", (url) => {
+    expect(isKlaviyoSupportedCaptureUrl(url)).toBe(false);
+  });
+
   it("uses the stored toolbar grant for manual capture and sends captureVisibleTab its granted window", async () => {
     const chromeApi = chromeFor();
     const service = new ChromeCaptureService(chromeApi, undefined, grantStore());
@@ -51,6 +75,22 @@ describe("Klaviyo source-tab recognition", () => {
     await expect(service.captureVisibleTab()).resolves.toMatchObject({ tabId: 7, windowId: 4, sourceUrl: grant.grantedUrl });
     expect(chromeApi.tabs.get).toHaveBeenCalledWith(7);
     expect(chromeApi.tabs.captureVisibleTab).toHaveBeenCalledWith(4, { format: "png" });
+  });
+
+  it("serializes fresh screenshot requests to respect Chrome's visible-tab capture quota", async () => {
+    vi.useFakeTimers();
+    try {
+      const times: number[] = [];
+      const chromeApi = chromeFor();
+      chromeApi.tabs.captureVisibleTab.mockImplementation(async () => { times.push(Date.now()); return "data:image/png;base64,AAAA"; });
+      const service = new ChromeCaptureService(chromeApi, 8_000, grantStore());
+      await service.captureVisibleTab();
+      const second = service.captureVisibleTab();
+      await vi.advanceTimersByTimeAsync(CHROME_CAPTURE_MIN_INTERVAL_MS);
+      await second;
+      expect(times).toHaveLength(2);
+      expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(CHROME_CAPTURE_MIN_INTERVAL_MS);
+    } finally { vi.useRealTimers(); }
   });
 
   it("does not substitute another matching Klaviyo tab for the toolbar-granted tab", async () => {
@@ -89,6 +129,16 @@ describe("Klaviyo source-tab recognition", () => {
       code: "GRANTED_TAB_CHANGED_ORIGIN",
     });
     expect(store.clearGrant).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the exact toolbar grant when that same tab navigates to Campaigns and changes only query-based date state", async () => {
+    const tab = grantedTab({ url: "https://www.klaviyo.com/omnicampaigns?appBarNav=true&startDate=2026-08-01&endDate=2026-08-31" });
+    const chromeApi = chromeFor(tab);
+    const store = grantStore();
+    const service = new ChromeCaptureService(chromeApi, undefined, store);
+
+    await expect(service.captureVisibleTab()).resolves.toMatchObject({ sourceUrl: tab.url, tabId: 7 });
+    expect(store.clearGrant).not.toHaveBeenCalled();
   });
 
   it("turns a Chrome activeTab denial into the same actionable grant failure", async () => {

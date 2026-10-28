@@ -1,5 +1,5 @@
 import {
-  reportSectionKeySchema, screenshotSectionMapping,
+  matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, reportSectionKeySchema, screenshotSectionMapping,
   type ReportDraft, type ReportSectionKey, type ScreenshotType, type SectionRequirement,
 } from "@tention/report-schema";
 
@@ -8,15 +8,15 @@ export interface ChecklistItem {
   label: string;
   requirement: SectionRequirement;
   screenshotType: ScreenshotType | null;
-  state: "missing" | "unapproved" | "approved" | "not_required" | "disabled";
+  state: "missing" | "unapproved" | "approved" | "stale" | "not_required" | "disabled";
 }
 
 const labels: Record<ReportSectionKey, string> = {
-  executive_summary: "Executive Summary", top_campaigns: "Top Campaigns", top_flows: "Top 5 Flows",
+  executive_summary: "Executive Summary", top_campaigns: "Top 5 Campaigns", top_flows: "Top 5 Flows",
   month_comparison: "Month Comparison", campaign_performance: "Campaign Performance",
-  flow_performance: "Flow Performance", signup_form: "Signup Form", welcome_flow: "Welcome Flow",
-  customer_split: "Customer Split", deliverability: "Deliverability", campaign_metrics: "Campaign Metrics",
-  flow_metrics: "Flow Metrics", list_growth: "List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
+  flow_performance: "Flow Performance", signup_form: "Signup Form Performance", welcome_flow: "Welcome Flow Performance",
+  customer_split: "Customer Split", deliverability: "Deliverability Score", campaign_metrics: "Campaign Metrics",
+  flow_metrics: "Flow Metrics", list_growth: "Historical List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
 };
 const screenshotBySection = Object.fromEntries(
   Object.entries(screenshotSectionMapping).map(([type, section]) => [section, type]),
@@ -24,14 +24,15 @@ const screenshotBySection = Object.fromEntries(
 
 export function buildReportChecklist(report: ReportDraft): ChecklistItem[] {
   return reportSectionKeySchema.options
-    .filter((section) => report.sections[section] !== undefined)
+    .filter((section) => section !== "list_growth" && report.sections[section] !== undefined)
     .map((section) => {
-      const requirement = report.sections[section]!;
+      const captureSpec = REPORT_CAPTURE_SPEC_V1.find((spec) => spec.key === section);
+      const requirement = captureSpec?.automationStatus === "auto" ? "required" : report.sections[section]!;
       const screenshotType = screenshotBySection[section] ?? null;
       if (requirement === "disabled") return { section, label: labels[section], requirement, screenshotType, state: "disabled" };
       if (!screenshotType) return { section, label: labels[section], requirement, screenshotType, state: "not_required" };
       const screenshot = report.screenshots.find(({ type }) => type === screenshotType);
-      const state = !screenshot ? "missing" : screenshot.approved ? "approved" : "unapproved";
+      const state = !screenshot ? "missing" : !matchesReportCaptureSpec(screenshotType, screenshot.sourceProof) ? "stale" : screenshot.approved ? "approved" : "unapproved";
       return { section, label: labels[section], requirement, screenshotType, state };
     });
 }

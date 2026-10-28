@@ -1,0 +1,10 @@
+{
+  "clients": [
+    {
+      "name": "Example client",
+      "timezone": "America/New_York",
+      "overviewUrl": "https://www.klaviyo.com/dashboard",
+      "businessReviewUrl": "https://www.klaviyo.com/analytics/dashboards/replace-with-verified-business-review-id"
+    }
+  ]
+}

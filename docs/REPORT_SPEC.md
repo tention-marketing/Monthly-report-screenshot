@@ -5,7 +5,7 @@ The future monthly report uses one reusable, configurable master structure acros
 ## Default sections
 
 1. Executive Summary
-2. Top 3 Campaigns
+2. Top 5 Campaigns
 3. Top 5 Flows
 4. Comparison to Previous Month
 5. Signup Form Performance
@@ -14,9 +14,8 @@ The future monthly report uses one reusable, configurable master structure acros
 8. Deliverability
 9. Campaign Metrics
 10. Flow Metrics
-11. List Growth
-12. Analysis
-13. Next Month's Plan
+11. Analysis
+12. Next Month's Plan
 
 Not every client requires every section. Each report draft carries its own section configuration, with `required`, `optional`, or `disabled` for each configured section. The schema does not impose one universal client configuration.
 
@@ -36,7 +35,6 @@ Not every client requires every section. Each report draft carries its own secti
 | `deliverability` | `deliverability` |
 | `campaign_metrics` | `campaign_metrics` |
 | `flow_metrics` | `flow_metrics` |
-| `list_growth` | `list_growth` |
 
 `analysis` and `next_month_plan` have no screenshot type. The mapping is defined once in the shared report schema and consumed by domain validation.
 

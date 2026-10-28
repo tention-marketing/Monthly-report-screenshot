@@ -10,3 +10,9 @@ test-results/
 *.tsbuildinfo
 apps/extension/.vite/
 data/screenshots/
+data/local-clients.json
+data/klaviyo-test-browser-profile/
+apps/api/output/
+output/
+data/report-artifacts/
+apps/api/data/

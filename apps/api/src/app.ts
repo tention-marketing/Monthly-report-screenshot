@@ -1,19 +1,34 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import { InMemoryReportDraftRepository, type ReportDraftRepository } from "@tention/report-domain";
+import { InMemoryClientReportTargetsRepository, InMemoryReportDraftRepository, type ClientReportTargetsRepository, type ReportDraftRepository } from "@tention/report-domain";
+import { clientReportTargetRoutes } from "./routes/client-report-targets.js";
 import { healthRoutes } from "./routes/health.js";
 import { reportDraftRoutes } from "./routes/report-drafts.js";
+import { localDevelopmentRoutes } from "./routes/local-development.js";
 import { InMemoryScreenshotStorage, MAX_SCREENSHOT_BYTE_SIZE, type ScreenshotStorage } from "./storage/screenshot-storage.js";
+import { InMemoryPdfArtifactStorage, type PdfArtifactStorage } from "./storage/pdf-artifact-storage.js";
+import { PlaywrightPdfRenderer, type PdfRenderer } from "./reports/pdf-renderer.js";
 
 export interface AppOptions {
   logger?: boolean;
   repository?: ReportDraftRepository;
+  clientReportTargetsRepository?: ClientReportTargetsRepository;
   now?: () => Date;
   allowedOrigins?: readonly string[];
   screenshotStorage?: ScreenshotStorage;
+  pdfArtifactStorage?: PdfArtifactStorage;
+  pdfRenderer?: PdfRenderer;
+  enableLocalDevelopmentImports?: boolean;
+  localImportRequiresPersistentStorage?: boolean;
+  repositoryRoot?: string;
 }
 
 export function buildApp(options: AppOptions = {}) {
+  const clientReportTargetsRepository = options.clientReportTargetsRepository ?? new InMemoryClientReportTargetsRepository();
+  const repository = options.repository ?? new InMemoryReportDraftRepository();
+  const screenshotStorage = options.screenshotStorage ?? new InMemoryScreenshotStorage();
+  const pdfArtifactStorage = options.pdfArtifactStorage ?? new InMemoryPdfArtifactStorage();
+  const pdfRenderer = options.pdfRenderer ?? new PlaywrightPdfRenderer(process.env.REPORT_PDF_BROWSER_EXECUTABLE_PATH ? { executablePath: process.env.REPORT_PDF_BROWSER_EXECUTABLE_PATH } : {});
   const app = Fastify({ logger: options.logger ?? false, bodyLimit: MAX_SCREENSHOT_BYTE_SIZE });
   app.addContentTypeParser("image/png", { parseAs: "buffer" }, (_request, body, done) => done(null, body));
   app.setErrorHandler((error, _request, reply) => {
@@ -36,10 +51,29 @@ export function buildApp(options: AppOptions = {}) {
   app.register(healthRoutes, { prefix: "/api/v1" });
   app.register(reportDraftRoutes, {
     prefix: "/api/v1",
-    repository: options.repository ?? new InMemoryReportDraftRepository(),
-    screenshotStorage: options.screenshotStorage ?? new InMemoryScreenshotStorage(),
+    repository,
+    clientReportTargetsRepository,
+    screenshotStorage,
+    pdfArtifactStorage,
+    pdfRenderer,
     now: options.now ?? (() => new Date()),
   });
+  app.register(clientReportTargetRoutes, {
+    prefix: "/api/v1",
+    repository: clientReportTargetsRepository,
+    now: options.now ?? (() => new Date()),
+  });
+  if (options.enableLocalDevelopmentImports) {
+    app.register(localDevelopmentRoutes, {
+      prefix: "/api/v1/dev", repository,
+      targetsRepository: clientReportTargetsRepository,
+      screenshotStorage,
+      persistentStorage: options.localImportRequiresPersistentStorage ?? false,
+      pdfRenderer,
+      pdfArtifactStorage,
+      repositoryRoot: options.repositoryRoot ?? process.cwd(), now: options.now ?? (() => new Date()),
+    });
+  }
   return app;
 }
 

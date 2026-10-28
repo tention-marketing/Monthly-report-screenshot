@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ReportDraft } from "@tention/report-schema";
+import { createScreenshotSourceProof, type ReportDraft } from "@tention/report-schema";
 import {
   createReportDraft, InMemoryReportDraftRepository, ReportPersistenceError,
   upsertScreenshotMetadata,
@@ -16,6 +16,7 @@ const mutate = (draft: ReportDraft) => upsertScreenshotMetadata(draft, {
   capturedAt: now.toISOString(), sourceUrl: "https://example.com/report", width: 100, height: 100,
   approved: true, storageKey: "reports/11111111-1111-4111-8111-111111111111/overview/22222222-2222-4222-8222-222222222222.png",
   mimeType: "image/png", byteSize: 100, sha256: "a".repeat(64), approvedAt: now.toISOString(), periodConfirmed: true,
+  sourceProof: createScreenshotSourceProof("overview", draft.period),
 }, "overview", { now });
 
 describe("InMemoryReportDraftRepository contract", () => {

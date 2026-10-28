@@ -27,18 +27,18 @@ export interface KlaviyoNavigationTarget {
  */
 export const klaviyoNavigationTargets: Readonly<Record<ScreenshotType, KlaviyoNavigationTarget>> = {
   overview: { label: "Executive Summary", manualInstruction: "Open the Business Review or overview screen." },
-  top_campaigns: { label: "Top Campaigns", manualInstruction: "Open campaign reporting." },
-  top_flows: { label: "Top 5 Flows", manualInstruction: "Open flow reporting." },
+  top_campaigns: { label: "Top 5 Campaigns", manualInstruction: "Open campaign reporting." },
+  top_flows: { label: "Top 5 Flows", manualInstruction: "Open Klaviyo Home, set the Time period to the report month, and capture the Top performing flows card: the first five rows, or every row when fewer than five exist. Do not click a flow name or open Flow Builder." },
   month_comparison: { label: "Month Comparison", manualInstruction: "Open the comparison view for the selected month." },
   campaign_performance: { label: "Campaign Performance", manualInstruction: "Open campaign performance reporting." },
   flow_performance: { label: "Flow Performance", manualInstruction: "Open flow performance reporting." },
-  signup_form: { label: "Signup Form", manualInstruction: "Open signup form performance." },
-  welcome_flow: { label: "Welcome Flow", manualInstruction: "Open the welcome flow performance screen." },
+  signup_form: { label: "Signup Forms Listing", manualInstruction: "Open the Sign-up Forms listing and capture the all-forms table with performance columns. Do not open an individual form." },
+  welcome_flow: { label: "Welcome Flow Listing", manualInstruction: "Open the Flows listing, filter for Welcome, and capture only the configured Email rows. Do not open an individual flow or Flow Builder." },
   customer_split: { label: "Customer Split", manualInstruction: "Open customer versus non-customer reporting." },
-  deliverability: { label: "Deliverability", manualInstruction: "Open deliverability reporting." },
+  deliverability: { label: "Deliverability Score", manualInstruction: "Open Analytics, Deliverability, Email, then Score. Read the score card only; do not use Action Center actions." },
   campaign_metrics: { label: "Campaign Metrics", manualInstruction: "Open campaign metrics reporting." },
   flow_metrics: { label: "Flow Metrics", manualInstruction: "Open flow metrics reporting." },
-  list_growth: { label: "List Growth", manualInstruction: "Open list growth reporting." },
+  list_growth: { label: "Historical List Growth", manualInstruction: "This retired section is retained only to view historical records." },
 };
 
 export type NavigationResult =

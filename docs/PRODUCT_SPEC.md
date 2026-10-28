@@ -23,7 +23,7 @@ Open extension
   -> generate PDF
 ```
 
-V1 will eventually support client and month selection, capture and cropping, capture approval, a completion checklist, preview, PDF generation, history, an editable next-month plan, deterministic Top 3 Campaigns, and deterministic Top 5 Flows.
+V1 will eventually support client and month selection, capture and cropping, capture approval, a completion checklist, preview, PDF generation, history, an editable next-month plan, deterministic Top 5 Campaigns, and deterministic Top 5 Flows.
 
 ## System ownership
 

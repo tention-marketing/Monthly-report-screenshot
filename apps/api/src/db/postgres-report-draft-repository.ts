@@ -4,7 +4,7 @@ import {
   ReportPersistenceError, type ReportDraftRepository, type ReportEvent,
 } from "@tention/report-domain";
 import {
-  reportDraftSchema, reportLifecycleEventSchema, type ReportDraft, type ReportLifecycleEvent,
+  reportDraftSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, type ReportDraft, type ReportLifecycleEvent, type ReportPdfArtifact,
 } from "@tention/report-schema";
 
 // PostgreSQL DATE is a business calendar date, so never parse it through the machine timezone.
@@ -22,6 +22,10 @@ interface HistoryRow extends QueryResultRow {
   id: string; report_id: string; event_type: ReportLifecycleEvent["eventType"];
   from_status: ReportLifecycleEvent["fromStatus"]; to_status: ReportLifecycleEvent["toStatus"];
   report_version: number; created_at: string | Date; metadata: unknown;
+}
+interface ArtifactRow extends QueryResultRow {
+  id: string; report_id: string; storage_key: string; mime_type: string; byte_size: number;
+  sha256: string; source_fingerprint: string; template_version: string; generated_at: string | Date;
 }
 
 export class PostgresReportDraftRepository implements ReportDraftRepository {
@@ -135,6 +139,79 @@ export class PostgresReportDraftRepository implements ReportDraftRepository {
     });
   }
 
+  async saveGeneratedArtifact(draft: ReportDraft, expectedVersion: number, artifact: ReportPdfArtifact): Promise<ReportDraft> {
+    return this.withErrors(async () => {
+      const parsedArtifact = reportPdfArtifactSchema.parse(artifact);
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const before = await currentDraft(client, draft.id, true);
+        if (before.status !== "generating" || draft.status !== "generated" || parsedArtifact.reportId !== draft.id) {
+          throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "A PDF artifact can only complete an active report generation.");
+        }
+        const stored = await updateDraft(client, draft, expectedVersion);
+        await client.query(`INSERT INTO report_pdf_artifacts (
+          id, report_id, storage_key, mime_type, byte_size, sha256, source_fingerprint, template_version, generated_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, artifactValues(parsedArtifact));
+        await insertHistory(client, {
+          id: randomUUID(), reportId: stored.id, eventType: "GENERATION_SUCCEEDED", fromStatus: before.status,
+          toStatus: stored.status, reportVersion: stored.version, createdAt: stored.updatedAt, metadata: { artifactId: parsedArtifact.id },
+        });
+        await client.query("COMMIT");
+        return stored;
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally { client.release(); }
+    });
+  }
+
+  async getArtifactForFingerprint(reportId: string, sourceFingerprint: string): Promise<ReportPdfArtifact | null> {
+    return this.withErrors(async () => {
+      const result = await this.pool.query<ArtifactRow>(`SELECT * FROM report_pdf_artifacts
+        WHERE report_id = $1 AND source_fingerprint = $2`, [reportId, sourceFingerprint]);
+      return result.rows[0] ? parseArtifactRow(result.rows[0]) : null;
+    });
+  }
+
+  async listArtifacts(reportId: string): Promise<ReportPdfArtifact[]> {
+    return this.withErrors(async () => {
+      const result = await this.pool.query<ArtifactRow>(`SELECT * FROM report_pdf_artifacts
+        WHERE report_id = $1 ORDER BY generated_at DESC, id DESC`, [reportId]);
+      return result.rows.map(parseArtifactRow);
+    });
+  }
+
+  async rekeyLocalDraft(fromId: string, toId: string, expectedVersion: number): Promise<ReportDraft> {
+    return this.withErrors(async () => {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const current = await currentDraft(client, fromId, true);
+        if (current.version !== expectedVersion) {
+          throw new ReportPersistenceError("REPORT_VERSION_CONFLICT", "Report draft has changed since it was read.", { expectedVersion, currentVersion: current.version });
+        }
+        const target = await client.query("SELECT id FROM report_drafts WHERE id = $1", [toId]);
+        if (target.rowCount) throw new ReportPersistenceError("REPORT_DRAFT_ALREADY_EXISTS", "The target report ID is already assigned.");
+        if (current.status !== "draft") throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Only a local development draft can have its identity repaired.");
+
+        // Foreign keys are immediate in the production schema. Move referencing rows out,
+        // update the draft PK, then restore them under the new PK within this transaction.
+        const events = await client.query<HistoryRow>("DELETE FROM report_lifecycle_events WHERE report_id = $1 RETURNING *", [fromId]);
+        const artifacts = await client.query<ArtifactRow>("DELETE FROM report_pdf_artifacts WHERE report_id = $1 RETURNING *", [fromId]);
+        const updated = await client.query<DraftRow>("UPDATE report_drafts SET id = $2 WHERE id = $1 AND version = $3 RETURNING *", [fromId, toId, expectedVersion]);
+        if (!updated.rows[0]) throw new ReportPersistenceError("REPORT_VERSION_CONFLICT", "Report draft changed during identity repair.");
+        for (const row of events.rows) await client.query(`INSERT INTO report_lifecycle_events (id, report_id, event_type, from_status, to_status, report_version, created_at, metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, [row.id, toId, row.event_type, row.from_status, row.to_status, row.report_version, row.created_at, row.metadata]);
+        for (const row of artifacts.rows) await client.query(`INSERT INTO report_pdf_artifacts (id, report_id, storage_key, mime_type, byte_size, sha256, source_fingerprint, template_version, generated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [row.id, toId, row.storage_key, row.mime_type, row.byte_size, row.sha256, row.source_fingerprint, row.template_version, row.generated_at]);
+        await client.query("COMMIT");
+        return parseDraftRow(updated.rows[0]);
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally { client.release(); }
+    });
+  }
+
   private async withErrors<T>(operation: () => Promise<T>): Promise<T> {
     try { return await operation(); }
     catch (error) {
@@ -224,6 +301,19 @@ function parseHistoryRow(row: HistoryRow): ReportLifecycleEvent {
   });
   if (!result.success) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", `Persisted lifecycle history failed schema validation: ${result.error.message}`);
   return result.data;
+}
+function parseArtifactRow(row: ArtifactRow): ReportPdfArtifact {
+  const result = reportPdfArtifactSchema.safeParse({
+    id: row.id, reportId: row.report_id, storageKey: row.storage_key, mimeType: row.mime_type,
+    byteSize: row.byte_size, sha256: row.sha256.trim(), sourceFingerprint: row.source_fingerprint.trim(),
+    templateVersion: row.template_version, generatedAt: instant(row.generated_at),
+  });
+  if (!result.success) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Persisted PDF artifact failed schema validation.");
+  return result.data;
+}
+function artifactValues(artifact: ReportPdfArtifact): unknown[] {
+  return [artifact.id, artifact.reportId, artifact.storageKey, artifact.mimeType, artifact.byteSize,
+    artifact.sha256, artifact.sourceFingerprint, artifact.templateVersion, artifact.generatedAt];
 }
 
 function calendarDate(value: string | Date): string {

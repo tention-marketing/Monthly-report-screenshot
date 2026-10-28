@@ -31,6 +31,16 @@ function realBusinessReviewPage({ businessReview = "Business review", dashboardI
   });
 }
 
+function siblingPeriodBusinessReview(rangeMarkup: string): void {
+  window.history.replaceState({}, "", "/analytics/dashboards/01HWZSHD83RW7CYWQ6EVVQD2BK");
+  document.body.innerHTML = `<main><nav aria-label="Breadcrumb">Dashboards / Business Review</nav>
+    <header id="date-region"><span>Conversion metric</span><button aria-label="Placed Order">Placed Order</button><button aria-label="Time period">Time period</button><p id="range">${rangeMarkup}</p></header>
+    <section id="growth" role="region"><h2>Growth Overview</h2><p>Conversion summary</p></section></main>`;
+  if (!("scrollIntoView" in HTMLElement.prototype)) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: () => undefined });
+  vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => undefined);
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return this.id === "growth" ? rect() : rect(0, 0, 10, 10); });
+}
+
 function openTimePeriodDialog(currentPeriod: string, onApply: (dialog: HTMLElement) => void, includeApply = true): HTMLElement {
   const dialog = document.createElement("div");
   dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-label", "Time period");
@@ -103,6 +113,31 @@ describe("Executive Summary Klaviyo adapter", () => {
     expect(document.querySelector("[role=dialog]")).toBeNull();
   });
 
+  it.each([
+    "Jul 1, 2026 - Jul 31, 2026 compared to previous period",
+    "Jul 1, 2026 – Jul 31, 2026 compared to previous period",
+    "  Jul 1, 2026\n - \n Jul 31, 2026   compared to\nprevious period ",
+    "<span>Jul 1, 2026 - Jul 31, 2026</span><span> compared to</span><span> previous period</span>",
+  ])("verifies a live sibling Time period range without requiring it inside the control: %s", async (range) => {
+    siblingPeriodBusinessReview(range);
+    await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({ ok: true, periodVerified: true });
+  });
+
+  it("re-queries a React-replaced Time period region after Apply until the live July sibling range appears", async () => {
+    siblingPeriodBusinessReview("Jun 1, 2026 - Jun 30, 2026 compared to previous period");
+    document.querySelector("[aria-label='Time period']")!.addEventListener("click", () => openTimePeriodDialog("Jun 1, 2026 - Jun 30, 2026", (dialog) => {
+      const region = document.createElement("header"); region.id = "date-region-after-apply";
+      region.innerHTML = `<span>Conversion metric</span><button aria-label="Time period">Time period</button><p>Jul 1, 2026 - Jul 31, 2026 compared to previous period</p>`;
+      document.getElementById("date-region")!.replaceWith(region); dialog.remove();
+    }));
+    await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({ ok: true, periodVerified: true });
+  });
+
+  it.each(["Jun 1, 2026 - Jun 30, 2026 compared to previous period", "Jul 1, 2026 compared to previous period", "Selected period unavailable"])("fails closed for an unconfirmed sibling range: %s", async (range) => {
+    siblingPeriodBusinessReview(range);
+    await expect(prepareExecutiveSummaryDocument(julyPeriod, 1)).resolves.toMatchObject({ ok: false });
+  });
+
   it("rejects a generic Klaviyo dashboard without Growth overview", async () => {
     document.body.innerHTML = `<nav aria-label="Breadcrumb">Dashboards <span>Business review</span></nav><button aria-label="Time period">${july}</button><section><h2>Another dashboard</h2></section>`;
     await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({
@@ -127,6 +162,32 @@ describe("Executive Summary Klaviyo adapter", () => {
     }));
     await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({ ok: true, periodVerified: true });
     expect(period).toHaveTextContent("Jul 1, 2026 - Jul 31, 2026");
+  });
+
+  it("re-resolves Growth overview after Klaviyo replaces the dashboard card while applying a period", async () => {
+    businessReview("Jun 1, 2026 - Jun 30, 2026");
+    const period = document.getElementById("period")!;
+    period.addEventListener("click", () => openTimePeriodDialog("Jun 1, 2026 - Jun 30, 2026", (dialog) => {
+      const [start, end] = Array.from(dialog.querySelectorAll("input")) as HTMLInputElement[];
+      period.textContent = `${start!.value} - ${end!.value}`;
+      const replacement = document.createElement("section");
+      replacement.id = "growth-after-apply";
+      replacement.setAttribute("role", "region");
+      replacement.innerHTML = "<h2>Growth overview</h2><p>Updated summary</p>";
+      document.getElementById("growth")!.replaceWith(replacement);
+      dialog.remove();
+    }));
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.id === "growth") return rect(0, -20, 500, 300);
+      if (this.id === "growth-after-apply") return rect(40, 50, 600, 320);
+      return rect(0, 0, 10, 10);
+    });
+
+    await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({
+      ok: true,
+      periodVerified: true,
+      targetRect: { x: 40, y: 50, width: 600, height: 320 },
+    });
   });
 
   it("applies an already-correct dialog selection without waiting for a change event", async () => {
@@ -177,5 +238,18 @@ describe("Executive Summary Klaviyo adapter", () => {
     vi.restoreAllMocks(); businessReview();
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return this.id === "growth" ? rect(0, -5, 500, 300) : rect(); });
     await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({ ok: false, code: "TARGET_NOT_FULLY_VISIBLE" });
+  });
+
+  it("waits a bounded number of animation frames for the scrolled Growth overview card to become visible", async () => {
+    businessReview();
+    let growthRectReads = 0;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.id !== "growth") return rect(0, 0, 10, 10);
+      growthRectReads += 1;
+      return growthRectReads < 3 ? rect(0, -5, 500, 300) : rect();
+    });
+
+    await expect(prepareExecutiveSummaryDocument(julyPeriod)).resolves.toMatchObject({ ok: true, targetRect: { x: 20, y: 30 } });
+    expect(growthRectReads).toBeGreaterThanOrEqual(3);
   });
 });

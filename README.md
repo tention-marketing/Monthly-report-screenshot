@@ -48,7 +48,20 @@ npm run migrate
 npm run dev:api
 ```
 
-`REPORT_STORAGE_MODE=memory` is available only as an explicit non-production development option. The API defaults to `http://127.0.0.1:3000`.
+`REPORT_STORAGE_MODE=memory` is available only as an explicit non-production development option. The API defaults to `http://127.0.0.1:4000`; platforms can override this with `PORT`.
+
+For the local PostgreSQL container setup:
+
+```bash
+docker start tention_reports_pg
+export DATABASE_URL="postgresql://postgres:postgres@127.0.0.1:5434/tention_reports"
+export SCREENSHOT_STORAGE_DIR="$PWD/data/screenshots"
+export REPORT_ARTIFACT_STORAGE_DIR="$PWD/data/report-artifacts"
+npm run migrate
+npm run dev:api
+```
+
+The local API is available at `http://127.0.0.1:4000`. PostgreSQL remains on port `5434` in this setup.
 
 ### Extension development
 
@@ -58,14 +71,14 @@ Set `VITE_API_BASE_URL` to the API origin when it differs from the local default
 export REPORT_STORAGE_MODE=memory
 npm run dev:api
 
-# In a separate terminal; defaults to http://127.0.0.1:3000
-VITE_API_BASE_URL=http://127.0.0.1:3000 npm run dev:extension
+# In a separate terminal; defaults to http://127.0.0.1:4000
+VITE_API_BASE_URL=http://127.0.0.1:4000 npm run dev:extension
 
 # Produce the unpacked-extension directory.
-VITE_API_BASE_URL=http://127.0.0.1:3000 npm run build --workspace @tention/extension
+VITE_API_BASE_URL=http://127.0.0.1:4000 npm run build --workspace @tention/extension
 ```
 
-In Chrome, open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `apps/extension/dist`. The manifest grants access only to `http://127.0.0.1:3000/*` and `https://www.klaviyo.com/*`; update the manifest deliberately if the configured API origin changes.
+In Chrome, open `chrome://extensions`, enable **Developer mode**, choose **Load unpacked**, and select `apps/extension/dist`. The manifest grants access only to `http://127.0.0.1:4000/*` and `https://www.klaviyo.com/*`; update the manifest deliberately if the configured API origin changes.
 
 The `activeTab` permission is used only after the employee clicks a capture action. It temporarily permits inspecting the active URL and capturing its visible PNG. The `scripting` permission plus the narrow `https://www.klaviyo.com/*` host permission are used only for the user-initiated Executive Summary adapter: it reads semantic DOM signals on the Business Review page, verifies the visible period, finds the `Growth overview` card, scrolls it into view, and returns its viewport bounds. It does not read or inject on other sites, use `<all_urls>`, extract provider metrics, or approve uploads. The localhost host permission remains limited to the local API.
 

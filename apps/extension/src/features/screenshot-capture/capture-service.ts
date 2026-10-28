@@ -35,9 +35,15 @@ export class ChromeCaptureError extends Error {
 }
 
 export const CHROME_CAPTURE_TIMEOUT_MS = 8_000;
+// Chrome limits tabs.captureVisibleTab calls to two per second. Leave a small
+// margin; in an automatic report run each successful section takes a screenshot.
+export const CHROME_CAPTURE_MIN_INTERVAL_MS = 550;
 
 /** Isolates activeTab-gated Chrome calls from React so capture behavior remains testable. */
 export class ChromeCaptureService implements CaptureService {
+  private captureQueue: Promise<void> = Promise.resolve();
+  private lastCaptureStartedAt = 0;
+
   constructor(
     private readonly chromeApi: ChromeApi | undefined = (globalThis as typeof globalThis & { chrome?: ChromeApi }).chrome,
     private readonly timeoutMs = CHROME_CAPTURE_TIMEOUT_MS,
@@ -70,11 +76,11 @@ export class ChromeCaptureService implements CaptureService {
     if (!verification.ok) throw new ChromeCaptureError(verification.code, activeTabGrantFailureMessage(verification.code));
     const tab = verification.tab;
     const sourceUrl = tab.url ?? null;
-    const dataUrl = await this.runChromeOperation(
+    const dataUrl = await this.enqueueCapture(() => this.runChromeOperation(
       () => tabs.captureVisibleTab(grant.grantedWindowId, { format: "png" }),
       "capturing the prepared Klaviyo tab",
       "VISIBLE_TAB_CAPTURE_FAILED",
-    );
+    ));
     return { sourceUrl, isKlaviyo: true, tabId: grant.grantedTabId, windowId: grant.grantedWindowId, dataUrl };
   }
 
@@ -93,6 +99,20 @@ export class ChromeCaptureService implements CaptureService {
   private requireTabs(): ChromeTabsApi {
     if (!this.chromeApi?.tabs) throw new Error("Chrome visible-tab capture is unavailable in this environment.");
     return this.chromeApi.tabs;
+  }
+
+  private enqueueCapture<T>(capture: () => Promise<T>): Promise<T> {
+    const queued = this.captureQueue.then(async () => {
+      const elapsed = Date.now() - this.lastCaptureStartedAt;
+      const waitMs = Math.max(0, CHROME_CAPTURE_MIN_INTERVAL_MS - elapsed);
+      // This is quota-aware serialization, not a fixed per-section wait. It
+      // only waits when the preceding Chrome screenshot call was too recent.
+      if (waitMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
+      this.lastCaptureStartedAt = Date.now();
+      return capture();
+    });
+    this.captureQueue = queued.then(() => undefined, () => undefined);
+    return queued;
   }
 
   private async runChromeOperation<T>(operation: () => Promise<T>, stage: string, failureCode: Exclude<CaptureFailureCode, "CAPTURE_TIMEOUT" | "KLAVIYO_CAPTURE_PERMISSION_REQUIRED" | "KLAVIYO_ACTIVE_TAB_GRANT_REQUIRED" | "CAPTURE_PERMISSION_DENIED" | ActiveTabGrantFailureCode>): Promise<T> {

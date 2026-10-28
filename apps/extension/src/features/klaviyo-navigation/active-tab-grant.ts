@@ -1,6 +1,6 @@
 export const KLAVIYO_ACTIVE_TAB_GRANT_KEY = "tention.klaviyo-active-tab-grant";
 export const KLAVIYO_ACTION_INVOCATION_KEY = "tention.klaviyo-action-invocation";
-export const KLAVIYO_ACTIVE_TAB_GRANT_REQUIRED_MESSAGE = "Open the Klaviyo Business Review tab and click the Tention Reports toolbar icon to start capture.";
+export const KLAVIYO_ACTIVE_TAB_GRANT_REQUIRED_MESSAGE = "Open the Klaviyo dashboard and click the Tention Reports toolbar icon to start capture.";
 
 export type ActiveTabGrantFailureCode =
   | "ACTION_NOT_INVOKED"
@@ -11,11 +11,11 @@ export type ActiveTabGrantFailureCode =
 
 export function activeTabGrantFailureMessage(code: ActiveTabGrantFailureCode): string {
   const messages: Record<ActiveTabGrantFailureCode, string> = {
-    ACTION_NOT_INVOKED: "Open the Klaviyo Business Review tab and click the Tention Reports toolbar icon to start capture.",
+    ACTION_NOT_INVOKED: "Open the Klaviyo dashboard and click the Tention Reports toolbar icon to start capture.",
     GRANTED_TAB_CLOSED: "The Klaviyo tab used to open Tention Reports was closed. Open it and click the Tention Reports toolbar icon again.",
     GRANTED_TAB_NOT_ACTIVE: "The Klaviyo tab used to open Tention Reports is no longer active. Return to it and click the Tention Reports toolbar icon again.",
-    GRANTED_TAB_CHANGED_ORIGIN: "The Klaviyo tab used to open Tention Reports navigated away. Return to Business Review and click the Tention Reports toolbar icon again.",
-    GRANTED_TAB_ROUTE_NOT_SUPPORTED: "The toolbar-granted tab is not the Klaviyo Business Review dashboard. Open Business Review and click the Tention Reports toolbar icon again.",
+    GRANTED_TAB_CHANGED_ORIGIN: "The Klaviyo tab used to open Tention Reports navigated away. Return to the supported Klaviyo dashboard and click the Tention Reports toolbar icon again.",
+    GRANTED_TAB_ROUTE_NOT_SUPPORTED: "The toolbar-granted tab is not a supported Klaviyo dashboard. Open the required dashboard and click the Tention Reports toolbar icon again.",
   };
   return messages[code];
 }
@@ -109,7 +109,12 @@ export interface ToolbarInvocationDiagnostics {
 }
 
 /** The toolbar click is the only source of authority for activeTab-gated capture. */
-export async function verifyKlaviyoActiveTabGrant(tabs: KlaviyoGrantTabsApi, store: KlaviyoActiveTabGrantStore): Promise<KlaviyoActiveTabGrantCheck> {
+/**
+ * `returningToConfiguredUrl` is for a caller that immediately navigates the granted tab to a validated, configured
+ * Klaviyo reporting URL before any script or capture: a granted tab that drifted to another route on the same Klaviyo
+ * origin (e.g. a stray click to /analytics/metrics) is then returned rather than its grant being destroyed.
+ */
+export async function verifyKlaviyoActiveTabGrant(tabs: KlaviyoGrantTabsApi, store: KlaviyoActiveTabGrantStore, options: { returningToConfiguredUrl?: boolean } = {}): Promise<KlaviyoActiveTabGrantCheck> {
   const [invocation, grant] = await Promise.all([store.getActionInvocation(), store.get()]);
   if (!invocation || !grant || invocation.tabId !== grant.grantedTabId || invocation.windowId !== grant.grantedWindowId || invocation.origin !== grant.grantedOrigin) {
     return { ok: false, code: "ACTION_NOT_INVOKED" };
@@ -121,7 +126,7 @@ export async function verifyKlaviyoActiveTabGrant(tabs: KlaviyoGrantTabsApi, sto
     const active = (await tabs.query({ active: true, windowId: grant.grantedWindowId }))[0];
     if (active?.id !== grant.grantedTabId) return invalidate(store, "GRANTED_TAB_NOT_ACTIVE");
     if (originOf(tab.url) !== grant.grantedOrigin) return invalidate(store, "GRANTED_TAB_CHANGED_ORIGIN");
-    if (!isKlaviyoBusinessReviewDashboardUrl(tab.url ?? null)) return invalidate(store, "GRANTED_TAB_ROUTE_NOT_SUPPORTED");
+    if (!isKlaviyoSupportedCaptureUrl(tab.url ?? null) && !options.returningToConfiguredUrl) return invalidate(store, "GRANTED_TAB_ROUTE_NOT_SUPPORTED");
     return { ok: true, grant, invocation, tab };
   } catch {
     return invalidate(store, "GRANTED_TAB_CLOSED");
@@ -140,7 +145,7 @@ export async function getToolbarInvocationDiagnostics(tabs: KlaviyoGrantTabsApi 
       actionInvocation,
       grantedTabId: grant.grantedTabId,
       currentActiveTabId: active[0]?.id ?? null,
-      routeMatched: originOf(tab.url) === grant.grantedOrigin && isKlaviyoBusinessReviewDashboardUrl(tab.url ?? null),
+      routeMatched: originOf(tab.url) === grant.grantedOrigin && isKlaviyoSupportedCaptureUrl(tab.url ?? null),
     };
   } catch {
     return { actionInvocation, grantedTabId: grant.grantedTabId, currentActiveTabId: null, routeMatched: false };
@@ -152,6 +157,30 @@ export function isKlaviyoBusinessReviewDashboardUrl(value: string | null): boole
   try {
     const url = new URL(value);
     return url.origin === "https://www.klaviyo.com" && /^\/analytics\/dashboards\/[^/]+\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function isKlaviyoHomeDashboardUrl(value: string | null): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.origin === "https://www.klaviyo.com" && /^\/dashboard\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Only reporting dashboards and exact listing routes may receive a toolbar capture grant. */
+export function isKlaviyoSupportedCaptureUrl(value: string | null): boolean {
+  if (isKlaviyoHomeDashboardUrl(value) || isKlaviyoBusinessReviewDashboardUrl(value)) return true;
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && (url.hostname === "www.klaviyo.com" || url.hostname === "klaviyo.com")
+      && (["/omnicampaigns", "/forms", "/flows", "/lists", "/analytics/dashboards", "/analytics/deliverability/email/score"].includes(url.pathname.replace(/\/$/, "")));
   } catch {
     return false;
   }
@@ -169,7 +198,7 @@ export function makeKlaviyoActionInvocation(tab: KlaviyoGrantTab): KlaviyoAction
 }
 
 export function makeKlaviyoActiveTabGrant(tab: KlaviyoActiveTabGrant): KlaviyoActiveTabGrant | null {
-  return isKlaviyoBusinessReviewDashboardUrl(tab.grantedUrl) && originOf(tab.grantedUrl) === tab.grantedOrigin ? tab : null;
+  return isKlaviyoSupportedCaptureUrl(tab.grantedUrl) && originOf(tab.grantedUrl) === tab.grantedOrigin ? tab : null;
 }
 
 async function invalidate(store: KlaviyoActiveTabGrantStore, code: Exclude<ActiveTabGrantFailureCode, "ACTION_NOT_INVOKED">): Promise<KlaviyoActiveTabGrantCheck> {

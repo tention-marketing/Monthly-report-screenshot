@@ -50,6 +50,8 @@ describe("Klaviyo navigation service", () => {
 
   it("keeps centralized guidance and falls back when account context is absent", async () => {
     const service = new ChromeKlaviyoNavigationService();
+    expect(klaviyoNavigationTargets.signup_form.manualInstruction).toContain("Do not open an individual form");
+    expect(klaviyoNavigationTargets.welcome_flow.manualInstruction).toContain("Do not open an individual flow");
     await expect(service.openSection("top_campaigns", null, period)).resolves.toMatchObject({ kind: "account_context_required", target: klaviyoNavigationTargets.top_campaigns });
     expect(service.preparePeriod(period)).toEqual({ kind: "manual_period_required" });
   });
@@ -87,6 +89,20 @@ describe("Klaviyo navigation service", () => {
       args: [{ startDate: "2026-08-01", endDate: "2026-08-31" }],
     }));
     expect(tabs.create).not.toHaveBeenCalled();
+  });
+  it("keeps the toolbar-authorized workflow in the same Klaviyo dashboard tab after same-origin navigation", async () => {
+    const executeScript = vi.fn().mockResolvedValue([{ frameId: 0, result: adapterSuccess() }]);
+    const navigatedDashboardUrl = "https://www.klaviyo.com/analytics/dashboards/another-business-review";
+    const tabs = readyTabs({
+      query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true, url: navigatedDashboardUrl }]),
+      get: vi.fn().mockResolvedValue({ id: 7, windowId: 3, active: true, status: "complete", url: navigatedDashboardUrl }),
+    });
+    const service = new ChromeKlaviyoNavigationService({ tabs, scripting: { executeScript } });
+
+    await expect(service.prepareExecutiveSummary(null, period)).resolves.toMatchObject({ kind: "ready", sourceTabId: 7 });
+    expect(executeScript).toHaveBeenCalledWith(expect.objectContaining({ target: { tabId: 7, frameIds: [0] } }));
+    expect(tabs.create).not.toHaveBeenCalled();
+    expect(tabs.update).not.toHaveBeenCalled();
   });
   it("requires a stored toolbar grant before automatic capture and never opens a replacement tab", async () => {
     const executeScript = vi.fn();

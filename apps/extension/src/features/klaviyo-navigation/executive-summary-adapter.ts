@@ -34,6 +34,10 @@ export interface ExecutiveSummaryTargetBounds {
   height: number;
   viewportWidth: number;
   viewportHeight: number;
+  visibleControls?: Array<Record<string, string | boolean | null>>;
+  availableRowCount?: number;
+  includedRowCount?: number;
+  stageTimingsMs?: Record<string, number>;
 }
 
 export interface ExecutiveSummaryInjectionPeriod { startDate: string; endDate: string }
@@ -141,12 +145,27 @@ export async function prepareExecutiveSummaryDocument(expected: ExecutiveSummary
       }
       return null;
     };
-    const displayedPeriod = () => {
-      for (const control of periodControls()) {
-        const range = rangeFromElement(control);
+    // Klaviyo's selected range can be a visible sibling of the accessible
+    // "Time period" control. Search only its compact semantic header region,
+    // never an arbitrary page-wide date list.
+    const rangeFromPeriodControlRegion = (control: Element) => {
+      const candidates = [semanticName(control), visibleText(control)];
+      let ancestor: Element | null = control.parentElement;
+      for (let depth = 0; ancestor && depth < 3 && ancestor !== document.body && ancestor !== document.documentElement && ancestor.tagName !== "MAIN"; depth += 1, ancestor = ancestor.parentElement) {
+        candidates.push(visibleText(ancestor));
+      }
+      for (const candidate of candidates) {
+        const range = normalizePeriod(candidate);
         if (range) return range;
       }
-      return normalizePeriod(visibleText(document.body));
+      return null;
+    };
+    const displayedPeriod = () => {
+      for (const control of periodControls()) {
+        const range = rangeFromPeriodControlRegion(control);
+        if (range) return range;
+      }
+      return null;
     };
     const dialog = () => Array.from(document.querySelectorAll("dialog, [role=dialog]")).find((element) => /time period|date range|reporting period/i.test(semanticName(element))) ?? null;
     const nextFrame = () => new Promise<void>((resolve) => {
@@ -156,6 +175,13 @@ export async function prepareExecutiveSummaryDocument(expected: ExecutiveSummary
       if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => { window.clearTimeout(fallback); finish(); });
       else finish();
     });
+    const waitForDisplayedPeriod = async (expected: { startDate: string; endDate: string }) => {
+      for (let attempt = 0; attempt < 8; attempt += 1) {
+        if (periodsMatch(displayedPeriod(), expected)) return true;
+        await nextFrame();
+      }
+      return periodsMatch(displayedPeriod(), expected);
+    };
     const waitForDialogToClose = (openDialog: Element, timeoutMs: number) => new Promise<boolean>((resolve) => {
       const startedAt = Date.now();
       const check = () => {
@@ -222,17 +248,26 @@ export async function prepareExecutiveSummaryDocument(expected: ExecutiveSummary
       if (!apply) return fail("KLAVIYO_PERIOD_APPLY_NOT_FOUND", "Klaviyo's Apply button was not found.");
       (apply as HTMLElement).click();
       if (!await waitForDialogToClose(openDialog, dialogTimeoutMs)) return fail("KLAVIYO_PERIOD_APPLY_TIMEOUT", "Klaviyo did not close the Time period dialog in time.");
-      if (!periodsMatch(displayedPeriod(), expectedRange)) return fail("KLAVIYO_PERIOD_VERIFY_FAILED", "Klaviyo did not show the requested report period after applying it.");
+      if (!await waitForDisplayedPeriod(expectedRange)) return fail("KLAVIYO_PERIOD_VERIFY_FAILED", "Klaviyo did not show the requested report period after applying it.");
     }
 
-    const heading = growthOverviewHeading;
+    // Klaviyo can replace this card after Apply. Do not retain a detached
+    // pre-Apply node: re-resolve the semantic target from the current DOM.
+    const heading = headings().find((element) => normalized(visibleText(element)) === "growth overview");
     if (!heading) return fail("TARGET_NOT_FOUND", "Growth Overview could not be detected.", diagnostics(businessReviewTextFound, false));
     const target = heading.closest("article, section, [role=region], [role=group]") ?? heading.parentElement ?? heading;
-    target.scrollIntoView?.({ block: "nearest", inline: "nearest" });
-    await nextFrame();
-    const rect = target.getBoundingClientRect();
+    target.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior: "auto" });
+    let rect = target.getBoundingClientRect();
+    let fullyVisible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
+    // Smooth/provider-controlled scrolling can leave the card between frames.
+    // Poll a bounded number of frames instead of racing the first layout frame.
+    for (let attempt = 0; !fullyVisible && attempt < 8; attempt += 1) {
+      await nextFrame();
+      rect = target.getBoundingClientRect();
+      fullyVisible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
+    }
     if (rect.width <= 0 || rect.height <= 0) return fail("TARGET_NOT_FOUND", "Growth Overview has no visible bounds.", diagnostics(businessReviewTextFound, true));
-    if (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight) {
+    if (!fullyVisible) {
       return fail("TARGET_NOT_FULLY_VISIBLE", "Growth Overview is not fully visible in the viewport.", diagnostics(businessReviewTextFound, true));
     }
     return {
