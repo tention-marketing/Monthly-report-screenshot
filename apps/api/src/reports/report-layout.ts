@@ -10,12 +10,12 @@ export const REPORT_LAYOUT_VERSION = "tention-monthly-v1" as const;
 export type ReportLayoutPageKey =
   | "summary" | "flows_and_comparison" | "campaigns_and_flows"
   | "supporting_performance" | "campaign_metrics" | "flow_metrics_and_analysis"
-  | "analysis_continuation";
+  | "analysis_continuation" | "subscriber_growth";
 export type ReportLayoutSlotKey =
   | "headline_metrics" | "executive_summary" | "top_campaigns" | "top_flows"
   | "month_comparison" | "campaign_performance" | "flow_performance"
   | "signup_form" | "welcome_flow" | "customer_split" | "deliverability"
-  | "campaign_metrics" | "flow_metrics" | "analysis" | "next_month_plan";
+  | "campaign_metrics" | "flow_metrics" | "analysis" | "next_month_plan" | "email_subscriber_growth";
 export type ReportLayoutContentType = "headline_metrics" | "screenshot" | "text";
 export type ReportLayoutSize = "full" | "half" | "quarter";
 export type ReportLayoutPagination = "fixed" | "flow" | "flow_continuation";
@@ -94,6 +94,13 @@ export const REPORT_LAYOUT_V1: ReportLayout = {
       key: "analysis_continuation", canonicalPage: 7, title: "Analysis", pagination: "flow_continuation",
       slots: [
         { key: "analysis", sectionKey: "analysis", contentType: "text", title: "Analysis", required: false, preferredSize: "full", pagination: "flow_continuation" },
+      ],
+    },
+    // Section 10, appended so pages 1–7 keep their numbers; rendered only for a report that includes Subscriber Growth.
+    {
+      key: "subscriber_growth", canonicalPage: 8, title: "Subscriber Growth", pagination: "fixed",
+      slots: [
+        { key: "email_subscriber_growth", sectionKey: "email_subscriber_growth", contentType: "screenshot", title: "Subscriber Growth - Email", required: true, preferredSize: "full", pagination: "fixed" },
       ],
     },
   ],

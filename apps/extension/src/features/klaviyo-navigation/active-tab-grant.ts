@@ -1,3 +1,5 @@
+import { writeCriticalSession } from "../../lib/chrome/session-storage.js";
+
 export const KLAVIYO_ACTIVE_TAB_GRANT_KEY = "tention.klaviyo-active-tab-grant";
 export const KLAVIYO_ACTION_INVOCATION_KEY = "tention.klaviyo-action-invocation";
 export const KLAVIYO_ACTIVE_TAB_GRANT_REQUIRED_MESSAGE = "Open the Klaviyo dashboard and click the Tention Reports toolbar icon to start capture.";
@@ -41,6 +43,7 @@ export interface ChromeStorageSession {
   get(key: string | null): Promise<Record<string, unknown>>;
   set(values: Record<string, unknown>): Promise<void>;
   remove(key: string): Promise<void>;
+  getBytesInUse?(keys: string | string[] | null): Promise<number>;
 }
 
 export interface KlaviyoActiveTabGrantStore {
@@ -67,12 +70,13 @@ export class ChromeSessionKlaviyoActiveTabGrantStore implements KlaviyoActiveTab
 
   async set(grant: KlaviyoActiveTabGrant): Promise<void> {
     if (!this.session) throw new Error("Chrome session storage is unavailable.");
-    await this.session.set({ [KLAVIYO_ACTIVE_TAB_GRANT_KEY]: grant });
+    // Critical: a refused write is a typed SessionStorageWriteError after one cleanup-and-retry, never silent.
+    await writeCriticalSession(this.session, { [KLAVIYO_ACTIVE_TAB_GRANT_KEY]: grant });
   }
 
   async setActionInvocation(invocation: KlaviyoActionInvocation): Promise<void> {
     if (!this.session) throw new Error("Chrome session storage is unavailable.");
-    await this.session.set({ [KLAVIYO_ACTION_INVOCATION_KEY]: invocation });
+    await writeCriticalSession(this.session, { [KLAVIYO_ACTION_INVOCATION_KEY]: invocation });
   }
 
   async clear(): Promise<void> {
@@ -182,7 +186,35 @@ export function isKlaviyoHomeDashboardUrl(value: string | null): boolean {
   }
 }
 
-/** Only reporting dashboards and exact listing routes may receive a toolbar capture grant. */
+/** Session key holding reporting routes that were verified semantically for this browser session (see below). */
+export const KLAVIYO_CONFIGURED_CAPTURE_ROUTES_KEY = "tention.klaviyo-configured-capture-routes";
+const configuredCaptureRoutes = new Set<string>();
+/** One route per client source; a handful of clients per browser session is the realistic maximum. */
+export const MAX_CONFIGURED_CAPTURE_ROUTES = 20;
+function routeKey(value: string | null): string | null {
+  try {
+    const url = new URL(value ?? "");
+    if (url.protocol !== "https:" || (url.hostname !== "www.klaviyo.com" && url.hostname !== "klaviyo.com") || url.username || url.password) return null;
+    return `${url.origin}${url.pathname.replace(/\/$/, "")}`;
+  } catch { return null; }
+}
+/**
+ * A reporting route with no fixed path (Subscriber Growth) is added only from a client's saved source, or from a page
+ * the read-only discovery adapter has just proven to be that source; its own page adapter still re-proves the exact
+ * view before any capture. Returns false for anything that is not an HTTPS Klaviyo URL.
+ */
+export function registerConfiguredCaptureRoute(value: string | null): boolean {
+  const key = routeKey(value);
+  if (!key) return false;
+  // Normalized (origin + path), deduplicated, and bounded: re-registering moves a route to the newest position.
+  configuredCaptureRoutes.delete(key); configuredCaptureRoutes.add(key);
+  while (configuredCaptureRoutes.size > MAX_CONFIGURED_CAPTURE_ROUTES) configuredCaptureRoutes.delete(configuredCaptureRoutes.values().next().value!);
+  return true;
+}
+export function configuredCaptureRoutesSnapshot(): string[] { return [...configuredCaptureRoutes]; }
+export function isConfiguredCaptureRoute(value: string | null): boolean { const key = routeKey(value); return Boolean(key && configuredCaptureRoutes.has(key)); }
+
+/** Only reporting dashboards, exact listing routes, and verified configured reporting routes may receive a toolbar capture grant. */
 export function isKlaviyoSupportedCaptureUrl(value: string | null): boolean {
   if (isKlaviyoHomeDashboardUrl(value) || isKlaviyoBusinessReviewDashboardUrl(value)) return true;
   if (!value) return false;
@@ -190,7 +222,8 @@ export function isKlaviyoSupportedCaptureUrl(value: string | null): boolean {
     const url = new URL(value);
     return url.protocol === "https:"
       && (url.hostname === "www.klaviyo.com" || url.hostname === "klaviyo.com")
-      && (["/omnicampaigns", "/forms", "/flows", "/lists", "/analytics/dashboards", "/analytics/deliverability/email/score"].includes(url.pathname.replace(/\/$/, "")));
+      && (["/omnicampaigns", "/forms", "/flows", "/lists", "/analytics/dashboards", "/analytics/deliverability/email/score"].includes(url.pathname.replace(/\/$/, ""))
+        || configuredCaptureRoutes.has(routeKey(value) ?? ""));
   } catch {
     return false;
   }

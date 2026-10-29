@@ -17,7 +17,8 @@ const approvedContent: ReportDocumentContent = {
 function fixtureProof(type: ScreenshotType, period: ReportDraft["period"]) {
   return createScreenshotSourceProof(type, period, type === "signup_form" ? { scope: "all_forms" }
     : type === "welcome_flow" ? { scope: "email_welcome_flows", entities: [{ id: "fixture-email-1", name: "Fixture Email Welcome 1", channel: "email" }, { id: "fixture-email-2", name: "Fixture Email Welcome 2", channel: "email" }] } : undefined,
-  type === "top_campaigns" ? { accountIdentity: "Orion", clientTimezone: "Asia/Kolkata", visibleMetricLabel: "Placed Order", rankingMethod: "complete-result-set", eligibleRowCount: 1, includedRowCount: 1, rows: [{ name: "Campaign", type: "Email", status: "Sent", sendDate: "2026-08-01", openRate: "10%", clickRate: "1%", placedOrderValue: 1 }] } : null);
+  type === "top_campaigns" ? { accountIdentity: "Orion", clientTimezone: "Asia/Kolkata", visibleMetricLabel: "Placed Order", rankingMethod: "complete-result-set", eligibleRowCount: 1, includedRowCount: 1, rows: [{ name: "Campaign", type: "Email", status: "Sent", sendDate: "2026-08-01", openRate: "10%", clickRate: "1%", placedOrderValue: 1 }] } : null,
+  type === "email_subscriber_growth" ? { channel: "email", view: "growth", emailSubscribers: 17_698, newSubscribers: 943, exclusions: 499, changes: { emailSubscribers: null, newSubscribers: null, exclusions: null }, charts: { subscriberGrowthLine: true, newSubscribersExclusionsBar: true }, visiblePeriodText: "Aug 1 – Aug 31, 2026" } : null);
 }
 async function fixture(types: readonly ScreenshotType[] = ["overview"], clientName = "Orion <script>", sections: SectionConfiguration = { executive_summary: "required" }, reportMonth = { year: 2026, month: 8 }) {
   const storage = new InMemoryScreenshotStorage();
@@ -26,7 +27,7 @@ async function fixture(types: readonly ScreenshotType[] = ["overview"], clientNa
     const id = `${type}-11111111-1111-4111-8111-111111111111`;
     const key = `reports/${report.id}/${type}/11111111-1111-4111-8111-111111111111.png`;
     const asset = await storage.put(key, Buffer.concat([png, Buffer.from(type)]));
-    report = upsertScreenshotMetadata(report, { id, clientId: report.client.id, reportMonth: report.reportMonth, type, capturedAt: now.toISOString(), sourceUrl: type === "top_campaigns" ? "https://www.klaviyo.com/omnicampaigns" : null, width: 1440, height: 720, approved: true, approvedAt: now.toISOString(), periodConfirmed: true, storageKey: key, mimeType: "image/png", byteSize: asset.byteSize, sha256: asset.sha256, sourceProof: fixtureProof(type, report.period) }, type, { now });
+    report = upsertScreenshotMetadata(report, { id, clientId: report.client.id, reportMonth: report.reportMonth, type, capturedAt: now.toISOString(), sourceUrl: type === "top_campaigns" ? "https://www.klaviyo.com/omnicampaigns" : type === "email_subscriber_growth" ? "https://www.klaviyo.com/configured-subscriber-growth-source" : null, width: 1440, height: 720, approved: true, approvedAt: now.toISOString(), periodConfirmed: true, storageKey: key, mimeType: "image/png", byteSize: asset.byteSize, sha256: asset.sha256, sourceProof: fixtureProof(type, report.period) }, type, { now });
   }
   return { report, storage };
 }
@@ -42,6 +43,7 @@ describe("REPORT_LAYOUT_V1", () => {
       { canonicalPage: 5, key: "campaign_metrics", slots: ["campaign_metrics"] },
       { canonicalPage: 6, key: "flow_metrics_and_analysis", slots: ["flow_metrics", "analysis"] },
       { canonicalPage: 7, key: "analysis_continuation", slots: ["analysis"] },
+      { canonicalPage: 8, key: "subscriber_growth", slots: ["email_subscriber_growth"] },
     ]);
     expect(REPORT_LAYOUT_V1.pages.find(({ key }) => key === "analysis_continuation")?.pagination).toBe("flow_continuation");
   });
@@ -79,6 +81,23 @@ describe("ReportDocumentModel", () => {
     expect(html).toContain('data-report-layout="tention-monthly-v1"');
     expect(html).toContain("Approved observations");
     expect(html).not.toContain("Next Month&#39;s Plan");
+  });
+  it("renders Subscriber Growth as its own last page with the month and exact counts, leaving the nine core pages unchanged", async () => {
+    const tenSections: SectionConfiguration = { ...fullSections, email_subscriber_growth: "required" };
+    const { report, storage } = await fixture([...allTypes, "email_subscriber_growth"], "Club Furniture", tenSections);
+    const model = await buildReportDocumentModel(report, storage, now, approvedContent);
+    const nine = await fixture([...allTypes], "Club Furniture", fullSections);
+    const nineModel = await buildReportDocumentModel(nine.report, nine.storage, now, approvedContent);
+    expect(model.pages.slice(0, -1).map(({ key, sections }) => ({ key, slots: sections.map(({ layoutSlotKey }) => layoutSlotKey) }))).toEqual(nineModel.pages.map(({ key, sections }) => ({ key, slots: sections.map(({ layoutSlotKey }) => layoutSlotKey) })));
+    const page = model.pages.at(-1)!;
+    expect(page).toMatchObject({ canonicalPage: 8, key: "subscriber_growth", title: "Subscriber Growth" });
+    expect(page.sections).toHaveLength(1);
+    expect(page.sections[0]).toMatchObject({ key: "email_subscriber_growth", layoutSlotKey: "email_subscriber_growth", periodNote: "Aug 1, 2026 - Aug 31, 2026 · Email subscribers 17,698 · New subscribers 943 · Exclusions 499" });
+    const html = renderReportHtml(model);
+    expect(html).toContain('data-layout-slot="email_subscriber_growth"');
+    expect(html).toContain("August 2026");
+    expect(renderReportHtml(nineModel)).not.toContain("Subscriber Growth");
+    expect(renderReportHtml(nineModel)).not.toContain("List Growth");
   });
   it("omits absent optional slots and pages instead of rendering blank boxes", async () => {
     const { report, storage } = await fixture(["overview", "top_campaigns", "top_flows", "month_comparison", "deliverability", "campaign_metrics", "flow_metrics"], "Orion", {

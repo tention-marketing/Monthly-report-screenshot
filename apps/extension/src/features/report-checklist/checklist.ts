@@ -17,6 +17,7 @@ const labels: Record<ReportSectionKey, string> = {
   flow_performance: "Flow Performance", signup_form: "Signup Form Performance", welcome_flow: "Welcome Flow Performance",
   customer_split: "Customer Split", deliverability: "Deliverability Score", campaign_metrics: "Campaign Metrics",
   flow_metrics: "Flow Metrics", list_growth: "Historical List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
+  email_subscriber_growth: "Subscriber Growth",
 };
 const screenshotBySection = Object.fromEntries(
   Object.entries(screenshotSectionMapping).map(([type, section]) => [section, type]),

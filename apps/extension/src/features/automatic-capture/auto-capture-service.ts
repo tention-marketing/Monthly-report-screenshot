@@ -1,4 +1,4 @@
-import type { ReportPeriod, ScreenshotType } from "@tention/report-schema";
+import type { ReportPeriod, ScreenshotType, SubscriberGrowthEvidence } from "@tention/report-schema";
 import type { CaptureFailureCode, CapturedImage } from "../screenshot-capture/capture-service.js";
 import type { ExecutiveSummaryTargetBounds, KlaviyoAutomationFailureCode } from "../klaviyo-navigation/executive-summary-adapter.js";
 import type { ToolbarInvocationDiagnostics } from "../klaviyo-navigation/active-tab-grant.js";
@@ -6,6 +6,8 @@ import type { CampaignsSourceInspectionResult } from "../klaviyo-navigation/camp
 import type { BusinessReviewFailureCode, BusinessReviewTargetBounds } from "../klaviyo-navigation/business-review-capture.js";
 import type { DashboardFailureCode, DashboardTargetBounds } from "../klaviyo-navigation/dashboard-capture.js";
 import type { CampaignsEvidence, CampaignsFailureCode, CampaignTargetBounds } from "../klaviyo-navigation/campaigns-capture.js";
+import type { SubscriberGrowthFailureCode, SubscriberGrowthTargetBounds } from "../klaviyo-navigation/subscriber-growth-capture.js";
+import type { SourceSetupDiagnostics, SubscriberGrowthDiscoveryResult } from "../klaviyo-navigation/subscriber-growth-source-setup.js";
 import type { BusinessReviewDiscoveryFailure, BusinessReviewDiscoveryRequest, BusinessReviewDiscoveryResult } from "../klaviyo-navigation/business-review-discovery.js";
 
 export type AutoCaptureStage = "preparing" | "capturing" | "review_ready" | "failed";
@@ -37,15 +39,17 @@ export interface AutoCaptureReviewState {
   sourceTabId: number;
   detectedPeriod: string;
   periodEvidence?: { startDate: string; endDate: string; comparisonStartDate?: string; comparisonEndDate?: string };
-  target: ExecutiveSummaryTargetBounds | BusinessReviewTargetBounds | DashboardTargetBounds | CampaignTargetBounds;
+  target: ExecutiveSummaryTargetBounds | BusinessReviewTargetBounds | DashboardTargetBounds | CampaignTargetBounds | SubscriberGrowthTargetBounds;
   campaignsEvidence?: CampaignsEvidence;
+  /** Section 10's structured read of the Email → Growth card (exact counts, chart proof, visible period). */
+  subscriberGrowthEvidence?: SubscriberGrowthEvidence;
   captured: CapturedImage;
 }
 
 export interface AutoCaptureFailureState {
   request: ExecutiveSummaryAutoCaptureRequest;
   stage: "failed";
-  code: KlaviyoAutomationFailureCode | BusinessReviewFailureCode | DashboardFailureCode | CampaignsFailureCode | CaptureFailureCode | "CAPTURE_FAILED" | "BUSINESS_REVIEW_URL_REQUIRED" | "BUSINESS_REVIEW_NAVIGATION_FAILED" | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID";
+  code: KlaviyoAutomationFailureCode | BusinessReviewFailureCode | DashboardFailureCode | CampaignsFailureCode | CaptureFailureCode | SubscriberGrowthFailureCode | "SUBSCRIBER_GROWTH_URL_REQUIRED" | "SUBSCRIBER_GROWTH_ROUTE_CHANGED" | "SUBSCRIBER_GROWTH_SOURCE_SETUP_BUSY" | "CAPTURE_STATE_LOST" | "CAPTURE_FAILED" | "BUSINESS_REVIEW_URL_REQUIRED" | "BUSINESS_REVIEW_NAVIGATION_FAILED" | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID";
   message: string;
   diagnostics?: Record<string, unknown>;
   viewportScreenshot?: CapturedImage | null;
@@ -55,6 +59,8 @@ export type AutoCaptureState = AutoCapturePendingState | AutoCaptureReviewState 
 
 export type AutoCaptureMessage =
   | { type: "DISCOVER_BUSINESS_REVIEW"; request: BusinessReviewDiscoveryRequest }
+  | { type: "DISCOVER_SUBSCRIBER_GROWTH_SOURCE" }
+  | { type: "SUBSCRIBER_GROWTH_SOURCE_PERSISTED"; request: { saved: boolean; sourceUrl: string | null; failureCode?: string | null } }
   | { type: "START_KLAVIYO_AUTO_CAPTURE"; request: ExecutiveSummaryAutoCaptureRequest }
   | { type: "GET_KLAVIYO_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
   | { type: "CLEAR_KLAVIYO_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
@@ -67,9 +73,44 @@ export type AutoCaptureMessage =
   | { type: "CLEAR_EXECUTIVE_SUMMARY_AUTO_CAPTURE"; request: Pick<ExecutiveSummaryAutoCaptureRequest, "reportId" | "screenshotType"> }
   | { type: "GET_KLAVIYO_TOOLBAR_DIAGNOSTICS" }
   | { type: "INSPECT_KLAVIYO_CAMPAIGNS_SOURCE" }
-  | { type: "GET_EXTENSION_BUILD" };
+  | { type: "GET_EXTENSION_BUILD" }
+  | { type: "GET_SESSION_STORAGE_USAGE" };
 
 export type { BusinessReviewDiscoveryFailure, BusinessReviewDiscoveryResult };
+
+/** A size-only report of the extension's session storage, largest key first (values are never returned). */
+export async function getSessionStorageUsage(): Promise<{ totalApproxBytes: number; bytesInUse: number | null; keys: Array<{ key: string; approxBytes: number; valueType: string; arrayLength: number | null; objectKeyCount: number | null }> } | null> {
+  const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
+  if (!chromeApi?.runtime) return null;
+  return await chromeApi.runtime.sendMessage({ type: "GET_SESSION_STORAGE_USAGE" }).catch(() => null) as never;
+}
+
+/** Ends the source-setup transaction: navigation may resume, and only a confirmed save consumes the verified source. */
+export async function reportSubscriberGrowthSourcePersisted(request: { saved: boolean; sourceUrl: string | null; failureCode?: string | null }): Promise<SourceSetupDiagnostics | null> {
+  const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
+  if (!chromeApi?.runtime) return null;
+  return await chromeApi.runtime.sendMessage({ type: "SUBSCRIBER_GROWTH_SOURCE_PERSISTED", request }).catch(() => null) as SourceSetupDiagnostics | null;
+}
+
+/** Calls back whenever the service worker has verified a Subscriber growth source at a toolbar click. */
+export function watchVerifiedSubscriberGrowthSource(callback: () => void): () => void {
+  const storage = (globalThis as typeof globalThis & { chrome?: { storage?: { onChanged?: { addListener(listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void): void; removeListener(listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void): void } } } }).chrome?.storage?.onChanged;
+  if (!storage) return () => undefined;
+  const listener = (changes: Record<string, { newValue?: unknown }>, area: string) => { if (area !== "session") return;
+    // A newly verified source, or a toolbar transaction that just failed (so the panel can show its typed cause).
+    const failed = changes["tention.subscriber-growth-source:last"]?.newValue as { SOURCE_SETUP_STATE?: string } | undefined;
+    if (changes["tention.subscriber-growth-source:verified"]?.newValue || failed?.SOURCE_SETUP_STATE === "FAILED") callback(); };
+  storage.addListener(listener);
+  return () => storage.removeListener(listener);
+}
+
+/** Takes the Subscriber growth source the service worker verified at the toolbar click (one-time source setup). */
+export async function discoverSubscriberGrowthSource(): Promise<SubscriberGrowthDiscoveryResult> {
+  const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
+  if (!chromeApi?.runtime) return { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "Subscriber Growth discovery requires the Tention Chrome extension." };
+  const response = await chromeApi.runtime.sendMessage({ type: "DISCOVER_SUBSCRIBER_GROWTH_SOURCE" }) as SubscriberGrowthDiscoveryResult | null;
+  return response && typeof response === "object" && typeof response.ok === "boolean" ? response : { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "The extension could not read the Subscriber growth page." };
+}
 
 export async function discoverBusinessReview(input: BusinessReviewDiscoveryRequest): Promise<BusinessReviewDiscoveryResult> {
   const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;

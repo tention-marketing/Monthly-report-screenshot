@@ -32,12 +32,12 @@ settle 120 s, crop 15 s, upload 30 s, persistence 30 s; page scripts 90 s.
 ## Known failures
 
 ### SESSION_STORAGE_QUOTA
-- **Discovered:** 2026-10-28 — June Top 5 Campaigns (b4732590, f7e3c851, 518179b8, b149eee7), September Flow Metrics (07809233).
-- **Fingerprint:** `CAPTURE_FAILED` with “Session storage quota bytes exceeded”; or a section stuck at *Capturing* until `CAPTURE_TIMEOUT`.
-- **Subsystem:** capture state store (`chrome.storage.session`, 10 MB quota).
-- **Root cause:** every section's state held a full-viewport screenshot and was never released, so the quota filled across sections, runs and months. Later sections failed, or hung when the controller's failure write (with another screenshot) was refused too. This made the runner look month-specific and flaky.
-- **Fix / recovery:** the runner releases each section's state once consumed and all states at run start; the store releases stale states on a refused write, then falls back to service-worker memory — it never throws. Recovery action `release-capture-state`.
-- **Regression test:** “never throws when session storage is full: releases stale capture states, then falls back to memory”.
+- **Discovered:** 2026-10-28 — June Top 5 Campaigns (b4732590, f7e3c851, 518179b8, b149eee7), September Flow Metrics (07809233). **Recurred:** 2026-10-29 — the Subscriber Growth toolbar click could not be recorded ("Session storage quota bytes exceeded" in background.js).
+- **Fingerprint:** `CAPTURE_FAILED` with “Session storage quota bytes exceeded”; a section stuck at *Capturing* until `CAPTURE_TIMEOUT`; or a toolbar click / source setup that silently records nothing (`SUBSCRIBER_GROWTH_SOURCE_NOT_VERIFIED`).
+- **Subsystem:** capture state store and every other `chrome.storage.session` writer (10 MB quota shared by all keys).
+- **Root cause:** capture states held full-viewport screenshots (data URLs of 1–4 MB) in session storage. Releasing them after use was not enough: an abandoned run left them behind, and only the capture store itself recovered from a refused write — the toolbar grant, the click record and source setup did not, so a full session made the click itself fail.
+- **Fix / recovery:** screenshots never go to session storage — the full state lives in service-worker memory and session storage holds only small metadata (a restarted worker reports a retryable `CAPTURE_STATE_LOST`). Startup removes obsolete image-bearing states from older builds. The grant, click record and verified Subscriber Growth source are critical writes: release obsolete transient state, retry once, read back, otherwise a typed `SESSION_STORAGE_QUOTA_EXCEEDED`. Diagnostics are compact fixed schemas; configured routes are deduplicated and capped. Advanced → *Inspect session storage* shows per-key sizes. Recovery action `release-capture-state`.
+- **Regression test:** “never stores a screenshot in session storage and never throws when it is full”.
 
 ### HIDDEN_TAB_ANIMATION_FRAME_HANG
 - **Discovered:** 2026-10-28 — September Flow Metrics attempt 1 (07809233, dbd864e0, d1e11bc9).

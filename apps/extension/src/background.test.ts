@@ -192,20 +192,22 @@ describe("shared capture state store", () => {
   }
   const screenshot = (bytes: number) => ({ sourceUrl: "https://www.klaviyo.com/omnicampaigns", isKlaviyo: true, tabId: 7, dataUrl: `data:image/png;base64,${"A".repeat(bytes)}` });
 
-  it("never throws when session storage is full: releases stale capture states, then falls back to memory", async () => {
+  it("never stores a screenshot in session storage and never throws when it is full", async () => {
     const session = quotaSession(6_000);
-    session.data["tention.business-review-auto-capture.july.overview"] = { stale: "A".repeat(4_000) };
     session.data["tention.active-tab-grant"] = { keep: true };
     const store = new ChromeSessionAutoCaptureStore(session);
     const ready = { request: request("top_campaigns"), stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "June", target: { x: 0, y: 0, width: 1, height: 1, viewportWidth: 1, viewportHeight: 1 }, captured: screenshot(3_000) };
     await expect(store.set(ready as never)).resolves.toBeUndefined();
-    expect(session.data["tention.business-review-auto-capture.july.overview"]).toBeUndefined();
+    expect(JSON.stringify(session.data)).not.toContain(ready.captured.dataUrl);
     expect(session.data["tention.active-tab-grant"]).toEqual({ keep: true });
-    await expect(store.get(request("top_campaigns"))).resolves.toMatchObject({ stage: "review_ready" });
-    // Larger than the whole budget: kept in service-worker memory instead of throwing into a controller.
+    await expect(store.get(request("top_campaigns"))).resolves.toMatchObject({ stage: "review_ready", captured: { dataUrl: ready.captured.dataUrl } });
+    // Larger than the whole budget: held in service-worker memory, never thrown into a controller.
     const huge = { ...ready, captured: screenshot(20_000) };
     await expect(store.set(huge as never)).resolves.toBeUndefined();
     await expect(store.get(request("top_campaigns"))).resolves.toMatchObject({ captured: { dataUrl: huge.captured.dataUrl } });
+    // Even a session already full of other state never makes a capture write throw.
+    session.data["other"] = "x".repeat(6_000);
+    await expect(store.set({ ...ready, request: request("overview") } as never)).resolves.toBeUndefined();
   });
 
   it("ignores every write from an abandoned attempt of the same section", async () => {

@@ -1,5 +1,5 @@
 import {
-  matchesReportCaptureSpec, reportDraftSchema, screenshotSourceProofSchema, reportGenerationResultSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, screenshotUploadAcknowledgementSchema, type ReportDraft, type ReportGenerationResult, type ReportLifecycleEvent, type ReportPdfArtifact, type ScreenshotUploadAcknowledgement,
+  automaticCaptureTypesForSections, matchesReportCaptureSpec, reportDraftSchema, screenshotSourceProofSchema, reportGenerationResultSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, screenshotUploadAcknowledgementSchema, type ReportDraft, type ReportGenerationResult, type ReportLifecycleEvent, type ReportPdfArtifact, type ScreenshotUploadAcknowledgement,
   clientReportTargetsInputSchema, clientReportTargetsSchema, reportReadinessSchema, type ClientReportTargets, type ClientReportTargetsInput, type ReportLifecycleEventType, type ReportReadiness, type ScreenshotType, type ScreenshotSourceProof, type SectionConfiguration,
 } from "@tention/report-schema";
 import { z } from "zod";
@@ -35,7 +35,11 @@ export interface UploadScreenshotImageRequest {
   sourceProof: ScreenshotSourceProof;
   image: Blob;
 }
-export interface AutomaticCaptureRunIdentity { runId: string; reportId: string; clientId: string; reportMonth: { year: number; month: number }; startedAt: string; extensionBuild?: string }
+export interface AutomaticCaptureRunIdentity {
+  runId: string; reportId: string; clientId: string; reportMonth: { year: number; month: number }; startedAt: string; extensionBuild?: string;
+  /** "resume" captures only `plannedSections` (missing/stale ones) and keeps the report's other valid captures. */
+  mode?: "full" | "resume"; plannedSections?: ScreenshotType[];
+}
 export interface AutomaticCaptureSectionResult {
   status: "running" | "pass" | "fail"; attemptNumber: number; startedAt: string; finishedAt: string | null; durationMs: number | null;
   expectedUrl: string | null; observedUrl: string | null; expectedSourceIdentity: string | null; observedSourceIdentity: string | null; expectedPeriod: Record<string, string> | null; observedPeriod: string | null;
@@ -73,6 +77,12 @@ export function createApiClient(options: ApiClientOptions) {
     },
     async getReportDraft(id: string): Promise<ReportDraft> {
       return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}`));
+    },
+    /** Local development: explicitly adds Section 10 (Subscriber Growth) to an existing draft. */
+    async enableSubscriberGrowthSection(id: string, expectedVersion: number): Promise<ReportDraft> {
+      const report = reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/dev/report-drafts/${encodeURIComponent(id)}/sections/email_subscriber_growth/enable`, jsonRequest("POST", { expectedVersion })));
+      if (report.id !== id || report.sections.email_subscriber_growth !== "required") throw new ApiError("SUBSCRIBER_GROWTH_ENABLE_ACK_MISMATCH", "The backend did not confirm Section 10 on this report.", 200);
+      return report;
     },
     /** Clients with a saved one-time profile (name, timezone, account, sources). */
     async listClientConfigurations(): Promise<ClientReportTargets[]> {
@@ -205,19 +215,26 @@ export function createApiClient(options: ApiClientOptions) {
     async getLocalAutomaticCaptureRun(runId: string): Promise<unknown> {
       return await requestJson(request, `${baseUrl}/api/v1/dev/automatic-capture-runs/${encodeURIComponent(runId)}`);
     },
-    async importLocalAutomaticCaptureRun(runId: string, report: Pick<ReportDraft, "id" | "client" | "reportMonth">): Promise<ReportDraft> {
+    async importLocalAutomaticCaptureRun(runId: string, report: Pick<ReportDraft, "id" | "client" | "reportMonth" | "sections">, importedTypes?: readonly ScreenshotType[]): Promise<ReportDraft> {
       const raw = asRecord(await requestJson(request, `${baseUrl}/api/v1/dev/automatic-capture-runs/${encodeURIComponent(runId)}/import`, jsonRequest("POST", {})));
       const captures = z.array(z.object({ type: z.string(), screenshotRecordId: z.string().uuid(), sha256: z.string().regex(/^[a-f0-9]{64}$/), reviewStatus: z.enum(["approved", "pending_review"]), captureOrigin: z.literal("live_acceptance_import") })).parse(raw.captures);
-      if (raw.runId !== runId || raw.reportId !== report.id || raw.clientId !== report.client.id || raw.capturedCount !== 9 || raw.missingAutomaticCount !== 0 || captures.length !== 9) throw new ApiError("AUTOMATIC_RUN_IMPORT_ACK_MISMATCH", "The backend did not confirm all nine captures were attached to the canonical report.", 200);
+      // The nine core sections, plus Section 10 only when this report includes it.
+      const automaticTypes = automaticCaptureTypesForSections(report.sections);
+      // A resume imports only its planned sections; the report must still hold every automatic section afterwards.
+      const imported = importedTypes ?? automaticTypes;
+      if (raw.runId !== runId || raw.reportId !== report.id || raw.clientId !== report.client.id || raw.capturedCount !== automaticTypes.length || raw.missingAutomaticCount !== 0 || captures.length !== imported.length) throw new ApiError("AUTOMATIC_RUN_IMPORT_ACK_MISMATCH", `The backend did not confirm all ${automaticTypes.length} captures on the canonical report.`, 200);
       const canonical = await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(raw.reportId)}`).then((data) => reportDraftSchema.parse(data));
-      const expected = new Set(["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"]);
+      if (automaticTypes.some((type) => !canonical.screenshots.some((item) => item.type === type))) throw new ApiError("AUTOMATIC_RUN_IMPORT_RELOAD_MISMATCH", "The reloaded report is missing an automatic capture.", 200);
+      const expected = new Set<string>(imported);
       for (const capture of captures) {
         const persisted = canonical.screenshots.find((item) => item.type === capture.type);
         if (!expected.has(capture.type) || !persisted || persisted.id !== capture.screenshotRecordId || persisted.sha256 !== capture.sha256 || persisted.captureOrigin !== "live_acceptance_import" || persisted.approved !== (capture.reviewStatus === "approved")) throw new ApiError("AUTOMATIC_RUN_IMPORT_RELOAD_MISMATCH", "The canonical report reload did not contain the imported capture acknowledgement.", 200);
         expected.delete(capture.type);
       }
-      const pendingReviewCount = captures.filter((capture) => capture.reviewStatus === "pending_review").length;
-      const approvedCount = captures.filter((capture) => capture.reviewStatus === "approved").length;
+      // Review counts cover every automatic capture on the reloaded report (a resume imports only some of them).
+      const automaticRecords = canonical.screenshots.filter((item) => automaticTypes.includes(item.type));
+      const pendingReviewCount = automaticRecords.filter((item) => !item.approved).length;
+      const approvedCount = automaticRecords.filter((item) => item.approved).length;
       if (expected.size || raw.pendingReviewCount !== pendingReviewCount || raw.approvedCount !== approvedCount
         || canonical.id !== raw.reportId || canonical.version < Number(raw.reportVersion)
         || canonical.client.id !== report.client.id || canonical.client.name !== report.client.name || canonical.client.timezone !== report.client.timezone

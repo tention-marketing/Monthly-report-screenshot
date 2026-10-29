@@ -17,7 +17,8 @@
     "klaviyo:test-login": "tsx src/reports/klaviyo-test-login.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --config vitest.config.ts"
+    "test": "vitest run --config vitest.config.ts",
+    "acceptance:subscriber-growth-e2e": "tsx src/reports/subscriber-growth-extension-e2e.ts"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.0",

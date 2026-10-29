@@ -41,11 +41,13 @@ export const screenshotTypeSchema = z.enum([
   "overview", "top_campaigns", "top_flows", "month_comparison",
   "campaign_performance", "flow_performance", "signup_form", "welcome_flow",
   "customer_split", "deliverability", "campaign_metrics", "flow_metrics", "list_growth",
+  "email_subscriber_growth",
 ]);
 export type ScreenshotType = z.infer<typeof screenshotTypeSchema>;
 
 export const reportCaptureSectionKeySchema = z.enum([
   "executive_summary", "month_comparison", "top_campaigns", "top_flows", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "signup_form_performance", "welcome_flow_performance", "customer_split", "deliverability", "list_growth",
+  "email_subscriber_growth",
 ]);
 export type ReportCaptureSectionKey = z.infer<typeof reportCaptureSectionKeySchema>;
 export const REPORT_CAPTURE_SPEC_VERSION = "1" as const;
@@ -57,6 +59,16 @@ export const captureDatePolicySchema = z.enum(["EXACT_MONTH", "PREVIOUS_MONTH_CO
 export type CaptureDatePolicy = z.infer<typeof captureDatePolicySchema>;
 export const capturePeriodProofSchema = z.object({ startDate: isoDateSchema, endDate: isoDateSchema, comparisonStartDate: isoDateSchema.optional(), comparisonEndDate: isoDateSchema.optional() });
 export type CapturePeriodProof = z.infer<typeof capturePeriodProofSchema>;
+/** Exact whole-number subscriber counts read from Klaviyo's Subscriber growth → Email → Growth view; never compact text. */
+export const subscriberGrowthEvidenceSchema = z.object({
+  channel: z.literal("email"), view: z.literal("growth"),
+  emailSubscribers: z.number().int().nonnegative(), newSubscribers: z.number().int().nonnegative(), exclusions: z.number().int().nonnegative(),
+  /** Klaviyo's own previous-period change labels, kept as displayed text (never parsed into calculations); null when not shown. */
+  changes: z.object({ emailSubscribers: z.string().min(1).nullable(), newSubscribers: z.string().min(1).nullable(), exclusions: z.string().min(1).nullable() }).strict(),
+  charts: z.object({ subscriberGrowthLine: z.literal(true), newSubscribersExclusionsBar: z.literal(true) }).strict(),
+  visiblePeriodText: z.string().min(1),
+}).strict();
+export type SubscriberGrowthEvidence = z.infer<typeof subscriberGrowthEvidenceSchema>;
 export const screenshotSourceProofSchema = z.object({
   captureSpecVersion: z.literal(REPORT_CAPTURE_SPEC_VERSION), sectionKey: reportCaptureSectionKeySchema, sourceFamily: z.string().min(1), semanticCard: z.string().min(1), semanticTab: z.string().min(1), sourceIdentity: z.string().min(1), datePolicy: captureDatePolicySchema,
   expectedPeriod: capturePeriodProofSchema.nullable(), observedPeriod: capturePeriodProofSchema.nullable(), configuredEntityId: z.string().min(1).nullable(), configuredEntityName: z.string().min(1).nullable(),
@@ -69,6 +81,11 @@ export const screenshotSourceProofSchema = z.object({
     rankingMethod: z.enum(["klaviyo-native-sort", "complete-result-set"]), eligibleRowCount: z.number().int().nonnegative(), includedRowCount: z.number().int().nonnegative(),
     rows: z.array(z.object({ name: z.string().min(1), /** Channel as Klaviyo labels it; null when its icon carries no accessible name. */ type: z.string().min(1).nullable(), status: z.literal("Sent"), sendDate: isoDateSchema.nullable(), openRate: z.string().nullable(), clickRate: z.string().nullable(), placedOrderValue: z.number().nonnegative() }).strict()),
   }).nullable().default(null),
+  /**
+   * Read-only evidence emitted by the Subscriber Growth adapter (Section 10). Absent on every other section's proof,
+   * so proofs created before Section 10 existed parse and serialize exactly as before.
+   */
+  subscriberGrowth: subscriberGrowthEvidenceSchema.optional(),
 });
 export type ScreenshotSourceProof = z.infer<typeof screenshotSourceProofSchema>;
 
@@ -76,10 +93,17 @@ export const captureNavigationModeSchema = z.enum(["direct_configured_url", "sha
 export type CaptureNavigationMode = z.infer<typeof captureNavigationModeSchema>;
 export const captureAutomationStatusSchema = z.enum(["auto", "manual_required", "manual_by_design", "deferred"]);
 export type CaptureAutomationStatus = z.infer<typeof captureAutomationStatusSchema>;
-export const clientSourceUrlKeySchema = z.enum(["overviewUrl", "campaignsUrl", "topFlowsUrl", "businessReviewUrl", "signupFormsUrl", "flowsUrl", "segmentsUrl", "deliverabilityUrl", "listGrowthUrl"]);
+export const clientSourceUrlKeySchema = z.enum(["overviewUrl", "campaignsUrl", "topFlowsUrl", "businessReviewUrl", "signupFormsUrl", "flowsUrl", "segmentsUrl", "deliverabilityUrl", "listGrowthUrl", "subscriberGrowthUrl"]);
 export type ClientSourceUrlKey = z.infer<typeof clientSourceUrlKeySchema>;
 
-export interface ReportCaptureSpec { key: ReportCaptureSectionKey; screenshotType: ScreenshotType; title: string; sourceFamily: string; semanticCard: string; semanticTab: string; datePolicy: CaptureDatePolicy; sourceIdentity: string; defaultRequirement: "required" | "optional"; navigationMode: CaptureNavigationMode; automationStatus: CaptureAutomationStatus; sourceUrlKey?: ClientSourceUrlKey; }
+export interface ReportCaptureSpec {
+  key: ReportCaptureSectionKey; screenshotType: ScreenshotType; title: string; sourceFamily: string; semanticCard: string; semanticTab: string; datePolicy: CaptureDatePolicy; sourceIdentity: string; defaultRequirement: "required" | "optional"; navigationMode: CaptureNavigationMode; automationStatus: CaptureAutomationStatus; sourceUrlKey?: ClientSourceUrlKey;
+  /**
+   * Added after the frozen nine-section core: part of a report only when that report's own section configuration
+   * lists it, so every existing nine-section report keeps exactly its nine sections.
+   */
+  reportOptIn?: true;
+}
 export const REPORT_CAPTURE_SPEC_V1: readonly ReportCaptureSpec[] = [
   { key: "executive_summary", screenshotType: "overview", title: "Executive Summary", sourceFamily: "klaviyo-home", semanticCard: "business-performance-summary", semanticTab: "default", datePolicy: "EXACT_MONTH", sourceIdentity: "klaviyo-home|business-performance-summary|default", defaultRequirement: "required", navigationMode: "direct_configured_url", automationStatus: "auto", sourceUrlKey: "overviewUrl" },
   { key: "month_comparison", screenshotType: "month_comparison", title: "Month Comparison", sourceFamily: "business-review", semanticCard: "growth-overview", semanticTab: "message-type-breakdown|previous-period", datePolicy: "PREVIOUS_MONTH_COMPARISON", sourceIdentity: "business-review|growth-overview|message-type-breakdown|previous-period", defaultRequirement: "required", navigationMode: "shared_dashboard_semantic_tab", automationStatus: "auto", sourceUrlKey: "businessReviewUrl" },
@@ -93,6 +117,8 @@ export const REPORT_CAPTURE_SPEC_V1: readonly ReportCaptureSpec[] = [
   { key: "welcome_flow_performance", screenshotType: "welcome_flow", title: "Welcome Flow Performance", sourceFamily: "flows", semanticCard: "listing", semanticTab: "email-welcome-rows", datePolicy: "ROLLING_30_DAY", sourceIdentity: "flows|listing|email-welcome-rows", defaultRequirement: "optional", navigationMode: "direct_configured_url", automationStatus: "manual_required", sourceUrlKey: "flowsUrl" },
   { key: "customer_split", screenshotType: "customer_split", title: "Customers vs Non-Customers", sourceFamily: "segments", semanticCard: "configured-customer-split", semanticTab: "overview", datePolicy: "STATIC_ENTITY_VIEW", sourceIdentity: "segments|configured-customer-split|overview", defaultRequirement: "optional", navigationMode: "configured_entity", automationStatus: "deferred", sourceUrlKey: "segmentsUrl" },
   { key: "deliverability", screenshotType: "deliverability", title: "Deliverability Score", sourceFamily: "klaviyo-deliverability", semanticCard: "deliverability-score", semanticTab: "email", datePolicy: "ROLLING_30_DAY", sourceIdentity: "klaviyo-deliverability|deliverability-score|email", defaultRequirement: "required", navigationMode: "direct_configured_url", automationStatus: "auto", sourceUrlKey: "deliverabilityUrl" },
+  // Section 10: Audience → Profiles → View subscriber growth → Email → Growth. A new section, not the retired List Growth.
+  { key: "email_subscriber_growth", screenshotType: "email_subscriber_growth", title: "Subscriber Growth", sourceFamily: "klaviyo-subscriber-growth", semanticCard: "email", semanticTab: "growth", datePolicy: "EXACT_MONTH", sourceIdentity: "klaviyo-subscriber-growth|email|growth", defaultRequirement: "required", navigationMode: "direct_configured_url", automationStatus: "auto", sourceUrlKey: "subscriberGrowthUrl", reportOptIn: true },
 ] as const;
 /** Legacy-only parsing contract. It deliberately is not in the current product specification. */
 const LEGACY_LIST_GROWTH_CAPTURE_SPEC: ReportCaptureSpec = {
@@ -102,11 +128,11 @@ export const reportCaptureSpecByScreenshotType: Readonly<Record<ScreenshotType, 
   ...Object.fromEntries(REPORT_CAPTURE_SPEC_V1.map((spec) => [spec.screenshotType, spec])),
   list_growth: LEGACY_LIST_GROWTH_CAPTURE_SPEC,
 } as Record<ScreenshotType, ReportCaptureSpec>;
-export function createScreenshotSourceProof(type: ScreenshotType, period: ReportPeriod, listing?: { scope: "all_forms" | "email_welcome_flows"; entities?: Array<{ id: string; name: string; channel: "email" }> }, campaigns: ScreenshotSourceProof["campaigns"] = null): ScreenshotSourceProof {
+export function createScreenshotSourceProof(type: ScreenshotType, period: ReportPeriod, listing?: { scope: "all_forms" | "email_welcome_flows"; entities?: Array<{ id: string; name: string; channel: "email" }> }, campaigns: ScreenshotSourceProof["campaigns"] = null, subscriberGrowth: SubscriberGrowthEvidence | null = null): ScreenshotSourceProof {
   const spec = reportCaptureSpecByScreenshotType[type];
   const expectedPeriod = spec.datePolicy === "EXACT_MONTH" ? { startDate: period.startDate, endDate: period.endDate }
     : spec.datePolicy === "PREVIOUS_MONTH_COMPARISON" ? { startDate: period.startDate, endDate: period.endDate, comparisonStartDate: period.previousStartDate, comparisonEndDate: period.previousEndDate } : null;
-  return { captureSpecVersion: REPORT_CAPTURE_SPEC_VERSION, sectionKey: spec.key, sourceFamily: spec.sourceFamily, semanticCard: spec.semanticCard, semanticTab: spec.semanticTab, sourceIdentity: spec.sourceIdentity, datePolicy: spec.datePolicy, expectedPeriod, observedPeriod: expectedPeriod, configuredEntityId: null, configuredEntityName: null, listingScope: listing?.scope ?? null, configuredEntities: listing?.entities ?? [], semanticEvidence: type === "deliverability" ? ["deliverability-score", "based-on-last-30-days", "score-gauge", "rate-table"] : [], campaigns: type === "top_campaigns" ? campaigns : null };
+  return { captureSpecVersion: REPORT_CAPTURE_SPEC_VERSION, sectionKey: spec.key, sourceFamily: spec.sourceFamily, semanticCard: spec.semanticCard, semanticTab: spec.semanticTab, sourceIdentity: spec.sourceIdentity, datePolicy: spec.datePolicy, expectedPeriod, observedPeriod: expectedPeriod, configuredEntityId: null, configuredEntityName: null, listingScope: listing?.scope ?? null, configuredEntities: listing?.entities ?? [], semanticEvidence: type === "deliverability" ? ["deliverability-score", "based-on-last-30-days", "score-gauge", "rate-table"] : [], campaigns: type === "top_campaigns" ? campaigns : null, ...(type === "email_subscriber_growth" && subscriberGrowth ? { subscriberGrowth } : {}) };
 }
 export function matchesReportCaptureSpec(type: ScreenshotType, proof: ScreenshotSourceProof | null | undefined): boolean {
   const spec = reportCaptureSpecByScreenshotType[type];
@@ -115,14 +141,16 @@ export function matchesReportCaptureSpec(type: ScreenshotType, proof: Screenshot
       : true;
   const deliverabilityEvidence = ["deliverability-score", "based-on-last-30-days", "score-gauge", "rate-table"] as const;
   const deliverabilityEvidenceMatches = type !== "deliverability" || deliverabilityEvidence.every((item) => proof?.semanticEvidence.includes(item));
-  return Boolean(proof && listingMatches && deliverabilityEvidenceMatches && proof.captureSpecVersion === REPORT_CAPTURE_SPEC_VERSION && proof.sectionKey === spec.key && proof.sourceIdentity === spec.sourceIdentity && proof.sourceFamily === spec.sourceFamily && proof.semanticCard === spec.semanticCard && proof.semanticTab === spec.semanticTab && proof.datePolicy === spec.datePolicy);
+  // Subscriber Growth evidence belongs to Section 10 alone: required there, and never carried by another section's proof.
+  const subscriberGrowthEvidenceMatches = type === "email_subscriber_growth" ? subscriberGrowthEvidenceSchema.safeParse(proof?.subscriberGrowth).success : proof?.subscriberGrowth === undefined;
+  return Boolean(proof && listingMatches && deliverabilityEvidenceMatches && subscriberGrowthEvidenceMatches && proof.captureSpecVersion === REPORT_CAPTURE_SPEC_VERSION && proof.sectionKey === spec.key && proof.sourceIdentity === spec.sourceIdentity && proof.sourceFamily === spec.sourceFamily && proof.semanticCard === spec.semanticCard && proof.semanticTab === spec.semanticTab && proof.datePolicy === spec.datePolicy);
 }
 
 export const reportSectionKeySchema = z.enum([
   "executive_summary", "top_campaigns", "top_flows", "month_comparison",
   "campaign_performance", "flow_performance", "signup_form", "welcome_flow",
   "customer_split", "deliverability", "campaign_metrics", "flow_metrics", "list_growth",
-  "analysis", "next_month_plan",
+  "analysis", "next_month_plan", "email_subscriber_growth",
 ]);
 export type ReportSectionKey = z.infer<typeof reportSectionKeySchema>;
 
@@ -202,6 +230,8 @@ export const clientSourceUrlsSchema = z.object({
   overviewUrl: klaviyoHttpsUrlSchema.optional(), campaignsUrl: klaviyoHttpsUrlSchema.optional(), topFlowsUrl: klaviyoHttpsUrlSchema.optional(),
   businessReviewUrl: klaviyoHttpsUrlSchema.optional(), signupFormsUrl: klaviyoHttpsUrlSchema.optional(), flowsUrl: klaviyoHttpsUrlSchema.optional(),
   segmentsUrl: klaviyoHttpsUrlSchema.optional(), deliverabilityUrl: klaviyoHttpsUrlSchema.optional(), listGrowthUrl: klaviyoHttpsUrlSchema.optional(),
+  /** The Klaviyo "Subscriber growth" page (Audience → Profiles → View subscriber growth), copied from the address bar. */
+  subscriberGrowthUrl: klaviyoHttpsUrlSchema.optional(),
 }).strict().superRefine((value, context) => {
   if (Object.values(value).every((url) => !url)) context.addIssue({ code: z.ZodIssueCode.custom, message: "Provide at least one source URL." });
 });
@@ -283,7 +313,18 @@ export const screenshotSectionMapping: Readonly<Record<ScreenshotType, ReportSec
   campaign_metrics: "campaign_metrics",
   flow_metrics: "flow_metrics",
   list_growth: "list_growth",
+  email_subscriber_growth: "email_subscriber_growth",
 };
+
+/**
+ * The automatic capture sections a report includes, in specification order: the frozen nine-section core always,
+ * plus each later automatic section (`reportOptIn`) only when the report's own section configuration enables it.
+ */
+export function automaticCaptureTypesForSections(sections: SectionConfiguration): ScreenshotType[] {
+  return REPORT_CAPTURE_SPEC_V1.filter((spec) => spec.automationStatus === "auto"
+    && (!spec.reportOptIn || (sections[screenshotSectionMapping[spec.screenshotType]] !== undefined && sections[screenshotSectionMapping[spec.screenshotType]] !== "disabled")))
+    .map((spec) => spec.screenshotType);
+}
 
 export const screenshotRecordSchema = z.object({
   id: z.string().min(1),

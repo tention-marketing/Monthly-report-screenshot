@@ -41,6 +41,10 @@ const BY_CODE: Record<string, FailureCategory> = {
   BUSINESS_REVIEW_TARGET_OCCLUDED: "TARGET_OBSCURED", TARGET_NOT_VISIBLE: "TARGET_BOUNDS_INVALID", TARGET_BOUNDS_INVALID: "TARGET_BOUNDS_INVALID",
   TOP_CAMPAIGNS_ROWS_NOT_VISIBLE: "TARGET_BOUNDS_INVALID", TARGET_LAYOUT_NOT_STABLE: "LAYOUT_UNSTABLE", TOP_CAMPAIGNS_UNSTABLE: "LAYOUT_UNSTABLE",
   BUSINESS_REVIEW_UNEXPECTED_NAVIGATION: "PAGE_NOT_READY", BUSINESS_REVIEW_CHART_NOT_RENDERED: "CARD_NOT_READY",
+  SUBSCRIBER_GROWTH_URL_REQUIRED: "CONFIGURATION", SUBSCRIBER_GROWTH_ACCOUNT_UNPROVEN: "PAGE_NOT_READY", SUBSCRIBER_GROWTH_TARGET_OCCLUDED: "TARGET_OBSCURED",
+  SUBSCRIBER_GROWTH_METRIC_NOT_EXACT: "CARD_NOT_READY", SUBSCRIBER_GROWTH_NOT_STABLE: "LAYOUT_UNSTABLE", SUBSCRIBER_GROWTH_ROUTE_CHANGED: "PAGE_NOT_READY", SUBSCRIBER_GROWTH_SOURCE_SETUP_BUSY: "PAGE_NOT_READY",
+  // Views the extension selects itself are retryable; only a wrong page or account cannot be fixed by retrying.
+  SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_FOUND: "VIEW_NOT_SELECTED", SUBSCRIBER_GROWTH_VIEW_NOT_FOUND: "VIEW_NOT_SELECTED", SUBSCRIBER_GROWTH_SOURCE_WRONG_PAGE: "CONFIGURATION",
   AUTOMATIC_PERIOD_PROOF_MISMATCH: "PERIOD_NOT_CONFIRMED", TOP_CAMPAIGNS_NO_DATA: "NO_DATA", TOP_FLOWS_NO_DATA: "NO_DATA",
 };
 
@@ -87,11 +91,11 @@ export interface KnownFailure {
 }
 export const KNOWN_FAILURES: readonly KnownFailure[] = [
   {
-    id: "SESSION_STORAGE_QUOTA", discovered: "2026-10-28 (June b4732590/b149eee7, September 07809233)", category: "CAPTURE_STATE_STORAGE_FULL",
-    subsystem: "capture state store (chrome.storage.session)",
+    id: "SESSION_STORAGE_QUOTA", discovered: "2026-10-28 (June b4732590/b149eee7, September 07809233); recurred 2026-10-29 at the Subscriber Growth toolbar click", category: "CAPTURE_STATE_STORAGE_FULL",
+    subsystem: "capture state store + every chrome.storage.session writer",
     rootCause: "Every section's state held a full-viewport screenshot and was never released, so the 10 MB session quota filled across sections, runs and months; later sections failed with 'Session storage quota bytes exceeded' or hung at Capturing when the failure write was refused too.",
-    recovery: "Runner releases each section's state once consumed and all states at run start; the store releases stale states and falls back to memory instead of throwing.",
-    regressionTest: "never throws when session storage is full: releases stale capture states, then falls back to memory",
+    recovery: "Screenshots never go to session storage: capture states keep images in service-worker memory and store only small metadata; startup removes obsolete image-bearing states from older builds; the toolbar grant, click record and Subscriber Growth source are critical writes (cleanup, one retry, read-back, typed SESSION_STORAGE_QUOTA_EXCEEDED).",
+    regressionTest: "never stores a screenshot in session storage and never throws when it is full",
     matches: (_code, message) => /quota bytes exceeded|QUOTA_BYTES/i.test(message),
   },
   {

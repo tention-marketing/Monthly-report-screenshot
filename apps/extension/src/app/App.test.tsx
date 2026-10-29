@@ -8,6 +8,8 @@ import type { KlaviyoNavigationService } from "../features/klaviyo-navigation/na
 import type { AutoCaptureService, AutoCaptureState } from "../features/automatic-capture/auto-capture-service.js";
 import type { BusinessReviewDiscoveryResult } from "../features/klaviyo-navigation/business-review-discovery.js";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
+/** A report created before Section 10: exactly the frozen nine-section core. */
+const { email_subscriber_growth: _sectionTen, ...NINE_SECTION_CONFIGURATION } = DEFAULT_DRAFT_SECTION_CONFIGURATION;
 import { App } from "./App.js";
 
 afterEach(() => { window.sessionStorage.clear(); });
@@ -42,7 +44,7 @@ function runnerReport(approvedTypes: readonly ScreenshotType[] = []): ReportDraf
     client: { id: "autoled", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null },
     reportMonth: { year: 2026, month: 7 },
     period: { startDate: "2026-07-01", endDate: "2026-07-31", previousStartDate: "2026-06-01", previousEndDate: "2026-06-30" },
-    sections: { ...DEFAULT_DRAFT_SECTION_CONFIGURATION },
+    sections: { ...NINE_SECTION_CONFIGURATION },
     screenshots: approvedTypes.map((type, index) => ({
       id: `screenshot-${index}`, clientId: "autoled", reportMonth: { year: 2026, month: 7 }, type,
       capturedAt: NOW.toISOString(), sourceUrl: "https://www.klaviyo.com", width: 100, height: 100,
@@ -111,6 +113,17 @@ function baseMockApi(overrides: Partial<Record<keyof ApiClient, unknown>>): ApiC
     getReportReadiness: vi.fn().mockResolvedValue({ ready: true, sections: [] }),
     ...overrides,
   } as ApiClient;
+}
+/** Source-setup hooks for tests: `take` returns what the service worker verified at the toolbar click. */
+const sourceHooks = (take: () => Promise<unknown>, persisted = vi.fn().mockResolvedValue(null)) => ({ take: take as never, persisted, watch: () => () => undefined });
+/** Client configuration that returns what was last saved, so the panel's reload confirmation is real. */
+function rememberingTargets(api: ApiClient, initial?: Record<string, unknown>) {
+  let saved: Record<string, unknown> | null = initial ?? null;
+  const read = api.getClientReportTargets;
+  api.getClientReportTargets = vi.fn(async (clientId: string) => saved ? { ...(await read(clientId)), ...saved } : read(clientId)) as ApiClient["getClientReportTargets"];
+  const write = api.saveClientReportTargets;
+  api.saveClientReportTargets = vi.fn(async (clientId: string, input: never) => { const result = await write(clientId, input); saved = { ...(result as Record<string, unknown>) }; return result; }) as ApiClient["saveClientReportTargets"];
+  return api;
 }
 const testDiscovery = async (input: { clientName: string }): Promise<BusinessReviewDiscoveryResult> => ({ ok: true, dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/verified-test-source", accountLabel: input.clientName, accountMatchesClient: true, evidence: { businessReviewHeading: true, growthOverview: true, campaignPerformance: true, flowPerformance: true } });
 const renderApp = (api: ApiClient, captureService?: CaptureService, navigationService?: KlaviyoNavigationService, automaticCaptureService?: AutoCaptureService, discoverBusinessReviewSource = testDiscovery) => render(<App api={api} {...(captureService ? { captureService } : {})} {...(navigationService ? { navigationService } : {})} {...(automaticCaptureService ? { automaticCaptureService } : {})} discoverBusinessReviewSource={discoverBusinessReviewSource} now={() => new Date(NOW)} />);
@@ -186,7 +199,7 @@ describe("extension report workflow", () => {
     expect(screen.getByText("Captured: 9 / 9 · Pending review: 9 · Approved: 0 · Missing/stale: 0")).toBeInTheDocument();
     expect(screen.getAllByText("Captured · Pending review")).toHaveLength(9);
     expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
-    expect(screen.getByText(/final-only sections below are separate from the nine automatic captures/)).toBeInTheDocument();
+    expect(screen.getByText(/final-only sections below are separate from the 9 automatic captures/)).toBeInTheDocument();
     const finalOnly = within(screen.getByRole("region", { name: "Final Report Readiness" }));
     expect(finalOnly.getByText("Signup Form Performance")).toBeInTheDocument();
     expect(finalOnly.getByText("Welcome Flow Performance")).toBeInTheDocument();
@@ -1037,6 +1050,181 @@ describe("capture workflow cross-section safety", () => {
     expect(screen.getByText("Fresh captures: 0 / 9 successful", { exact: false })).toBeInTheDocument();
     expect(screen.getAllByText("Not started")).toHaveLength(8);
   }, 15_000);
+  it("saves the Subscriber Growth source once from the authorized tab, then runs all ten sections in order", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    }));
+    // A lost toolbar grant is permanent, so the run stops at once at section 1 of 10.
+    const service: AutoCaptureService = {
+      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+    };
+    const discoverSubscriberGrowth = vi.fn().mockResolvedValue({ ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/discovered-subscriber-growth", accountLabels: ["Account AutoLEDTech.com"] });
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(discoverSubscriberGrowth)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(screen.getByText("10 supported sections")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Start Automatic Capture · 10 sections/ }));
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    expect(discoverSubscriberGrowth).toHaveBeenCalledOnce();
+    expect(api.saveClientReportTargets).toHaveBeenCalledWith("autoled", expect.objectContaining({ sourceUrls: expect.objectContaining({ subscriberGrowthUrl: "https://www.klaviyo.com/discovered-subscriber-growth" }) }));
+    expect(screen.getByText("Fresh captures: 0 / 10 successful", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("10/10 Subscriber Growth")).toBeInTheDocument();
+  });
+  it("reuses a saved Subscriber Growth source without rediscovering it", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      getClientReportTargets: vi.fn().mockResolvedValue({ clientId: "autoled", profile: { name: "AutoLEDTech.com", timezone: "America/New_York", currency: null, conversionMetric: { label: "Placed Order", providerMetricId: null }, sections: null }, businessReview: null, sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/saved-subscriber-growth" }, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, welcomeFlowListing: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, createdAt: null, updatedAt: null }),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    });
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined) };
+    const discoverSubscriberGrowth = vi.fn();
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(discoverSubscriberGrowth)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText(/Verified Subscriber growth source saved for this client/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Start Automatic Capture · 10 sections/ }));
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    expect(discoverSubscriberGrowth).not.toHaveBeenCalled();
+  });
+  it("blocks a ten-section run when the authorized tab is not Subscriber growth → Email → Growth", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), startLocalAutomaticCaptureRun: vi.fn() });
+    const discoverSubscriberGrowth = vi.fn().mockResolvedValue({ ok: false, code: "SUBSCRIBER_GROWTH_VIEW_NOT_SELECTED", message: "Select the Growth view under Email on Subscriber growth, then click the Tention toolbar icon again." });
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={{ start: vi.fn(), get: vi.fn().mockResolvedValue(null), clear: vi.fn() }} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(discoverSubscriberGrowth)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await user.click(screen.getByRole("button", { name: /Start Automatic Capture · 10 sections/ }));
+    expect(await screen.findByText(/SUBSCRIBER_GROWTH_VIEW_NOT_SELECTED/)).toBeInTheDocument();
+    expect(api.startLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+    expect(vi.mocked(api.saveClientReportTargets).mock.calls.some(([, input]) => Boolean((input as { sourceUrls?: { subscriberGrowthUrl?: string } }).sourceUrls?.subscriberGrowthUrl))).toBe(false);
+  });
+  it("keeps an existing nine-section report at nine sections until Section 10 is added explicitly", async () => {
+    const initial = runnerReport();
+    const enabled: ReportDraft = { ...initial, version: initial.version + 1, sections: { ...initial.sections, email_subscriber_growth: "required" } };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), enableSubscriberGrowthSection: vi.fn().mockResolvedValue(enabled) });
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(screen.getByText("9 supported sections")).toBeInTheDocument();
+    expect(screen.queryByText("Subscriber Growth")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add Section 10 · Subscriber Growth" }));
+    expect(api.enableSubscriberGrowthSection).toHaveBeenCalledWith(initial.id, initial.version);
+    expect(await screen.findByText("10 supported sections")).toBeInTheDocument();
+  });
+  it("resumes only Section 10 when sections 1–9 are already captured, keeping their evidence", async () => {
+    const initial: ReportDraft = { ...runnerReport(runnerScreenshotTypes), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), uploadScreenshotImage: vi.fn(),
+    }), { sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/saved-subscriber-growth" } });
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined) };
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn())} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await user.click(await screen.findByRole("button", { name: "Resume Automatic Capture · Subscriber Growth" }));
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    expect(api.startLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.objectContaining({ mode: "resume", plannedSections: ["email_subscriber_growth"] }));
+    expect(vi.mocked(service.start).mock.calls.map(([request]) => request.screenshotType)).toEqual(["email_subscriber_growth"]);
+    expect(screen.getByText("10/10 Subscriber Growth")).toBeInTheDocument();
+    expect(screen.queryByText(/Executive Summary/)).not.toBeInTheDocument();
+    expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
+  });
+  it("saves the Subscriber Growth source from one toolbar click, confirmed by reloading the client configuration", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }));
+    let notify: () => void = () => undefined;
+    let verified = false;
+    const take = vi.fn(async () => verified ? { ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/clicked-subscriber-growth", accountLabels: ["AutoLEDTech.com"] } : { ok: false, code: "SUBSCRIBER_GROWTH_SOURCE_NOT_VERIFIED", message: "Click the toolbar icon." });
+    const persisted = vi.fn().mockResolvedValue(null);
+    const user = userEvent.setup();
+    render(<App api={api} automaticCaptureService={automaticService(null as never)} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={{ take: take as never, persisted, watch: (callback) => { notify = callback; return () => undefined; } }} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText(/Not yet saved · open Audience → Profiles/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    verified = true; notify(); // the service worker verified the clicked Email → Growth tab
+    expect(await screen.findByText(/Verified Subscriber growth source saved for this client/)).toBeInTheDocument();
+    expect(api.saveClientReportTargets).toHaveBeenCalledWith("autoled", expect.objectContaining({ sourceUrls: expect.objectContaining({ subscriberGrowthUrl: "https://www.klaviyo.com/clicked-subscriber-growth" }) }));
+    expect(persisted).toHaveBeenLastCalledWith({ saved: true, sourceUrl: "https://www.klaviyo.com/clicked-subscriber-growth", failureCode: null });
+  });
+  it("never saves a verified Subscriber Growth page from another client's Klaviyo account", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }));
+    const persisted = vi.fn().mockResolvedValue(null);
+    const user = userEvent.setup();
+    render(<App api={api} automaticCaptureService={automaticService(null as never)} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn().mockResolvedValue({ ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/other", accountLabels: ["Club Furniture"] }), persisted)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText(/could not be proven to be AutoLEDTech.com/)).toBeInTheDocument();
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    expect(persisted).toHaveBeenLastCalledWith({ saved: false, sourceUrl: "https://www.klaviyo.com/other", failureCode: "SUBSCRIBER_GROWTH_ACCOUNT_UNPROVEN" });
+  });
+  it("does not mark the source configured when the reloaded client configuration does not confirm it", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) });
+    const persisted = vi.fn().mockResolvedValue(null);
+    const user = userEvent.setup();
+    render(<App api={api} automaticCaptureService={automaticService(null as never)} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn().mockResolvedValue({ ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/clicked", accountLabels: ["AutoLEDTech.com"] }), persisted)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText("The client configuration did not confirm the saved Subscriber Growth source.")).toBeInTheDocument();
+    expect(screen.queryByText(/Verified Subscriber growth source saved/)).not.toBeInTheDocument();
+    expect(persisted).toHaveBeenLastCalledWith({ saved: false, sourceUrl: "https://www.klaviyo.com/clicked", failureCode: "SUBSCRIBER_GROWTH_SOURCE_SAVE_UNCONFIRMED" });
+  });
+  it("keeps a saved Business Review binding when the Subscriber Growth source is saved", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const businessReview = { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/verified-test-source", displayName: "Business Review", accountLabel: "AutoLEDTech.com" };
+    const api = rememberingTargets(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }), { businessReview });
+    const user = userEvent.setup();
+    render(<App api={api} automaticCaptureService={automaticService(null as never)} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn().mockResolvedValue({ ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers", accountLabels: ["AutoLEDTech.com"] }))} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText(/Verified Subscriber growth source saved for this client/)).toBeInTheDocument();
+    expect(api.saveClientReportTargets).toHaveBeenCalledWith("autoled", expect.objectContaining({ businessReview: expect.objectContaining(businessReview), sourceUrls: expect.objectContaining({ subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" }) }));
+  });
+  it("keeps a saved Subscriber Growth source when Business Review is saved later", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    }), { sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" } });
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined) };
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn())} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await screen.findByText(/Verified Subscriber growth source saved for this client/);
+    await user.click(screen.getByRole("button", { name: /Start Automatic Capture · 10 sections/ }));
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    const businessReviewSave = vi.mocked(api.saveClientReportTargets).mock.calls.find(([, input]) => Boolean((input as { businessReview?: unknown }).businessReview));
+    expect(businessReviewSave?.[1]).toMatchObject({ sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" } });
+  });
+  it("never loses the Subscriber Growth source when Start runs the Business Review preflight while the source is still saving", async () => {
+    const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    }));
+    // The automatic save on opening the report is slow: Start is clicked while it is still in flight.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const take = vi.fn(async () => { await held; return { ok: true, subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers", accountLabels: ["AutoLEDTech.com"] }; });
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined) };
+    const user = userEvent.setup();
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(take)} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await vi.waitFor(() => expect(take).toHaveBeenCalledOnce());
+    const start = user.click(screen.getByRole("button", { name: /Start Automatic Capture · 10 sections/ }));
+    release();
+    await start;
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    expect(take).toHaveBeenCalledOnce();
+    const finalConfig = await api.getClientReportTargets("autoled");
+    expect(finalConfig).toMatchObject({ sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" }, businessReview: { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/verified-test-source" } });
+  });
   it("restores a persisted worker capture into review after the UI remounts", async () => {
     const initial = businessReviewAutoReport();
     const saved: AutoCaptureState = { request: automaticRequest(initial), stage: "review_ready", sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } };

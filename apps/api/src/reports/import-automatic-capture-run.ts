@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { createScreenshotSourceProof, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, TOP_CAMPAIGNS_LIMIT, TOP_FLOWS_LIMIT, screenshotRecordSchema, screenshotSourceProofSchema, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { automaticCaptureTypesForSections, createScreenshotSourceProof, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, TOP_CAMPAIGNS_LIMIT, TOP_FLOWS_LIMIT, screenshotRecordSchema, screenshotSourceProofSchema, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 import { deriveClientId, ReportDomainError, ReportPersistenceError, upsertScreenshotMetadataBatch, validateReportDraft, type ReportDraftRepository } from "@tention/report-domain";
 import { getReportPeriod } from "@tention/report-core";
 import type { ScreenshotStorage } from "../storage/screenshot-storage.js";
 import { inspectPng } from "../storage/png.js";
 
+/** The frozen nine-section core. A report that enables Section 10 (Subscriber Growth) also requires it; see automaticCaptureTypesForSections. */
 export const AUTOMATIC_RUN_CAPTURE_TYPES = ["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"] as const satisfies readonly ScreenshotType[];
 
 export async function importCompletedAutomaticCaptureRun(options: { repository: ReportDraftRepository; screenshotStorage: ScreenshotStorage; repositoryRoot: string; runId: string; now: () => Date }) {
@@ -31,20 +32,37 @@ export async function importCompletedAutomaticCaptureRun(options: { repository: 
     if (!section || typeof section.section !== "string" || byType.has(section.section)) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Automatic run contains duplicate or malformed section results.");
     byType.set(section.section, section);
   }
-  if (byType.size !== AUTOMATIC_RUN_CAPTURE_TYPES.length || AUTOMATIC_RUN_CAPTURE_TYPES.some((type) => !byType.has(type))) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Automatic run does not contain exactly the nine supported sections.");
-
   const source = await options.repository.getById(run.reportId);
   if (!source || source.client.id !== run.clientId || source.client.name !== run.clientName || source.client.timezone !== run.timezone
     || source.reportMonth.year !== reportMonth.year || source.reportMonth.month !== reportMonth.month || source.period.startDate !== period.startDate || source.period.endDate !== period.endDate
     || source.period.previousStartDate !== period.previousStartDate || source.period.previousEndDate !== period.previousEndDate || source.status !== "draft") {
     throw new ReportDomainError("REPORT_VALIDATION_FAILED", "The automatic run no longer resolves to the expected canonical client/month draft.");
   }
+  // Exactly the report's own automatic sections: the nine core sections, plus Section 10 only when the report includes it.
+  const automaticTypes = automaticCaptureTypesForSections(source.sections);
+  const isAutomaticType = (type: ScreenshotType) => automaticTypes.includes(type);
+  // A full run carries every automatic section. A resume run carries exactly its declared missing/stale sections; each
+  // section it does not carry must already be valid canonical evidence for this client and month, which is kept as is.
+  const resume = run.mode === "resume";
+  const runTypes: ScreenshotType[] = resume ? (Array.isArray(run.plannedSections) ? run.plannedSections : []) : automaticTypes;
+  if (!runTypes.length || runTypes.some((type) => !isAutomaticType(type)) || new Set(runTypes).size !== runTypes.length
+    || byType.size !== runTypes.length || runTypes.some((type) => !byType.has(type))) throw new ReportDomainError("REPORT_VALIDATION_FAILED", resume ? "Resume run sections do not match its declared plan for this report." : `Automatic run does not contain exactly the ${automaticTypes.length} sections this report includes.`);
+  const keptTypes = automaticTypes.filter((type) => !runTypes.includes(type));
+  for (const type of keptTypes) {
+    const kept = source.screenshots.filter((record) => record.type === type);
+    const record = kept[0];
+    if (kept.length !== 1 || !record || record.clientId !== source.client.id || record.reportMonth.year !== reportMonth.year || record.reportMonth.month !== reportMonth.month
+      || !record.sha256 || !record.storageKey || !record.periodConfirmed || !matchesReportCaptureSpec(type, record.sourceProof)
+      || JSON.stringify(record.sourceProof?.expectedPeriod) !== JSON.stringify(createScreenshotSourceProof(type, period).expectedPeriod)) {
+      throw new ReportDomainError("REPORT_VALIDATION_FAILED", `A resume run may only skip ${type} when the report already holds its valid evidence for this client and month.`);
+    }
+  }
   const existingLogical = (await options.repository.list()).filter((draft) => draft.client.id === run.clientId && draft.reportMonth.year === reportMonth.year && draft.reportMonth.month === reportMonth.month);
   if (existingLogical.length !== 1 || existingLogical[0]!.id !== source.id) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Automatic run import requires exactly one matching client and report-month draft.");
 
   const captures: Array<{ type: ScreenshotType; bytes: Buffer; sha256: string; width: number; height: number; sourceUrl: string; sourceProof: ReturnType<typeof createScreenshotSourceProof>; capturedAt: string }> = [];
   const seenHashes = new Set<string>();
-  for (const type of AUTOMATIC_RUN_CAPTURE_TYPES) {
+  for (const type of runTypes) {
     const result = byType.get(type)!;
     const spec = REPORT_CAPTURE_SPEC_V1.find((entry) => entry.screenshotType === type)!;
     const diagnostic = result.diagnostics;
@@ -84,7 +102,7 @@ export async function importCompletedAutomaticCaptureRun(options: { repository: 
     captures.push({ type, bytes, sha256, ...dimensions, sourceUrl, sourceProof: proof, capturedAt: result.finishedAt });
   }
   for (const record of source.screenshots) {
-    if (AUTOMATIC_RUN_CAPTURE_TYPES.includes(record.type as typeof AUTOMATIC_RUN_CAPTURE_TYPES[number])) {
+    if (runTypes.includes(record.type)) {
       const capture = captures.find((item) => item.type === record.type)!;
       // Unapproved evidence from an earlier automatic run is superseded by a newer complete run (a retake);
       // approved or manually captured evidence is never replaced.
@@ -120,10 +138,11 @@ export async function importCompletedAutomaticCaptureRun(options: { repository: 
       draft = await options.repository.save(updated, draft.version);
     }
     const byTypeAfter = new Map(draft.screenshots.map((entry) => [entry.type, entry]));
-    if (AUTOMATIC_RUN_CAPTURE_TYPES.some((type) => byTypeAfter.get(type)?.sha256 !== captures.find((capture) => capture.type === type)?.sha256)) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Canonical report reload did not preserve all nine automatic capture hashes.");
-    const runWithImport = { ...run, reportId: draft.id, canonicalImport: { status: "persisted", reportId: draft.id, reportVersion: draft.version, capturedCount: 9, pendingReviewCount: draft.screenshots.filter((item) => AUTOMATIC_RUN_CAPTURE_TYPES.includes(item.type as typeof AUTOMATIC_RUN_CAPTURE_TYPES[number]) && !item.approved).length, approvedCount: draft.screenshots.filter((item) => AUTOMATIC_RUN_CAPTURE_TYPES.includes(item.type as typeof AUTOMATIC_RUN_CAPTURE_TYPES[number]) && item.approved).length, importedAt: options.now().toISOString(), captures: captures.map((capture) => ({ type: capture.type, sha256: capture.sha256, screenshotRecordId: byTypeAfter.get(capture.type)!.id })) } };
+    if (runTypes.some((type) => byTypeAfter.get(type)?.sha256 !== captures.find((capture) => capture.type === type)?.sha256)
+      || keptTypes.some((type) => byTypeAfter.get(type)?.sha256 !== source.screenshots.find((record) => record.type === type)?.sha256)) throw new ReportDomainError("REPORT_VALIDATION_FAILED", `Canonical report reload did not preserve all ${automaticTypes.length} automatic capture hashes.`);
+    const runWithImport = { ...run, reportId: draft.id, canonicalImport: { status: "persisted", reportId: draft.id, reportVersion: draft.version, capturedCount: automaticTypes.length, pendingReviewCount: draft.screenshots.filter((item) => isAutomaticType(item.type) && !item.approved).length, approvedCount: draft.screenshots.filter((item) => isAutomaticType(item.type) && item.approved).length, importedAt: options.now().toISOString(), captures: captures.map((capture) => ({ type: capture.type, sha256: capture.sha256, screenshotRecordId: byTypeAfter.get(capture.type)!.id })) } };
     await writeFile(file, `${JSON.stringify(runWithImport, null, 2)}\n`);
-    return { runId: options.runId, reportId: draft.id, clientId: draft.client.id, reportMonth: draft.reportMonth, reportVersion: draft.version, captures: captures.map((capture) => ({ type: capture.type, screenshotRecordId: byTypeAfter.get(capture.type)!.id, sha256: capture.sha256, reviewStatus: byTypeAfter.get(capture.type)!.approved ? "approved" : "pending_review", captureOrigin: byTypeAfter.get(capture.type)!.captureOrigin })), capturedCount: 9, pendingReviewCount: draft.screenshots.filter((item) => AUTOMATIC_RUN_CAPTURE_TYPES.includes(item.type as typeof AUTOMATIC_RUN_CAPTURE_TYPES[number]) && !item.approved).length, approvedCount: draft.screenshots.filter((item) => AUTOMATIC_RUN_CAPTURE_TYPES.includes(item.type as typeof AUTOMATIC_RUN_CAPTURE_TYPES[number]) && item.approved).length, missingAutomaticCount: 0, validation: validateReportDraft(draft, { now: options.now() }) };
+    return { runId: options.runId, reportId: draft.id, clientId: draft.client.id, reportMonth: draft.reportMonth, reportVersion: draft.version, captures: captures.map((capture) => ({ type: capture.type, screenshotRecordId: byTypeAfter.get(capture.type)!.id, sha256: capture.sha256, reviewStatus: byTypeAfter.get(capture.type)!.approved ? "approved" : "pending_review", captureOrigin: byTypeAfter.get(capture.type)!.captureOrigin })), capturedCount: automaticTypes.length, pendingReviewCount: draft.screenshots.filter((item) => isAutomaticType(item.type) && !item.approved).length, approvedCount: draft.screenshots.filter((item) => isAutomaticType(item.type) && item.approved).length, missingAutomaticCount: 0, validation: validateReportDraft(draft, { now: options.now() }) };
   } catch (error) {
     await Promise.all(newAssets.map((key) => options.screenshotStorage.delete(key).catch(() => undefined)));
     throw error;

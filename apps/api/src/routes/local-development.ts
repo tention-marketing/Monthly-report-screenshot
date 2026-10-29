@@ -4,7 +4,7 @@ import { createScreenshotSourceProof, matchesReportCaptureSpec, REPORT_CAPTURE_S
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ReportPersistenceError, retireLegacyListGrowth, upsertScreenshotMetadata, type ClientReportTargetsRepository, type ReportDraftRepository } from "@tention/report-domain";
+import { enableEmailSubscriberGrowth, ReportDomainError, ReportPersistenceError, retireLegacyListGrowth, upsertScreenshotMetadata, type ClientReportTargetsRepository, type ReportDraftRepository } from "@tention/report-domain";
 import type { ScreenshotStorage } from "../storage/screenshot-storage.js";
 import type { PdfArtifactStorage } from "../storage/pdf-artifact-storage.js";
 import { inspectPng } from "../storage/png.js";
@@ -35,8 +35,9 @@ const importRequest = z.object({
   section: z.enum(LIVE_ACCEPTANCE_IMPORT_TYPES).optional(),
 }).strict();
 const importedReviewRequest = z.object({ expectedVersion: z.number().int().positive(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
-const autoRunStart = z.object({ runId: z.string().uuid(), reportId: z.string().uuid(), clientId: z.string().min(1).max(120), reportMonth: z.object({ year: z.number().int(), month: z.number().int().min(1).max(12) }).strict(), startedAt: z.string().datetime(), extensionBuild: z.string().max(64).optional() }).strict();
+const autoRunStart = z.object({ runId: z.string().uuid(), reportId: z.string().uuid(), clientId: z.string().min(1).max(120), reportMonth: z.object({ year: z.number().int(), month: z.number().int().min(1).max(12) }).strict(), startedAt: z.string().datetime(), extensionBuild: z.string().max(64).optional(), mode: z.enum(["full", "resume"]).optional(), plannedSections: z.array(screenshotTypeSchema).min(1).max(20).optional() }).strict();
 const autoRunSection = z.object({ status: z.enum(["running", "pass", "fail"]), attemptNumber: z.number().int().min(1).max(5), startedAt: z.string().datetime(), finishedAt: z.string().datetime().nullable(), durationMs: z.number().int().nonnegative().nullable(), expectedUrl: z.string().max(2048).nullable(), observedUrl: z.string().max(2048).nullable(), expectedSourceIdentity: z.string().max(240).nullable(), observedSourceIdentity: z.string().max(240).nullable(), expectedPeriod: z.record(z.string(), z.string()).nullable(), observedPeriod: z.string().max(500).nullable(), expectedSemanticCard: z.string().max(160).nullable(), expectedView: z.string().max(160).nullable(), visibleControls: z.array(z.record(z.string(), z.unknown())).max(80), usableRowCount: z.number().int().nonnegative().nullable(), screenshotResult: z.string().max(100).nullable(), sourceProofResult: z.string().max(100).nullable(), sha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(), errorCode: z.string().max(100).nullable(), errorMessage: z.string().max(1000).nullable(), diagnostics: z.record(z.string(), z.unknown()).nullable() }).strict();
+const enableSectionRequest = z.object({ expectedVersion: z.number().int().positive() }).strict();
 const autoRunFinish = z.object({ status: z.enum(["completed", "failed"]), finishedAt: z.string().datetime(), durationMs: z.number().int().nonnegative() }).strict();
 
 /** Registered only by a non-production API bound to a loopback interface. */
@@ -56,6 +57,21 @@ export const localDevelopmentRoutes: FastifyPluginAsync<RouteOptions> = async (a
       return reply.code(error instanceof ReportPersistenceError && error.code === "REPORT_VERSION_CONFLICT" ? 409 : 400).send({ error: error instanceof ReportPersistenceError ? error.code : "LIST_GROWTH_RETIREMENT_FAILED", message: error instanceof Error ? error.message : "List Growth retirement failed." });
     }
   });
+  // Section 10 is opt-in per report: an existing draft gains it only through this explicit request. It never touches
+  // legacy List Growth (still retired above) and never migrates any existing evidence.
+  app.post<{ Params: { reportId: string } }>("/report-drafts/:reportId/sections/email_subscriber_growth/enable", async (request, reply) => {
+    if (!options.persistentStorage) return reply.code(503).send({ error: "SECTION_CHANGE_REQUIRES_PERSISTENT_STORAGE", message: "Enabling Subscriber Growth requires the persistent local report store." });
+    try {
+      const { expectedVersion } = enableSectionRequest.parse(request.body);
+      const draft = await options.repository.getById(request.params.reportId);
+      if (!draft) return reply.code(404).send({ error: "REPORT_NOT_FOUND", message: "Report draft was not found." });
+      if (draft.version !== expectedVersion) return reply.code(409).send({ error: "REPORT_VERSION_CONFLICT", message: "The report changed; reload it and try again." });
+      const enabled = enableEmailSubscriberGrowth(draft, { now: options.now() });
+      return enabled === draft ? draft : await options.repository.save(enabled, draft.version);
+    } catch (error) {
+      return reply.code(error instanceof ReportPersistenceError && error.code === "REPORT_VERSION_CONFLICT" ? 409 : 400).send({ error: error instanceof ReportPersistenceError || error instanceof ReportDomainError ? error.code : "SUBSCRIBER_GROWTH_ENABLE_FAILED", message: error instanceof Error ? error.message : "Subscriber Growth could not be enabled." });
+    }
+  });
   app.post("/automatic-capture-runs", async (request, reply) => {
     try {
       if (!options.persistentStorage) return reply.code(503).send({ error: "LOCAL_ACCEPTANCE_REQUIRES_PERSISTENT_STORAGE", message: "Local automatic-capture diagnostics require PostgreSQL and filesystem storage." });
@@ -67,14 +83,15 @@ export const localDevelopmentRoutes: FastifyPluginAsync<RouteOptions> = async (a
       if (builtExtension && input.extensionBuild !== builtExtension) return reply.code(409).send({ error: "EXTENSION_BUILD_STALE", message: `Chrome is running extension build ${input.extensionBuild ?? "(unstamped)"}, but the built extension is ${builtExtension}. Reload the extension in chrome://extensions, reopen the panel, and start again.`, runningBuild: input.extensionBuild ?? null, builtExtension });
       const directory = automaticRunDirectory(options.repositoryRoot, input.runId);
       await mkdir(join(directory, "sections"), { recursive: true });
-      const run = { kind: "tention_local_automatic_capture", runId: input.runId, extensionBuild: input.extensionBuild ?? null, reportId: report.id, clientId: report.client.id, clientName: report.client.name, timezone: report.client.timezone, reportMonth: report.reportMonth, period: report.period, status: "running", startedAt: input.startedAt, finishedAt: null, durationMs: null, currentStep: null, sections: [] };
+      if (input.mode === "resume" && !input.plannedSections?.length) return reply.code(400).send({ error: "INVALID_AUTOMATIC_RUN", message: "A resume run must list its planned sections." });
+      const run = { kind: "tention_local_automatic_capture", runId: input.runId, extensionBuild: input.extensionBuild ?? null, mode: input.mode ?? "full", ...(input.mode === "resume" ? { plannedSections: input.plannedSections } : {}), reportId: report.id, clientId: report.client.id, clientName: report.client.name, timezone: report.client.timezone, reportMonth: report.reportMonth, period: report.period, status: "running", startedAt: input.startedAt, finishedAt: null, durationMs: null, currentStep: null, sections: [] };
       await writeFile(join(directory, "results.json"), `${JSON.stringify(run, null, 2)}\n`, { flag: "wx" });
       return reply.code(201).send(run);
     } catch (error) { return reply.code(400).send({ error: "INVALID_AUTOMATIC_RUN", message: error instanceof Error ? error.message : "Automatic run could not be created." }); }
   });
   app.post<{ Params: { runId: string; section: string } }>("/automatic-capture-runs/:runId/sections/:section", async (request, reply) => {
     try {
-      if (!isAutomaticSection(request.params.section)) return reply.code(400).send({ error: "INVALID_AUTOMATIC_RUN_SECTION", message: "Section is not part of the supported nine-section automatic run." });
+      if (!isAutomaticSection(request.params.section)) return reply.code(400).send({ error: "INVALID_AUTOMATIC_RUN_SECTION", message: "Section is not part of the supported automatic run." });
       const input = autoRunSection.parse(request.body);
       const file = automaticRunFile(options.repositoryRoot, request.params.runId);
       const run = await readAutomaticRun(file, request.params.runId);
@@ -104,6 +121,7 @@ export const localDevelopmentRoutes: FastifyPluginAsync<RouteOptions> = async (a
           || input.sourceProofResult !== "PASS" || input.screenshotResult !== "fresh_semantic_crop_saved"
           || !input.sha256 || !evidence || evidence.sha256 !== input.sha256
           || !periodVerified
+          || (request.params.section === "email_subscriber_growth" && (report.sections.email_subscriber_growth === undefined || !matchesReportCaptureSpec("email_subscriber_growth", input.diagnostics?.sourceProof as never)))
           || (rowLimit !== null && (usableRows < 1 || includedRows !== Math.min(rowLimit, usableRows)))) {
           return reply.code(409).send({ error: "AUTOMATIC_RUN_PASS_NOT_VERIFIED", message: "The section cannot pass until matching fresh evidence, source identity, period, and required rows are confirmed." });
         }
@@ -315,7 +333,7 @@ async function loadPendingImport(repository: ReportDraftRepository, storage: Scr
   if (!screenshot || screenshot.clientId !== draft.client.id || screenshot.reportMonth.year !== draft.reportMonth.year || screenshot.reportMonth.month !== draft.reportMonth.month
     || screenshot.captureOrigin !== "live_acceptance_import" || screenshot.approved || screenshot.approvedAt !== null || !screenshot.storageKey
     || screenshot.mimeType !== "image/png" || !screenshot.sha256 || !screenshot.periodConfirmed || !screenshot.sourceProof) throw new Error("No pending live-acceptance screenshot is available for review.");
-  const expectedProof = createScreenshotSourceProof(type, draft.period);
+  const expectedProof = createScreenshotSourceProof(type, draft.period, undefined, null, type === "email_subscriber_growth" ? screenshot.sourceProof.subscriberGrowth ?? null : null);
   if (!matchesReportCaptureSpec(type, screenshot.sourceProof) || JSON.stringify(screenshot.sourceProof) !== JSON.stringify(expectedProof)) throw new Error("Imported screenshot source proof or period is stale or invalid.");
   if (draft.screenshots.some((candidate) => candidate.type !== type && candidate.sha256 === screenshot.sha256)) throw new Error("Imported screenshot duplicates another report section.");
   const asset = await storage.get(screenshot.storageKey);
@@ -325,7 +343,7 @@ async function loadPendingImport(repository: ReportDraftRepository, storage: Scr
   return { draft, screenshot, bytes: asset.bytes };
 }
 
-const automaticSections = new Set(["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"]);
+const automaticSections = new Set(["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability", "email_subscriber_growth"]);
 function isAutomaticSection(value: string): boolean { return automaticSections.has(value); }
 function automaticRunDirectory(root: string, runId: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(runId)) throw new Error("Diagnostic run ID is invalid.");

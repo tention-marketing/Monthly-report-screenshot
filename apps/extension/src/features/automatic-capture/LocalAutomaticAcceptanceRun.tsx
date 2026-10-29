@@ -10,7 +10,13 @@ import type { DashboardTargetBounds } from "../klaviyo-navigation/dashboard-capt
 import { TOP_CAMPAIGN_ROW_COUNT } from "../klaviyo-navigation/campaigns-capture.js";
 import { classifyFailure, recoveryPlan, type RecoveryAction } from "./recovery-policy.js";
 
-interface Props { api: ApiClient; report: ReportDraft; targets: ClientReportTargets | null; plan: ChecklistItem[]; service: AutoCaptureService; onClose(report?: ReportDraft): void }
+interface Props {
+  api: ApiClient; report: ReportDraft; targets: ClientReportTargets | null; plan: ChecklistItem[]; service: AutoCaptureService; onClose(report?: ReportDraft): void;
+  /** "resume" captures only `plan` (missing/stale sections) and keeps every other valid capture on the report. */
+  mode?: "full" | "resume";
+  /** The report's full automatic section list, for "10/10"-style numbering during a resume. */
+  allSections?: ChecklistItem[];
+}
 type Result = { section: string; label: string; status: "pending" | "running" | "PASS" | "FAIL"; phase: "Preparing" | "Capturing"; durationMs: number | null; attempt: number; error: string | undefined };
 type Target = BusinessReviewTargetBounds | DashboardTargetBounds;
 // Transient page states (loading, rendering, filter applying, stale DOM, layout shifts, capture hiccups) get
@@ -25,10 +31,12 @@ const semantic: Partial<Record<ScreenshotType, { card: string; view: string | nu
   top_flows: { card: "Top performing flows", view: "Default" }, month_comparison: { card: "Growth overview", view: "Message type breakdown" },
   campaign_performance: { card: "Campaign Performance Summary", view: "Overview" }, campaign_metrics: { card: "Campaign Performance Summary", view: "Metrics" },
   flow_performance: { card: "Flow Performance Summary", view: "Overview" }, flow_metrics: { card: "Flow Performance Summary", view: "Metrics" }, deliverability: { card: "Deliverability Score", view: "Email" },
+  email_subscriber_growth: { card: "Subscriber growth", view: "Email → Growth" },
 };
 
 /** Local acceptance uses the real toolbar-authorized capture controllers but stores evidence outside canonical screenshots. */
-export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, service, onClose }: Props) {
+export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, service, onClose, mode = "full", allSections = plan }: Props) {
+  const position = (section: string) => `${allSections.findIndex((item) => item.screenshotType === section) + 1}/${allSections.length}`;
   const [results, setResults] = useState<Result[]>(() => plan.map((item) => ({ section: item.screenshotType!, label: item.label, status: "pending", phase: "Preparing", durationMs: null, attempt: 0, error: undefined })));
   const [runId, setRunId] = useState<string | null>(null);
   const [running, setRunning] = useState(true);
@@ -54,7 +62,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
       // the panel's build stamp alone does not prove which page adapters will run.
       const workerBuild = service.getExtensionBuild ? await service.getExtensionBuild() : EXTENSION_BUILD;
       if (workerBuild !== EXTENSION_BUILD) throw new Error(`The extension service worker is running build ${workerBuild ?? "(unknown)"}, but this panel is build ${EXTENSION_BUILD}. Reload the extension in chrome://extensions, reopen the panel, and start again.`);
-      await api.startLocalAutomaticCaptureRun({ runId: id, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: runStartedAt.toISOString(), extensionBuild: EXTENSION_BUILD });
+      await api.startLocalAutomaticCaptureRun({ runId: id, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: runStartedAt.toISOString(), extensionBuild: EXTENSION_BUILD, ...(mode === "resume" ? { mode, plannedSections: plan.map((item) => item.screenshotType!) } : {}) });
       // Capture states (each holding a full-viewport screenshot) left by earlier sections, runs, or months are released.
       await service.clearAll?.().catch(() => undefined);
     } catch (error) { setRunError(errorMessage(error, "Local acceptance diagnostics could not be started.")); setRunning(false); return; }
@@ -125,6 +133,11 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           if (type === "top_campaigns") {
             if (!state.campaignsEvidence) throw Object.assign(new Error("The Campaigns adapter returned no Top Campaigns evidence."), { code: "TOP_CAMPAIGNS_EVIDENCE_MISSING" });
             proof = createScreenshotSourceProof(type, report.period, undefined, state.campaignsEvidence);
+          }
+          // Section 10 proof carries the adapter's exact Email → Growth counts and chart proof.
+          if (type === "email_subscriber_growth") {
+            if (!state.subscriberGrowthEvidence) throw Object.assign(new Error("The Subscriber growth adapter returned no Email → Growth evidence."), { code: "SUBSCRIBER_GROWTH_EVIDENCE_MISSING" });
+            proof = createScreenshotSourceProof(type, report.period, undefined, null, state.subscriberGrowthEvidence);
           }
           const proofShape = screenshotSourceProofSchema.safeParse(proof);
           if (!proofShape.success) throw Object.assign(new Error(`Source proof failed schema validation: ${proofShape.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")}`), { code: "SOURCE_PROOF_SCHEMA_INVALID", permanent: true });
@@ -226,8 +239,8 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
     try {
       await api.finishLocalAutomaticCaptureRun(id, { status: persistedPassCount === plan.length ? "completed" : "failed", finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - runStart) });
       if (persistedPassCount === plan.length) {
-        setRunError("All nine sections passed, but canonical report persistence is still being confirmed.");
-        const persisted = await api.importLocalAutomaticCaptureRun(id, report);
+        setRunError(`All ${plan.length} sections passed, but canonical report persistence is still being confirmed.`);
+        const persisted = await api.importLocalAutomaticCaptureRun(id, report, mode === "resume" ? plan.map((item) => item.screenshotType!) : undefined);
         setCanonicalReport(persisted);
         setRunError(null);
       }
@@ -239,7 +252,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
 
   const passed = results.filter(({ status }) => status === "PASS").length;
   const current = results.find(({ status }) => status === "running");
-  const confirmedCaptures = canonicalReport ? plan.flatMap((item) => {
+  const confirmedCaptures = canonicalReport ? allSections.flatMap((item) => {
     const type = item.screenshotType;
     const screenshot = type ? canonicalReport.screenshots.find((record) => record.type === type) : undefined;
     return screenshot && type && matchesReportCaptureSpec(type, screenshot.sourceProof)
@@ -251,11 +264,11 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
   return <main className="capture-workflow"><section className="card" aria-live="polite">
     <p className="kicker">Local live acceptance</p><h1>{running ? "Automatic capture running" : paused ? "Automatic capture paused" : "Automatic capture finished"}</h1><p className="support-copy">Extension build {EXTENSION_BUILD}</p>
     {!running && <h2>AUTOMATIC CAPTURE RESULTS</h2>}
-    <p className="support-copy">{running ? "The extension completes and confirms each section before starting the next. Existing report screenshots are not replaced; fresh evidence is staged for verified canonical persistence." : paused ? `${results.find(({ status }) => status === "FAIL")?.label ?? "The current section"} needs attention. Later sections were not started.` : passed === 9 && canonicalReport ? "All nine captures are saved to this report and awaiting review." : passed === 9 ? "All nine sections passed, but canonical report persistence was not confirmed. The report checklist remains unchanged." : "Automatic capture finished."}</p>
-    {current && <p role="status" className="notice">{results.indexOf(current) + 1}/{plan.length} {current.label} — {current.phase} (attempt {current.attempt}/{MAX_ATTEMPTS})…</p>}
+    <p className="support-copy">{running ? "The extension completes and confirms each section before starting the next. Existing report screenshots are not replaced; fresh evidence is staged for verified canonical persistence." : paused ? `${results.find(({ status }) => status === "FAIL")?.label ?? "The current section"} needs attention. Later sections were not started.` : passed === plan.length && canonicalReport ? `All ${allSections.length} captures are saved to this report and awaiting review.` : passed === plan.length ? `All ${plan.length} sections passed, but canonical report persistence was not confirmed. The report checklist remains unchanged.` : "Automatic capture finished."}</p>
+    {current && <p role="status" className="notice">{position(current.section)} {current.label} — {current.phase} (attempt {current.attempt}/{MAX_ATTEMPTS})…</p>}
     {runId && <p className="support-copy">Diagnostic run ID: <code>{runId}</code></p>}
-    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{index + 1}/9 {result.label}</strong><small>{result.status === "pending" ? "Not started" : result.status === "running" ? `${result.phase} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
-    {!running && <p role="status" className="notice">Fresh captures: {passed} / {plan.length} successful · {canonicalReport ? `${confirmedCaptures.length} captured · ${confirmedPending} pending review · ${confirmedApproved} approved · ${plan.length - confirmedCaptures.length} missing` : "canonical persistence not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
+    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Not started" : result.status === "running" ? `${result.phase} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
+    {!running && <p role="status" className="notice">Fresh captures: {passed} / {plan.length} successful · {canonicalReport ? `${confirmedCaptures.length} / ${allSections.length} captured · ${confirmedPending} pending review · ${confirmedApproved} approved · ${allSections.length - confirmedCaptures.length} missing` : "canonical persistence not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
     {runError && <p role="alert" className="notice error-notice">{runError}</p>}
     {!running && <button className="secondary" onClick={() => onClose(canonicalReport ?? undefined)}>Back to report</button>}
   </section></main>;

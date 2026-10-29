@@ -5,10 +5,12 @@ import { buildReportChecklist, type ChecklistItem } from "../report-checklist/ch
 const runnerSectionOrder = [
   "executive_summary", "top_flows", "top_campaigns", "month_comparison",
   "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability",
+  "email_subscriber_growth",
 ] as const;
 const automaticCaptureTypes = new Set([
   "overview", "top_campaigns", "top_flows", "month_comparison",
   "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability",
+  "email_subscriber_growth",
 ]);
 
 export interface ReportRunnerState {

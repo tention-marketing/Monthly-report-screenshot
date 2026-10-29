@@ -49,8 +49,11 @@ export async function buildReportDocumentModel(report: ReportDraft, screenshotSt
       continue;
     }
     // Rolling provider views (e.g. Deliverability Score) are not calendar-month data; say so beside the image.
+    const growth = screenshot.type === "email_subscriber_growth" ? screenshot.sourceProof?.subscriberGrowth : undefined;
     const periodNote = reportCaptureSpecByScreenshotType[screenshot.type].datePolicy === "ROLLING_30_DAY"
       ? `Klaviyo rolling last-30-days view as of ${formatInstant(screenshot.capturedAt, report.client.timezone)}; not limited to ${formatMonth(report.reportMonth.year, report.reportMonth.month)}.`
+      // Section 10 states its exact month and the exact counts its adapter read from the page (never from pixels).
+      : growth ? `${formatRange(report.period.startDate, report.period.endDate)} · Email subscribers ${formatCount(growth.emailSubscribers)} · New subscribers ${formatCount(growth.newSubscribers)} · Exclusions ${formatCount(growth.exclusions)}`
       : null;
     included.set(section, { key: section, required: report.sections[section] === "required", width: screenshot.width, height: screenshot.height, imageDataUrl: `data:image/png;base64,${asset.bytes.toString("base64")}`, periodNote });
   }
@@ -114,6 +117,7 @@ function isRenderable(screenshot: ScreenshotRecord): screenshot is ScreenshotRec
 function fingerprint(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 function escape(value: string): string { return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!); }
 function formatInstant(value: string, timeZone: string): string { return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone }).format(new Date(value)); }
+function formatCount(value: number): string { return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(value); }
 function formatMonth(year: number, month: number): string { return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(year, month - 1, 1))); }
 function formatRange(start: string, end: string): string { const date = (value: string) => new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(`${value}T00:00:00Z`)); return `${date(start)} - ${date(end)}`; }
 function formatTitle(start: string, end: string): string {

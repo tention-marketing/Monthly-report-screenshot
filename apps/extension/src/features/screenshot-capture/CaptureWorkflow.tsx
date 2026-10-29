@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ApiError, type ApiClient } from "@tention/api-client";
-import { createScreenshotSourceProof, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { createScreenshotSourceProof, type ClientReportTargets, type ReportDraft, type ScreenshotType, type SubscriberGrowthEvidence } from "@tention/report-schema";
 import { formatCalendarRange } from "../../lib/dates/month-options.js";
 import type { CaptureService, ActiveCaptureTab, CapturedImage } from "./capture-service.js";
 import { mapDisplayedCropToImage, mapViewportCropToImage, selectionFromDrag, type CropRectangle } from "./crop-geometry.js";
@@ -59,6 +59,7 @@ export function CaptureWorkflow({
   const [detectedPeriod, setDetectedPeriod] = useState<string | null>(null);
   const [automaticTarget, setAutomaticTarget] = useState<BusinessReviewTargetBounds | DashboardTargetBounds | CampaignTargetBounds | null>(null);
   const [campaignsEvidence, setCampaignsEvidence] = useState<CampaignsEvidence | null>(null);
+  const [subscriberGrowthEvidence, setSubscriberGrowthEvidence] = useState<SubscriberGrowthEvidence | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [navigationMessage, setNavigationMessage] = useState<string | null>(null);
@@ -93,7 +94,7 @@ export function CaptureWorkflow({
     if (state.stage === "review_ready") {
       setAutomaticFailure(false);
       setCaptured(state.captured); setSelection(null); setCroppedImage(null); setCroppedSize(null);
-      setPeriodConfirmed(true); setDetectedPeriod(state.detectedPeriod); setAutomaticTarget(state.target); setCampaignsEvidence(state.campaignsEvidence ?? null); setStage("crop");
+      setPeriodConfirmed(true); setDetectedPeriod(state.detectedPeriod); setAutomaticTarget(state.target); setCampaignsEvidence(state.campaignsEvidence ?? null); setSubscriberGrowthEvidence(state.subscriberGrowthEvidence ?? null); setStage("crop");
     }
   }
 
@@ -238,7 +239,7 @@ export function CaptureWorkflow({
         expectedVersion: report.version, periodConfirmed: true,
         sourceUrl: captured.sourceUrl,
         sourceProof: createScreenshotSourceProof(screenshotType, report.period, screenshotType === "signup_form" ? { scope: "all_forms" }
-          : screenshotType === "welcome_flow" ? { scope: "email_welcome_flows", entities: clientTargets?.welcomeFlowListing?.flows ?? [] } : undefined, screenshotType === "top_campaigns" ? campaignsEvidence : null),
+          : screenshotType === "welcome_flow" ? { scope: "email_welcome_flows", entities: clientTargets?.welcomeFlowListing?.flows ?? [] } : undefined, screenshotType === "top_campaigns" ? campaignsEvidence : null, screenshotType === "email_subscriber_growth" ? subscriberGrowthEvidence : null),
         image: croppedImage,
       });
       operation = "GET canonical draft";

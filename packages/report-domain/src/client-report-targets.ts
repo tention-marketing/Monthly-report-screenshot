@@ -26,17 +26,23 @@ const reportSectionByCaptureSection: Readonly<Record<ReportCaptureSectionKey, st
   executive_summary: "executive_summary", month_comparison: "month_comparison", top_campaigns: "top_campaigns", top_flows: "top_flows",
   campaign_performance: "campaign_performance", campaign_metrics: "campaign_metrics", flow_performance: "flow_performance", flow_metrics: "flow_metrics",
   signup_form_performance: "signup_form", welcome_flow_performance: "welcome_flow", customer_split: "customer_split", deliverability: "deliverability", list_growth: "list_growth",
+  email_subscriber_growth: "email_subscriber_growth",
 };
 const targetRequirements: Partial<Record<ReportCaptureSectionKey, readonly string[]>> = {
   signup_form_performance: ["signupForms"],
   welcome_flow_performance: ["welcomeFlowListing"],
   customer_split: ["customerSegment", "nonCustomerSegment"],
   deliverability: ["deliverabilityUrl"],
+  email_subscriber_growth: ["subscriberGrowthUrl"],
 };
 
 export function getReportReadiness(targets: ClientReportTargets, sections: SectionConfiguration): ReportReadiness {
   const result: ReportReadinessSection[] = REPORT_CAPTURE_SPEC_V1.map((spec) => {
     const configuredRequirement = sections[reportSectionByCaptureSection[spec.key]];
+    // A section added after the nine-section core belongs only to reports that list it.
+    if (spec.reportOptIn && (configuredRequirement === undefined || configuredRequirement === "disabled")) {
+      return { sectionKey: spec.key, required: false, status: "not_applicable", reason: "This section is not enabled for this report.", requiredTargets: [] };
+    }
     // The nine automated current-product captures are core evidence. Older
     // drafts may still say optional for two of them, but that legacy setting
     // must not make a current report look final-ready.
@@ -75,6 +81,7 @@ function isConfiguredTarget(targets: ClientReportTargets, target: string): boole
     case "customerSegment": return Boolean(targets.customerSegment?.id || targets.customerSegment?.name);
     case "nonCustomerSegment": return Boolean(targets.nonCustomerSegment?.id || targets.nonCustomerSegment?.name);
     case "deliverabilityUrl": return Boolean(targets.sourceUrls?.deliverabilityUrl);
+    case "subscriberGrowthUrl": return Boolean(targets.sourceUrls?.subscriberGrowthUrl);
     case "primaryEmailList": return Boolean(targets.primaryEmailList?.id || targets.primaryEmailList?.name);
     default: return false;
   }

@@ -234,3 +234,65 @@ describe("local automatic-capture acceptance diagnostics", () => {
     expect(badEvidence.statusCode).toBe(400);
   });
 });
+
+describe("Section 10 and the retired List Growth route", () => {
+  const sections = { executive_summary: "required", top_campaigns: "required", top_flows: "required", month_comparison: "required", campaign_performance: "required", flow_performance: "required", deliverability: "required", campaign_metrics: "required", flow_metrics: "required" } as const;
+  const makeDraft = (extra: Record<string, "required" | "optional"> = {}, id = "d1234567-1234-4234-8234-123456789012") => createReportDraft({ client: { id: "club-furniture", name: "Club Furniture", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, sections: { ...sections, ...extra } }, { id, now: new Date("2026-10-10T07:00:00Z") });
+
+  it("still retires legacy List Growth exactly as before and never adds Subscriber Growth", async () => {
+    const repository = new InMemoryReportDraftRepository();
+    await repository.create(makeDraft({ list_growth: "optional" }));
+    const app = buildApp({ repository, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true }); apps.push(app);
+    const response = await app.inject({ method: "POST", url: "/api/v1/dev/retire-list-growth" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ retiredCount: 1 });
+    const saved = await repository.getById("d1234567-1234-4234-8234-123456789012");
+    expect(saved?.sections).not.toHaveProperty("list_growth");
+    expect(saved?.sections).not.toHaveProperty("email_subscriber_growth");
+  });
+
+  it("enables Subscriber Growth on an existing draft only by explicit, version-checked request", async () => {
+    const repository = new InMemoryReportDraftRepository();
+    await repository.create(makeDraft());
+    const app = buildApp({ repository, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true }); apps.push(app);
+    const url = "/api/v1/dev/report-drafts/d1234567-1234-4234-8234-123456789012/sections/email_subscriber_growth/enable";
+    const wrong = await app.inject({ method: "POST", url, payload: { expectedVersion: 99 } });
+    expect(wrong.statusCode).toBe(409); expect(wrong.json()).toMatchObject({ error: "REPORT_VERSION_CONFLICT" });
+    const enabled = await app.inject({ method: "POST", url, payload: { expectedVersion: 1 } });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toMatchObject({ version: 2, sections: { ...sections, email_subscriber_growth: "required" } });
+    // Enabling incremented the version: the old version is now stale and still conflicts; the returned one succeeds.
+    const stale = await app.inject({ method: "POST", url, payload: { expectedVersion: 1 } });
+    expect(stale.statusCode).toBe(409); expect(stale.json()).toMatchObject({ error: "REPORT_VERSION_CONFLICT" });
+    const current = await app.inject({ method: "POST", url, payload: { expectedVersion: enabled.json().version } });
+    expect(current.statusCode).toBe(200); expect(current.json()).toMatchObject({ version: 2 });
+    expect((await app.inject({ method: "POST", url: "/api/v1/dev/report-drafts/00000000-0000-4000-8000-000000000000/sections/email_subscriber_growth/enable", payload: { expectedVersion: 1 } })).statusCode).toBe(404);
+  });
+
+  it("refuses to pass a Subscriber Growth section for a report that does not include it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tention-subscriber-growth-route-")); temporaryRoots.push(root);
+    const repository = new InMemoryReportDraftRepository();
+    const report = makeDraft(); await repository.create(report);
+    const app = buildApp({ repository, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true, repositoryRoot: root }); apps.push(app);
+    const runId = "0f6b2a51-6d4f-4c3e-9a1b-2c3d4e5f6a7b";
+    const start = { runId, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: "2026-10-10T07:00:00.000Z" };
+    // A resume run must declare which sections it captures.
+    expect((await app.inject({ method: "POST", url: "/api/v1/dev/automatic-capture-runs", payload: { ...start, mode: "resume" } })).statusCode).toBe(400);
+    expect((await app.inject({ method: "POST", url: "/api/v1/dev/automatic-capture-runs", payload: { ...start, mode: "resume", plannedSections: ["email_subscriber_growth"] } })).json()).toMatchObject({ mode: "resume", plannedSections: ["email_subscriber_growth"] });
+    const bytes = Buffer.alloc(25); Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes); bytes.writeUInt32BE(13, 8); bytes.write("IHDR", 12, "ascii"); bytes.writeUInt32BE(100, 16); bytes.writeUInt32BE(80, 20);
+    const running = { status: "running", attemptNumber: 1, startedAt: "2026-10-10T07:00:01.000Z", finishedAt: null, durationMs: null, expectedUrl: null, observedUrl: null, expectedSourceIdentity: null, observedSourceIdentity: null, expectedPeriod: null, observedPeriod: null, expectedSemanticCard: null, expectedView: null, visibleControls: [], usableRowCount: null, screenshotResult: "pending", sourceProofResult: "pending", sha256: null, errorCode: null, errorMessage: null, diagnostics: null };
+    expect((await app.inject({ method: "POST", url: `/api/v1/dev/automatic-capture-runs/${runId}/sections/email_subscriber_growth`, payload: running })).statusCode).toBe(200);
+    const evidence = await app.inject({ method: "PUT", url: `/api/v1/dev/automatic-capture-runs/${runId}/sections/email_subscriber_growth/evidence/capture?attempt=1`, headers: { "content-type": "image/png" }, payload: bytes });
+    expect(evidence.statusCode).toBe(200);
+    const period = report.period;
+    const proof = createScreenshotSourceProof("email_subscriber_growth", period, undefined, null, { channel: "email", view: "growth", emailSubscribers: 17698, newSubscribers: 943, exclusions: 499, changes: { emailSubscribers: null, newSubscribers: null, exclusions: null }, charts: { subscriberGrowthLine: true, newSubscribersExclusionsBar: true }, visiblePeriodText: "Aug 1 – Aug 31, 2026" });
+    const pass = { status: "pass", attemptNumber: 1, startedAt: "2026-10-10T07:00:01.000Z", finishedAt: "2026-10-10T07:00:02.000Z", durationMs: 1000, expectedUrl: "https://www.klaviyo.com/configured", observedUrl: "https://www.klaviyo.com/configured", expectedSourceIdentity: "klaviyo-subscriber-growth|email|growth", observedSourceIdentity: "klaviyo-subscriber-growth|email|growth", expectedPeriod: { startDate: period.startDate, endDate: period.endDate }, observedPeriod: "Aug 1 – Aug 31, 2026", expectedSemanticCard: "Subscriber growth", expectedView: "Email → Growth", visibleControls: [], usableRowCount: null, screenshotResult: "fresh_semantic_crop_saved", sourceProofResult: "PASS", sha256: evidence.json().sha256, errorCode: null, errorMessage: null, diagnostics: { sourceProof: proof, observedPeriodProof: { startDate: period.startDate, endDate: period.endDate } } };
+    const url = `/api/v1/dev/automatic-capture-runs/${runId}/sections/email_subscriber_growth`;
+    // Evidence attaches only to an existing section record, which is why the "running" record above is posted first.
+    const notIncluded = await app.inject({ method: "POST", url, payload: pass });
+    expect(notIncluded.statusCode).toBe(409); expect(notIncluded.json()).toMatchObject({ error: "AUTOMATIC_RUN_PASS_NOT_VERIFIED" });
+    await repository.save({ ...report, sections: { ...report.sections, email_subscriber_growth: "required" }, version: 2 }, 1);
+    expect((await app.inject({ method: "POST", url, payload: { ...pass, diagnostics: { ...pass.diagnostics, sourceProof: createScreenshotSourceProof("email_subscriber_growth", period) } } })).statusCode).toBe(409);
+    expect((await app.inject({ method: "POST", url, payload: pass })).statusCode).toBe(200);
+  });
+});

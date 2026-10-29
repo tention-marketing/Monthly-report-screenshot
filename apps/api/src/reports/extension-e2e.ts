@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type BrowserContext, type Download, type Page, type Response } from "playwright";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
-import { matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1 } from "@tention/report-schema";
+import { automaticCaptureTypesForSections, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1 } from "@tention/report-schema";
 import { extensionE2eIgnoreDefaultArgs, extensionE2eLaunchArgs } from "./extension-e2e-browser.js";
 import { EXTENSION_E2E_TARGETS, findCanonicalE2eDrafts, findRecentReportCardsForIdentity, selectExtensionE2eTarget, type ExtensionE2eDraftIdentity } from "./extension-e2e-contract.js";
 
@@ -23,7 +23,7 @@ const evidenceDirectory = join(repositoryRoot, "output/extension-e2e", stamp);
 const downloadsDirectory = join(evidenceDirectory, "downloads");
 const profileDirectory = join(evidenceDirectory, "chrome-profile");
 const canonicalEndpoint = `${API_V1}/report-drafts/${REPORT_ID}`;
-const requiredTypes = new Set(REPORT_CAPTURE_SPEC_V1.map(({ screenshotType }) => screenshotType));
+const requiredTypes = new Set(REPORT_CAPTURE_SPEC_V1.filter(({ reportOptIn }) => !reportOptIn).map(({ screenshotType }) => screenshotType));
 
 /** A historical import can remain stored, but the UI must not offer approval
  * when its source proof no longer satisfies the current capture contract. */
@@ -222,11 +222,13 @@ try {
     if (!response.ok) throw new Error(`Canonical report GET returned HTTP ${response.status}.`);
     const draft = await response.json() as any;
     if (draft.id !== REPORT_ID || draft.client.id !== CLIENT_ID || draft.client.name !== TARGET.clientName || draft.client.timezone !== TARGET.timezone || draft.reportMonth.year !== YEAR || draft.reportMonth.month !== MONTH) throw new Error("Canonical report identity, timezone, or month does not match the E2E contract.");
-    if (draft.screenshots.length !== 9 || draft.screenshots.some((shot: any) => shot.captureOrigin !== "live_acceptance_import")) throw new Error("The report does not contain exactly the nine expected live acceptance imports.");
+    // Nine core imports, or ten when this report includes Section 10 (Subscriber Growth).
+    const expectedImports = automaticCaptureTypesForSections(draft.sections).length;
+    if (draft.screenshots.length !== expectedImports || draft.screenshots.some((shot: any) => shot.captureOrigin !== "live_acceptance_import")) throw new Error(`The report does not contain exactly the ${expectedImports} expected live acceptance imports.`);
     const hashes = draft.screenshots.map((shot: any) => shot.sha256).filter((hash: unknown): hash is string => typeof hash === "string");
-    if (hashes.length !== 9 || new Set(hashes).size !== 9) throw new Error("The canonical imported screenshot records have missing or duplicate SHA-256 values.");
+    if (hashes.length !== expectedImports || new Set(hashes).size !== expectedImports) throw new Error("The canonical imported screenshot records have missing or duplicate SHA-256 values.");
     return draft;
-  }, (draft) => ({ expected: { reportId: REPORT_ID, clientId: CLIENT_ID, timezone: TARGET.timezone, month: `${YEAR}-${String(MONTH).padStart(2, "0")}`, importedCaptures: 9 }, observed: { reportId: draft.id, clientId: draft.client.id, timezone: draft.client.timezone, month: `${draft.reportMonth.year}-${String(draft.reportMonth.month).padStart(2, "0")}`, captures: draft.screenshots.length } }));
+  }, (draft) => ({ expected: { reportId: REPORT_ID, clientId: CLIENT_ID, timezone: TARGET.timezone, month: `${YEAR}-${String(MONTH).padStart(2, "0")}`, importedCaptures: automaticCaptureTypesForSections(draft.sections).length }, observed: { reportId: draft.id, clientId: draft.client.id, timezone: draft.client.timezone, month: `${draft.reportMonth.year}-${String(draft.reportMonth.month).padStart(2, "0")}`, captures: draft.screenshots.length } }));
 
   initialVersion = canonicalResponse.version;
   await step("Open canonical report from extension", async () => {
@@ -279,7 +281,7 @@ try {
     if (!pendingToInspect) {
       if (hadPendingReviewAtStart) throw new Error("Pending-review state changed unexpectedly before the review step.");
       await snap(extensionPage!, "review-screen");
-      return { reviewNeeded: false, reason: "all nine canonical captures were already approved; no approval action was invoked", screenshotType: chosen.type };
+      return { reviewNeeded: false, reason: "all canonical automatic captures were already approved; no approval action was invoked", screenshotType: chosen.type };
     }
     if (chosen.approved) {
       const anotherPending = extensionPage!.getByRole("button", { name: "Review saved capture", exact: true }).first();
@@ -352,7 +354,8 @@ try {
     if ((ack.reportId ?? ack.canonicalReportId) !== REPORT_ID || ack.developmentOnly !== true || ack.finalClientArtifact !== false || ack.reportLifecycle?.transitionedToGenerated !== false) throw new Error("PDF generation acknowledgement was not bound to this canonical development-only draft.");
     await extensionPage!.getByText(/Saved for report version/, { exact: false }).waitFor({ state: "visible", timeout: 90_000 });
     const visibleText = await extensionPage!.locator("[aria-label='Development Review PDF']").innerText();
-    if (!visibleText.includes("DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED")) throw new Error("PDF UI did not clearly label the artifact as a nine-core-section development review.");
+    // "… 9 CORE SECTIONS VERIFIED" or "… 9 CORE SECTIONS + SUBSCRIBER GROWTH VERIFIED".
+    if (!visibleText.includes("DEVELOPMENT REVIEW — 9 CORE SECTIONS")) throw new Error("PDF UI did not clearly label the artifact as a core-section development review.");
     const statusResponse = await fetch(`${API_V1}/dev/report-drafts/${REPORT_ID}/partial-review/status`);
     if (!statusResponse.ok) throw new Error(`Development PDF status returned HTTP ${statusResponse.status}.`);
     const status = await statusResponse.json() as any;
@@ -448,7 +451,7 @@ try {
     const executiveSummaryRow = reportProgressCard.locator(".runner-checklist li").filter({ hasText: "Executive Summary" });
     const expectedSummaryAction = reopened.screenshots.find((shot: any) => shot.type === "overview")?.approved ? "Retake" : "Review saved capture";
     if (await executiveSummaryRow.getByRole("button", { name: expectedSummaryAction, exact: true }).count() !== 1) throw new Error("The extension UI did not reload the saved Executive Summary review state from the canonical report.");
-    await extensionPage.getByText("DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
+    await extensionPage.getByText("DEVELOPMENT REVIEW — 9 CORE SECTIONS", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
     await extensionPage.getByText(/Saved for report version/, { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
     await snap(extensionPage, "reopened-report");
     return { cards: recentReportCards, reportHeading: await extensionPage.getByRole("heading", { name: TARGET.clientName, exact: true }).innerText(), reportId: REPORT_ID, approvedSummaryCompletedAfterReopen: true };
@@ -507,7 +510,7 @@ try {
     try { await snap(extensionPage, "failure-state"); } catch { /* preserve the original acceptance failure */ }
   }
   for (const name of [
-    "Canonical report identity and month verified", "Open canonical report from extension", "Checklist reflects nine pending imported captures", "Review one saved screenshot in the real extension",
+    "Canonical report identity and month verified", "Open canonical report from extension", "Checklist reflects every pending imported capture", "Review one saved screenshot in the real extension",
     "Approve one screenshot and verify backend acknowledgement", "Generate development review PDF from extension", "Preview Review PDF from extension",
     "Open PDF through extension control", "Download PDF through extension control and validate file",
     "Close and reopen extension UI; reopen the canonical report", "Reopen existing PDF without regenerating", "Redownload existing PDF without regenerating",

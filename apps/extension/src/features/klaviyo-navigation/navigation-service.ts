@@ -39,6 +39,7 @@ export const klaviyoNavigationTargets: Readonly<Record<ScreenshotType, KlaviyoNa
   campaign_metrics: { label: "Campaign Metrics", manualInstruction: "Open campaign metrics reporting." },
   flow_metrics: { label: "Flow Metrics", manualInstruction: "Open flow metrics reporting." },
   list_growth: { label: "Historical List Growth", manualInstruction: "This retired section is retained only to view historical records." },
+  email_subscriber_growth: { label: "Subscriber Growth", manualInstruction: "Open Audience, Profiles, View subscriber growth, then the Email tab and its Growth view, set the report month, and capture the Email Growth card with both charts. Read only; do not change profiles, lists, or suppressions." },
 };
 
 export type NavigationResult =

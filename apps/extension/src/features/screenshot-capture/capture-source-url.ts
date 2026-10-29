@@ -13,6 +13,8 @@ export function configuredAutomaticCaptureUrl(type: ScreenshotType, targets: Cli
   if (isCanonicalDashboardScreenshotType(type)) return targets?.sourceUrls?.overviewUrl ?? KLAVIYO_HOME_URL;
   if (type === "top_campaigns") return targets?.sourceUrls?.campaignsUrl ?? KLAVIYO_CAMPAIGNS_LIST_URL;
   if (type === "deliverability") return targets?.sourceUrls?.deliverabilityUrl ?? KLAVIYO_DELIVERABILITY_SCORE_URL;
+  // Subscriber Growth, like Business Review, has no fixed route: only the client's saved, discovered source is used.
+  if (type === "email_subscriber_growth") return targets?.sourceUrls?.subscriberGrowthUrl ?? null;
   // Business Review is a client-specific dashboard: only a saved, verified target is used.
   return targets?.businessReview?.dashboardUrl ?? null;
 }

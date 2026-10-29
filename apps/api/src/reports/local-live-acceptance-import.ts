@@ -221,7 +221,7 @@ async function findOrCreateCanonicalDraft(
     return existing;
   }
   const sections: SectionConfiguration = Object.fromEntries([
-    ...REPORT_CAPTURE_SPEC_V1.map((spec) => [screenshotSectionMapping[spec.screenshotType], spec.defaultRequirement] as const),
+    ...REPORT_CAPTURE_SPEC_V1.filter((spec) => !spec.reportOptIn).map((spec) => [screenshotSectionMapping[spec.screenshotType], spec.defaultRequirement] as const),
     ["analysis", "optional"], ["next_month_plan", "optional"],
   ]);
   return repository.create(createReportDraft({ client: { id: clientId, name: client.name, timezone: client.timezone, currency: null }, reportMonth, sections }, { now: timestamp }));

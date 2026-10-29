@@ -67,6 +67,17 @@ export function retireLegacyListGrowth(draft: ReportDraft, context: DomainContex
   return { ...next, validation: validateReportDraft(next, context) };
 }
 
+/**
+ * Adds Section 10 (Subscriber Growth) to an existing draft on explicit request. It never touches legacy List Growth,
+ * never migrates its evidence, and leaves every other section and screenshot unchanged.
+ */
+export function enableEmailSubscriberGrowth(draft: ReportDraft, context: DomainContext): ReportDraft {
+  if (draft.status === "generated") throw new ReportDomainError("REPORT_VALIDATION_FAILED", "A generated report cannot gain a new section.");
+  if (draft.sections.email_subscriber_growth === "required") return draft;
+  const next = { ...draft, sections: { ...draft.sections, email_subscriber_growth: "required" as const }, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
+  return { ...next, validation: validateReportDraft(next, context) };
+}
+
 export function validateReportDraft(draft: ReportDraft, context: DomainContext): ReportValidationState {
   const errors: ReportValidationIssue[] = [];
   const warnings: ReportValidationIssue[] = [];
@@ -156,6 +167,9 @@ function validateSourceProof(screenshot: ScreenshotRecord, spec: ReportCaptureSp
   if (screenshot.type === "top_campaigns" && (!screenshot.sourceUrl || !isCampaignsListUrl(screenshot.sourceUrl))) {
     issue("SCREENSHOT_SOURCE_URL_MISMATCH", "error", "Top Campaigns evidence must come from the Klaviyo Campaigns listing (/omnicampaigns).", { screenshotType: screenshot.type });
   }
+  if (screenshot.type === "email_subscriber_growth" && (!screenshot.sourceUrl || !isKlaviyoHttpsUrl(screenshot.sourceUrl))) {
+    issue("SCREENSHOT_SOURCE_URL_MISMATCH", "error", "Subscriber Growth evidence must come from the Klaviyo Subscriber growth page.", { screenshotType: screenshot.type });
+  }
   if (spec.sourceFamily === "klaviyo-home" && screenshot.sourceUrl && !isKlaviyoHomeUrl(screenshot.sourceUrl)) {
     issue("SCREENSHOT_SOURCE_URL_MISMATCH", "error", `${spec.title} evidence must come from the Klaviyo Home dashboard.`, { screenshotType: screenshot.type });
   }
@@ -173,6 +187,9 @@ function isStandaloneDeliverabilityScoreUrl(sourceUrl: string | null): boolean {
     const url = new URL(sourceUrl);
     return /(^|\/)analytics\/deliverability\/email\/score\/?$/i.test(url.pathname);
   } catch { return false; }
+}
+function isKlaviyoHttpsUrl(sourceUrl: string): boolean {
+  try { const url = new URL(sourceUrl); return url.protocol === "https:" && (url.hostname === "klaviyo.com" || url.hostname.endsWith(".klaviyo.com")); } catch { return false; }
 }
 function isCampaignsListUrl(sourceUrl: string): boolean {
   try { return /^\/omnicampaigns\/?$/i.test(new URL(sourceUrl).pathname); } catch { return false; }

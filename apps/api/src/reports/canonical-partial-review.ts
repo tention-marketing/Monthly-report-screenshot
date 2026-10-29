@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ReportDomainError, validateReportDraft, type ReportDraftRepository } from "@tention/report-domain";
-import { createScreenshotSourceProof, matchesReportCaptureSpec, reportCaptureSpecByScreenshotType, screenshotSectionMapping, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { automaticCaptureTypesForSections, createScreenshotSourceProof, matchesReportCaptureSpec, reportCaptureSpecByScreenshotType, screenshotSectionMapping, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 import type { ScreenshotStorage } from "../storage/screenshot-storage.js";
 import type { PdfArtifactStorage } from "../storage/pdf-artifact-storage.js";
 import type { PdfRenderer } from "./pdf-renderer.js";
@@ -11,8 +11,8 @@ import { buildReportDocumentModel, renderReportHtml } from "./report-document.js
 import { renderPartialReviewHtml } from "./dev-partial-review.js";
 import { inspectPng } from "../storage/png.js";
 
-const REVIEW_BANNER = "DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED";
-const AUTOMATIC_TYPES: readonly ScreenshotType[] = ["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"];
+const CORE_REVIEW_BANNER = "DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED";
+const SUBSCRIBER_GROWTH_REVIEW_BANNER = "DEVELOPMENT REVIEW — 9 CORE SECTIONS + SUBSCRIBER GROWTH VERIFIED";
 const FINAL_ONLY_TYPES: readonly ScreenshotType[] = ["signup_form", "welcome_flow", "customer_split"];
 
 /** Renders a dev-only PDF from the persisted canonical draft without mutating its review lifecycle. */
@@ -28,6 +28,9 @@ export async function renderCanonicalPartialReview(options: {
   const draft = await options.repository.getById(options.reportId);
   if (!draft) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Canonical report draft was not found.");
   assert(draft.status === "draft", "development review rendering requires the unchanged draft lifecycle state");
+  // The nine core sections, plus Section 10 only when this report includes it.
+  const AUTOMATIC_TYPES: readonly ScreenshotType[] = automaticCaptureTypesForSections(draft.sections);
+  const REVIEW_BANNER = AUTOMATIC_TYPES.includes("email_subscriber_growth") ? SUBSCRIBER_GROWTH_REVIEW_BANNER : CORE_REVIEW_BANNER;
 
   const captures = draft.screenshots.filter((record) => AUTOMATIC_TYPES.includes(record.type));
   assert(captures.length === AUTOMATIC_TYPES.length && AUTOMATIC_TYPES.every((type) => captures.filter((record) => record.type === type).length === 1), "canonical report does not contain exactly one of each supported automatic capture");

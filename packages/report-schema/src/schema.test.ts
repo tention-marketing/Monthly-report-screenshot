@@ -20,15 +20,18 @@ describe("shared report schemas", () => {
   it("defines stable section requirements", () => expect(sectionRequirementSchema.options).toEqual(["required", "optional", "disabled"]));
   it("supports per-report partial section configuration", () => {
     expect(sectionConfigurationSchema.parse({ executive_summary: "required", analysis: "disabled" })).toEqual({ executive_summary: "required", analysis: "disabled" });
-    expect(reportSectionKeySchema.options).toHaveLength(15);
+    expect(reportSectionKeySchema.options).toHaveLength(16);
   });
-  it("locks the current capture specification to twelve canonical sections and stable wire types", () => {
-    expect(REPORT_CAPTURE_SPEC_V1).toHaveLength(12);
+  it("locks the current capture specification to the twelve canonical sections plus additive Section 10, with stable wire types", () => {
+    expect(REPORT_CAPTURE_SPEC_V1).toHaveLength(13);
     expect(REPORT_CAPTURE_SPEC_V1.map(({ key }) => key)).toEqual([
       "executive_summary", "month_comparison", "top_campaigns", "top_flows", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "signup_form_performance", "welcome_flow_performance", "customer_split", "deliverability",
+      "email_subscriber_growth",
     ]);
-    expect(new Set(REPORT_CAPTURE_SPEC_V1.map(({ screenshotType }) => screenshotType)).size).toBe(12);
-    expect(new Set(REPORT_CAPTURE_SPEC_V1.map(({ sourceIdentity }) => sourceIdentity)).size).toBe(12);
+    expect(new Set(REPORT_CAPTURE_SPEC_V1.map(({ screenshotType }) => screenshotType)).size).toBe(13);
+    expect(new Set(REPORT_CAPTURE_SPEC_V1.map(({ sourceIdentity }) => sourceIdentity)).size).toBe(13);
+    // Only Section 10 is opt-in per report; the frozen core never is.
+    expect(REPORT_CAPTURE_SPEC_V1.filter(({ reportOptIn }) => reportOptIn).map(({ key }) => key)).toEqual(["email_subscriber_growth"]);
     expect(REPORT_CAPTURE_SPEC_V1.find(({ key }) => key === "signup_form_performance")?.screenshotType).toBe("signup_form");
     expect(REPORT_CAPTURE_SPEC_V1.find(({ key }) => key === "welcome_flow_performance")?.screenshotType).toBe("welcome_flow");
     const identity = (key: string) => REPORT_CAPTURE_SPEC_V1.find((spec) => spec.key === key)?.sourceIdentity;
@@ -153,6 +156,7 @@ describe("Month Comparison source contract", () => {
       welcome_flow_performance: "flows|listing|email-welcome-rows",
       customer_split: "segments|configured-customer-split|overview",
       deliverability: "klaviyo-deliverability|deliverability-score|email",
+      email_subscriber_growth: "klaviyo-subscriber-growth|email|growth",
     });
   });
 });
