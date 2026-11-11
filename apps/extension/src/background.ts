@@ -1,4 +1,5 @@
 import type { AutoCaptureStateStore } from "./features/automatic-capture/auto-capture-controller.js";
+import { KLAVIYO_CAPTURE_RUN_PORT, KlaviyoViewportNormalizer, type ViewportScriptingApi, type ZoomTabsApi } from "./features/automatic-capture/klaviyo-viewport.js";
 import { BusinessReviewAutoCaptureController } from "./features/automatic-capture/business-review-auto-capture-controller.js";
 import { DashboardAutoCaptureController } from "./features/automatic-capture/dashboard-auto-capture-controller.js";
 import { DeliverabilityScoreAutoCaptureController } from "./features/automatic-capture/deliverability-score-auto-capture-controller.js";
@@ -17,6 +18,7 @@ import { ChromeSubscriberGrowthNavigation } from "./features/klaviyo-navigation/
 import { isSubscriberGrowthScreenshotType } from "./features/klaviyo-navigation/subscriber-growth-capture.js";
 import { SUBSCRIBER_GROWTH_SOURCE_DIAGNOSTICS_KEY, SubscriberGrowthSourceSetup } from "./features/klaviyo-navigation/subscriber-growth-source-setup.js";
 import { SourceSetupGate } from "./features/klaviyo-navigation/source-setup-gate.js";
+import { ConversionMetricSourceSetup, DeliverabilitySourceVerifier, klaviyoMetricIdFromUrl } from "./features/klaviyo-navigation/client-setup-sources.js";
 import { ChromeCaptureService } from "./features/screenshot-capture/capture-service.js";
 import { boundedDiagnostics, releaseObsoleteTransientState, sessionUsage } from "./lib/chrome/session-storage.js";
 import {
@@ -34,6 +36,7 @@ import {
 
 interface ChromeRuntimeApi {
   onMessage: { addListener(listener: (message: unknown, sender: unknown, sendResponse: (response: unknown) => void) => boolean | void): void };
+  onConnect?: { addListener(listener: (port: { name: string; onDisconnect: { addListener(listener: () => void): void } }) => void): void };
   onInstalled?: { addListener(listener: () => void): void };
 }
 interface ChromeActionApi { onClicked: { addListener(listener: (tab: ChromeActionTab) => void): void } }
@@ -47,7 +50,8 @@ interface BackgroundChromeApi {
   storage?: { session?: ChromeStorageSession };
   action?: ChromeActionApi;
   sidePanel?: ChromeSidePanelApi;
-  tabs?: KlaviyoGrantTabsApi & {
+  scripting?: ViewportScriptingApi;
+  tabs?: KlaviyoGrantTabsApi & Partial<ZoomTabsApi> & {
     get(tabId: number): Promise<{ id?: number; windowId?: number; url?: string; active?: boolean; status?: string }>;
     update(tabId: number, properties: { url: string }): Promise<{ id?: number; windowId?: number; url?: string; active?: boolean; status?: string }>;
     onUpdated: {
@@ -126,14 +130,24 @@ export function registerBackgroundAutomation(chromeApi: BackgroundChromeApi): vo
     .catch(() => undefined);
   const persistRoutes = () => { void session?.set({ [KLAVIYO_CONFIGURED_CAPTURE_ROUTES_KEY]: configuredCaptureRoutesSnapshot() }).catch(() => undefined); };
   // One-time source setup and automatic navigation never overlap: capture starts wait while a source is validated or saved.
+  // Automatic capture temporarily zooms only the toolbar-authorized Klaviyo tab; the panel holds a port for the
+  // whole run, so a closed or cancelled panel still gets the user's zoom restored.
+  const zoomTabs = chromeApi.tabs?.getZoom && chromeApi.tabs.setZoom ? chromeApi.tabs as ZoomTabsApi : undefined;
+  const viewportNormalizer = new KlaviyoViewportNormalizer(zoomTabs, chromeApi.scripting, grantStore, session);
+  chromeApi.runtime?.onConnect?.addListener((port) => {
+    if (port.name === KLAVIYO_CAPTURE_RUN_PORT) port.onDisconnect.addListener(() => { void viewportNormalizer.restore().catch(() => undefined); });
+  });
   const sourceSetupGate = new SourceSetupGate();
   const sourceSetup = new SubscriberGrowthSourceSetup(chromeApi as never, grantStore, session, sourceSetupGate, persistRoutes);
+  const conversionMetricSetup = new ConversionMetricSourceSetup(chromeApi.scripting as never, session);
   // This is registered immediately at service-worker startup. `activeTab` is
   // granted by this explicit action click, not by implicit side-panel behavior.
   chromeApi.action?.onClicked.addListener((tab) => {
     void openGrantedSidePanel(chromeApi, grantStore, tab, routesLoaded).then(async () => {
       // A Klaviyo page without a fixed reporting route (or a saved Subscriber growth route) is verified right now, on
       // this exact clicked tab, while the click's grant is fresh — never later against whichever tab is active.
+      // Client setup on a metric page (Analytics → Metrics → Placed Order): its metric ID is read from that tab.
+      if (klaviyoMetricIdFromUrl(tab.url)) { await conversionMetricSetup.verifyAtToolbarClick(tab); return; }
       if (typeof tab.url === "string" && (!isKlaviyoSupportedCaptureUrl(tab.url) || isConfiguredCaptureRoute(tab.url))) await sourceSetup.verifyAtToolbarClick(tab);
     }).catch(async (error: unknown) => {
       // Never silent: a failed toolbar transaction leaves a compact, typed record the panel shows.
@@ -164,6 +178,7 @@ export function registerBackgroundAutomation(chromeApi: BackgroundChromeApi): vo
   const subscriberGrowthNavigation = new ChromeSubscriberGrowthNavigation(undefined, grantStore, persistRoutes);
   const subscriberGrowthController = new SubscriberGrowthAutoCaptureController(subscriberGrowthNavigation, capture, store);
   const businessReviewDiscovery = new ChromeBusinessReviewDiscovery(undefined, undefined, grantStore);
+  const deliverabilitySourceVerifier = new DeliverabilitySourceVerifier(chromeApi.tabs, chromeApi.scripting as never, grantStore, (input) => businessReviewDiscovery.discover(input));
   const campaignsSourceInspector = new ChromeCampaignsSourceInspector(undefined, grantStore);
   const campaignsController = new CampaignsAutoCaptureController(new ChromeCampaignsCaptureNavigation(undefined, undefined, grantStore), capture, store);
   chromeApi.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -182,6 +197,14 @@ export function registerBackgroundAutomation(chromeApi: BackgroundChromeApi): vo
         void session.set({ "tention.business-review-discovery:last": boundedDiagnostics({ discoveredAt: Date.now(), status: "failed", ...failure }) }).catch(() => undefined);
         sendResponse(failure);
       });
+      return true;
+    }
+    if (message.type === "TAKE_CONVERSION_METRIC_SOURCE") {
+      void conversionMetricSetup.take().then(sendResponse).catch(() => sendResponse({ ok: false, code: "CONVERSION_METRIC_PAGE_NOT_READ", message: "Metric verification failed safely." }));
+      return true;
+    }
+    if (message.type === "VERIFY_DELIVERABILITY_SOURCE") {
+      void deliverabilitySourceVerifier.verify(message.request).then(sendResponse).catch(() => sendResponse({ ok: false, code: "SCRIPT_INJECTION_FAILED", message: "Deliverability verification failed safely." }));
       return true;
     }
     if (message.type === "DISCOVER_SUBSCRIBER_GROWTH_SOURCE") {
@@ -227,6 +250,14 @@ export function registerBackgroundAutomation(chromeApi: BackgroundChromeApi): vo
     }
     if (message.type === "GET_SESSION_STORAGE_USAGE") {
       void sessionUsage(session).then(sendResponse).catch(() => sendResponse(null));
+      return true;
+    }
+    if (message.type === "NORMALIZE_KLAVIYO_VIEWPORT") {
+      void viewportNormalizer.normalize().then(sendResponse).catch(() => sendResponse(null));
+      return true;
+    }
+    if (message.type === "RESTORE_KLAVIYO_ZOOM") {
+      void viewportNormalizer.restore().then(sendResponse).catch(() => sendResponse(null));
       return true;
     }
     if (message.type === "GET_EXTENSION_BUILD") {

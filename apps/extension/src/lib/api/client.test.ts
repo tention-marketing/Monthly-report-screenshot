@@ -225,6 +225,36 @@ describe("extension API configuration", () => {
     if (summaryOverride) await expect(api.importLocalAutomaticCaptureRun(runId, canonical)).rejects.toMatchObject({ code: "AUTOMATIC_RUN_IMPORT_ACK_MISMATCH" });
     else expect((await api.importLocalAutomaticCaptureRun(runId, canonical)).client.id).toBe("acme-home");
   });
+  describe("a single-section retake import", () => {
+    const runId = "b2e9f891-8365-455f-adc8-46d74d6c5b2f";
+    const types: ScreenshotType[] = ["overview", "top_campaigns", "top_flows", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"];
+    function retake(changedAlso: ScreenshotType | null) {
+      const base = makeDraft("signup_form", "a".repeat(64));
+      const before = { ...base, version: 3, sections: { executive_summary: "required" as const }, screenshots: types.map((type, index) => ({
+        ...base.screenshots[0]!, id: `2e529e6d-0ebf-4a28-a87f-02a47cc0b7${String(index).padStart(2, "0")}`, type, storageKey: `reports/${reportId}/${type}/old.png`,
+        approved: false, approvedAt: null, captureOrigin: "live_acceptance_import" as const, sha256: String(index + 1).repeat(64),
+      })) };
+      // Only Flow Performance was retaken: a new record and new bytes, still pending review.
+      const after = { ...before, version: 4, screenshots: before.screenshots.map((shot) => shot.type === "flow_performance" || shot.type === changedAlso
+        ? { ...shot, id: shot.type === "flow_performance" ? "3e529e6d-0ebf-4a28-a87f-02a47cc0b700" : "3e529e6d-0ebf-4a28-a87f-02a47cc0b701", sha256: shot.type === "flow_performance" ? "f".repeat(64) : "e".repeat(64), storageKey: `reports/${reportId}/${shot.type}/new.png` }
+        : shot) };
+      const retaken = after.screenshots.find((shot) => shot.type === "flow_performance")!;
+      const summary = { runId, reportId, clientId: "autoledtech", reportMonth, reportVersion: 4, capturedCount: 9, pendingReviewCount: 9, approvedCount: 0, missingAutomaticCount: 0,
+        captures: [{ type: "flow_performance", screenshotRecordId: retaken.id, sha256: retaken.sha256, reviewStatus: "pending_review", captureOrigin: "live_acceptance_import" }] };
+      const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(summary), { status: 200 })).mockResolvedValueOnce(new Response(JSON.stringify(after), { status: 200 }));
+      return { api: createApiClient({ baseUrl: localApiBaseUrl, fetch }), before };
+    }
+    it("accepts a reload where only the retaken section changed and it is still pending review", async () => {
+      const { api, before } = retake(null);
+      const result = await api.importLocalAutomaticCaptureRun(runId, before, ["flow_performance"]);
+      expect(result.screenshots.find((shot) => shot.type === "flow_performance")).toMatchObject({ sha256: "f".repeat(64), approved: false });
+      for (const type of types.filter((item) => item !== "flow_performance")) expect(result.screenshots.find((shot) => shot.type === type)).toEqual(before.screenshots.find((shot) => shot.type === type));
+    });
+    it("rejects a reload where a section that was not retaken also changed", async () => {
+      const { api, before } = retake("campaign_metrics");
+      await expect(api.importLocalAutomaticCaptureRun(runId, before, ["flow_performance"])).rejects.toMatchObject({ code: "AUTOMATIC_RUN_IMPORT_RELOAD_MISMATCH", message: expect.stringContaining("campaign_metrics") });
+    });
+  });
   it("rejects a local automatic-run response that does not bind to the requested report", async () => {
     const api = createApiClient({ baseUrl: localApiBaseUrl, fetch: vi.fn().mockResolvedValue(new Response(JSON.stringify({ runId: "other", reportId, clientId: "autoledtech", status: "running" }), { status: 201 })) });
     await expect(api.startLocalAutomaticCaptureRun({ runId: "d5b98faf-955e-4474-8c8c-7c8a9a2f83a5", reportId, clientId: "autoledtech", reportMonth: { year: 2026, month: 8 }, startedAt: "2026-10-09T12:00:00.000Z" })).rejects.toMatchObject({ code: "AUTOMATIC_RUN_START_ACK_MISMATCH" });

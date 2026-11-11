@@ -180,6 +180,76 @@ describe("import completed automatic capture run", () => {
     await expect(importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: later, now })).rejects.toThrow(/Refusing to replace existing top_flows/);
   });
 
+  it.each([
+    ["generated", "MARK_CAPTURES_INCOMPLETE", "captures_incomplete"],
+    ["auto_validated", "MARK_CAPTURES_INCOMPLETE", "captures_incomplete"],
+    ["failed", "RESET_TO_DRAFT", "draft"],
+  ] as const)("imports a fresh complete run into a %s report and reopens it, so its final report is generated again from the new captures", async (status, event, reopened) => {
+    const root = await mkdtemp(join(tmpdir(), "tention-auto-run-fresh-")); roots.push(root);
+    const repo = new InMemoryReportDraftRepository(); const storage = new InMemoryScreenshotStorage();
+    const report = createReportDraft({ client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, sections: Object.fromEntries(CORE_NINE_SPECS.map(({ screenshotType }) => [screenshotSectionMapping[screenshotType], "required"])) }, { id: "c3b0c2f1-4444-4c4c-9d9d-0123456789ab", now: new Date("2026-10-10T07:00:00Z") });
+    await repo.create(report);
+    const now = () => new Date("2026-10-11T07:01:00Z");
+    const first = await importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: await successfulRun(root, report.id), now });
+    // The first capture set was machine-validated and the final report generated from it (never approved by a person).
+    const done = (await repo.getById(report.id))!;
+    await repo.save({ ...done, status, version: done.version + 1, screenshots: done.screenshots.map((shot) => ({ ...shot, automatedValidatedAt: "2026-10-11T06:10:00.000Z" })) }, done.version);
+    const freshRun = await successfulRun(root, report.id, undefined, undefined, undefined, { runId: "d1e9f891-8365-455f-adc8-46d74d6c5b2f", seed: 60, finishedAt: "2026-10-11T06:55:00.000Z" });
+    const fresh = await importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: freshRun, now });
+    const after = (await repo.getById(report.id))!;
+    expect(after.status).toBe(reopened);
+    expect(after.screenshots.map((shot) => shot.sha256).sort()).toEqual(fresh.captures.map((capture) => capture.sha256).sort());
+    expect(fresh.captures.every((capture, index) => capture.sha256 !== first.captures[index]!.sha256)).toBe(true);
+    // New evidence carries no earlier machine validation: it is validated again before the next final report.
+    expect(after.screenshots.every((shot) => !shot.automatedValidatedAt)).toBe(true);
+    expect((await repo.getHistory(report.id)).at(-1)).toMatchObject({ eventType: event, toStatus: reopened });
+  });
+
+  it("never imports into a report that is being generated", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tention-auto-run-generating-")); roots.push(root);
+    const repo = new InMemoryReportDraftRepository(); const storage = new InMemoryScreenshotStorage();
+    const report = createReportDraft({ client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, sections: Object.fromEntries(CORE_NINE_SPECS.map(({ screenshotType }) => [screenshotSectionMapping[screenshotType], "required"])) }, { id: "c3b0c2f1-5555-4c4c-9d9d-0123456789ab", now: new Date("2026-10-10T07:00:00Z") });
+    await repo.create({ ...report, status: "generating" });
+    await expect(importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: await successfulRun(root, report.id), now: () => new Date("2026-10-11T07:01:00Z") })).rejects.toThrow(/no longer resolves/);
+  });
+
+  it("retakes one pending section through a single-section resume run, leaving the other eight records untouched", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tention-auto-run-single-retake-")); roots.push(root);
+    const repo = new InMemoryReportDraftRepository(); const storage = new InMemoryScreenshotStorage();
+    const report = createReportDraft({ client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, sections: Object.fromEntries(CORE_NINE_SPECS.map(({ screenshotType }) => [screenshotSectionMapping[screenshotType], "required"])) }, { now: new Date("2026-10-10T07:00:00Z") });
+    await repo.create(report);
+    const now = () => new Date("2026-10-11T07:01:00Z");
+    await importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: await successfulRun(root, report.id), now });
+    const before = (await repo.getById(report.id))!;
+    const retakeRun = await successfulRun(root, report.id, undefined, undefined, undefined, { runId: "c1e9f891-8365-455f-adc8-46d74d6c5b2f", seed: 60, finishedAt: "2026-10-11T06:00:00.000Z", resumeOnly: ["flow_performance"] });
+    const result = await importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: retakeRun, now });
+    expect(result).toMatchObject({ capturedCount: 9, pendingReviewCount: 9, approvedCount: 0, captures: [{ type: "flow_performance", reviewStatus: "pending_review", captureOrigin: "live_acceptance_import" }] });
+    const after = (await repo.getById(report.id))!;
+    // One optimistic version step; the replacement is a new record with new bytes and is still pending review.
+    expect(after.version).toBe(before.version + 1);
+    const oldShot = before.screenshots.find((shot) => shot.type === "flow_performance")!; const newShot = after.screenshots.find((shot) => shot.type === "flow_performance")!;
+    expect(newShot.id).not.toBe(oldShot.id); expect(newShot.sha256).not.toBe(oldShot.sha256);
+    expect(newShot).toMatchObject({ approved: false, approvedAt: null, captureOrigin: "live_acceptance_import" });
+    // The other eight captures keep their record, storage key, bytes hash, evidence, and review state exactly.
+    for (const shot of before.screenshots.filter((item) => item.type !== "flow_performance")) expect(after.screenshots.find((item) => item.type === shot.type)).toEqual(shot);
+    expect(after.screenshots).toHaveLength(9);
+    for (const shot of after.screenshots) expect((await storage.get(shot.storageKey!))?.sha256).toBe(shot.sha256);
+  });
+
+  it("refuses a single-section retake of a section that has already been approved", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tention-auto-run-approved-retake-")); roots.push(root);
+    const repo = new InMemoryReportDraftRepository(); const storage = new InMemoryScreenshotStorage();
+    const report = createReportDraft({ client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, sections: Object.fromEntries(CORE_NINE_SPECS.map(({ screenshotType }) => [screenshotSectionMapping[screenshotType], "required"])) }, { now: new Date("2026-10-10T07:00:00Z") });
+    await repo.create(report);
+    const now = () => new Date("2026-10-11T07:01:00Z");
+    await importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: await successfulRun(root, report.id), now });
+    const canonical = (await repo.getById(report.id))!;
+    await repo.save({ ...canonical, version: canonical.version + 1, screenshots: canonical.screenshots.map((shot) => shot.type === "flow_metrics" ? { ...shot, approved: true, approvedAt: "2026-10-11T06:30:00.000Z" } : shot) }, canonical.version);
+    const retakeRun = await successfulRun(root, report.id, undefined, undefined, undefined, { runId: "d1e9f891-8365-455f-adc8-46d74d6c5b2f", seed: 70, finishedAt: "2026-10-11T06:45:00.000Z", resumeOnly: ["flow_metrics"] });
+    await expect(importCompletedAutomaticCaptureRun({ repository: repo, screenshotStorage: storage, repositoryRoot: root, runId: retakeRun, now })).rejects.toThrow(/Refusing to replace existing flow_metrics/);
+    expect((await repo.getById(report.id))!.screenshots.find((shot) => shot.type === "flow_metrics")).toMatchObject({ approved: true });
+  });
+
   it("refuses an older run's different bytes over newer unapproved evidence", async () => {
     const root = await mkdtemp(join(tmpdir(), "tention-auto-run-older-")); roots.push(root);
     const repo = new InMemoryReportDraftRepository(); const storage = new InMemoryScreenshotStorage();

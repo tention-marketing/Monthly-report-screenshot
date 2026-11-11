@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalDashboardScreenshotTypes, DASHBOARD_TARGETS, isCanonicalDashboardScreenshotType, prepareDashboardCaptureDocument } from "./dashboard-capture.js";
+import { installRangeCalendar, type RangeCalendarOptions } from "./test-support/range-calendar.js";
 
 const period = { startDate: "2026-07-01", endDate: "2026-07-31", previousStartDate: "2026-06-01", previousEndDate: "2026-06-30" };
 
@@ -58,6 +59,30 @@ describe("Klaviyo home dashboard semantic capture adapter", () => {
     dashboard();
     await expect(prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, period)).resolves.toMatchObject({ ok: true, targetRect: { width: 900, height: 532, stageTimingsMs: { pageReadyMs: expect.any(Number), periodSetMs: expect.any(Number), cardResolveMs: expect.any(Number), contentReadyMs: expect.any(Number), totalMs: expect.any(Number) } }, observedPeriod: { startDate: period.startDate, endDate: period.endDate } });
   });
+
+  // Regression (runs 67311d57, 08be2f58): a short viewport whose dashboard scrolls inside its own container; the card sits
+  // below the fold after the one-off scroll. It must be moved into the visible area, not waited on until it fails.
+  it("re-positions an Overview card left below the fold of an internal scroll container", async () => {
+    dashboard();
+    const main = document.querySelector("main")!;
+    const scroller = document.createElement("div"); scroller.id = "scroller"; scroller.style.overflowY = "auto";
+    main.replaceWith(scroller); scroller.append(main);
+    let scrollTop = 0; const top = 1_000;
+    Object.defineProperty(scroller, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = Math.max(0, Math.min(value, 3_000)); } });
+    const original = vi.mocked(HTMLElement.prototype.getBoundingClientRect).getMockImplementation()!;
+    vi.mocked(HTMLElement.prototype.getBoundingClientRect).mockImplementation(function (this: HTMLElement) {
+      if (this.id === "scroller") return rect(0, 120, window.innerWidth, window.innerHeight - 120);
+      if (this.id === "summary-heading") return rect(10, top - scrollTop, 900, 46);
+      if (this.id === "summary-card") return rect(10, top - scrollTop, 900, 532);
+      return original.call(this);
+    });
+    const result = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, period);
+    expect(result.ok ? "ok" : `${result.code}: ${JSON.stringify((result as { diagnostics?: Record<string, unknown> }).diagnostics?.positioning)}`).toBe("ok");
+    if (!result.ok) return;
+    expect(scrollTop).toBeGreaterThan(0);
+    expect(result.targetRect.y).toBeGreaterThanOrEqual(120);
+    expect(result.targetRect.y + result.targetRect.height).toBeLessThanOrEqual(window.innerHeight);
+  }, 20_000);
 
   it("returns redacted failure diagnostics when Chrome runs the helper as a self-contained serialized function", async () => {
     window.history.replaceState({}, "", "/not-a-klaviyo-report");
@@ -486,4 +511,453 @@ describe("Top performing flows inside a single wrapper row", () => {
     expect(injected.startsWith("function parseCampaignPeriodText(")).toBe(true);
     expect(injected).toBe(exported);
   });
+});
+
+/**
+ * The report month is the single source of truth (run c3d31628, Club Furniture April 2026): Klaviyo Home was left on
+ * a Custom Sep 1–30 range by the September report, its date fields reverted every programmatic value write, and the
+ * old adapter clicked Apply on the unchanged September values. These pages start on whatever range an earlier report
+ * left and must end on the report's own month — or fail closed without Apply and without a capture target.
+ */
+describe("report month reconciliation from any leftover Klaviyo Home range", () => {
+  const monthPeriod = (start: string, end: string, previousStart: string, previousEnd: string) => ({ startDate: start, endDate: end, previousStartDate: previousStart, previousEndDate: previousEnd });
+  const april = monthPeriod("2026-04-01", "2026-04-30", "2026-03-01", "2026-03-31");
+  const september = monthPeriod("2026-09-01", "2026-09-30", "2026-08-01", "2026-08-31");
+  const short = (iso: string, padded: boolean) => { const text = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(`${iso}T00:00:00Z`)); return padded ? text.replace(/ (\d),/, " 0$1,") : text; };
+  const rangeText = (from: { startDate: string; endDate: string }) => `${short(from.startDate, false)} - ${short(from.endDate, false)} compared to previous period`;
+  const originalExecCommand = document.execCommand;
+  afterEach(() => { document.execCommand = originalExecCommand; });
+
+  /**
+   * Klaviyo Home left on a Custom range. `fields`: "controlled" reverts programmatic writes (live), "plain" accepts
+   * them, "frozen" accepts nothing. `afterApply` decides what Klaviyo renders for the committed values.
+   */
+  function homeLeftOn(left: { startDate: string; endDate: string }, options: { fields?: "controlled" | "plain" | "frozen"; afterApply?: (committed: string[]) => string | null; revertAfterMs?: number } = {}) {
+    dashboard(rangeText(left));
+    const fieldsMode = options.fields ?? "controlled";
+    const state = [short(left.startDate, true), short(left.endDate, true)];
+    let committed = [...state]; let applyClicks = 0;
+    const picker = document.createElement("div"); picker.setAttribute("role", "dialog"); picker.style.display = "none";
+    picker.innerHTML = `<label>Time period</label><button id="tp" aria-haspopup="listbox">Custom</button>
+      <div id="range"><span>Date range</span><input placeholder="Start Date" value="${state[0]}" /><input placeholder="End Date" value="${state[1]}" /></div>
+      <label>Comparison period</label><button aria-haspopup="listbox">Previous period</button>
+      <button id="apply">Apply</button><button id="cancel">Cancel</button>`;
+    document.querySelector("header")!.append(picker);
+    const inputs = Array.from(picker.querySelectorAll<HTMLInputElement>("#range input"));
+    const setNative = (input: HTMLInputElement, value: string) => Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    inputs.forEach((input, index) => {
+      // A controlled field keeps its own state: only typing (insertText) changes it; anything else is re-rendered back.
+      input.addEventListener("input", (event) => {
+        const typed = event instanceof InputEvent && (event.inputType === "insertText" || event.inputType === "deleteContentBackward");
+        if (fieldsMode === "plain" || (fieldsMode === "controlled" && typed)) state[index] = input.value; else setNative(input, state[index]!);
+      });
+      input.addEventListener("focusout", () => { committed = [...state]; });
+    });
+    document.execCommand = ((command: string, _ui?: boolean, value?: string) => {
+      const input = document.activeElement as HTMLInputElement | null;
+      if (fieldsMode === "frozen" || !input || !inputs.includes(input)) return false;
+      const from = input.selectionStart ?? input.value.length; const to = input.selectionEnd ?? input.value.length;
+      if (command === "insertText") { setNative(input, input.value.slice(0, from) + (value ?? "") + input.value.slice(to)); input.setSelectionRange(from + (value ?? "").length, from + (value ?? "").length); input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value ?? "" })); return true; }
+      if (command === "delete") { setNative(input, input.value.slice(0, from) + input.value.slice(to)); input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" })); return true; }
+      return false;
+    }) as typeof document.execCommand;
+    document.querySelector("[aria-label='Time period']")!.addEventListener("click", () => { picker.style.display = ""; });
+    picker.querySelector("#cancel")!.addEventListener("click", () => { picker.style.display = "none"; });
+    picker.querySelector("#apply")!.addEventListener("click", () => {
+      applyClicks += 1; picker.style.display = "none";
+      const toIso = (text: string) => new Date(`${text} UTC`).toISOString().slice(0, 10);
+      const rendered = options.afterApply ? options.afterApply(committed) : `${short(toIso(committed[0]!), false)} - ${short(toIso(committed[1]!), false)} compared to previous period`;
+      const paint = (text: string) => { document.querySelector("header p")!.textContent = text; for (const card of Array.from(document.querySelectorAll("#summary-card p, #flows-card p"))) card.textContent = text; };
+      if (rendered) window.setTimeout(() => {
+        paint(rendered);
+        // Klaviyo restoring its stored range after a re-navigation.
+        if (options.revertAfterMs !== undefined) window.setTimeout(() => paint(rangeText(left)), options.revertAfterMs);
+      }, 300);
+    });
+    return { committed: () => committed, applyClicks: () => applyClicks };
+  }
+  const periodSetting = (outcome: Awaited<ReturnType<typeof prepareDashboardCaptureDocument>>) => (outcome.ok ? null : outcome.diagnostics?.periodSetting) as Record<string, unknown> | null;
+  const describeOutcome = (outcome: Awaited<ReturnType<typeof prepareDashboardCaptureDocument>>) => outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify(outcome.diagnostics?.periodSetting)}`;
+
+  it("April report, Klaviyo left on September by the previous report: replaces September with April itself", async () => {
+    const home = homeLeftOn(september);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(describeOutcome(outcome)).toBe("ok");
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: "2026-04-01", endDate: "2026-04-30" } });
+    expect(home.committed()).toEqual(["Apr 01, 2026", "Apr 30, 2026"]);
+    expect(home.applyClicks()).toBe(1);
+    expect(document.querySelector("header p")!.textContent).toBe("Apr 1, 2026 - Apr 30, 2026 compared to previous period");
+  });
+
+  it("records the reconciliation: expected period, rendered before/after, values entered, strategy, Apply, source page", async () => {
+    homeLeftOn(september, { afterApply: () => rangeText({ startDate: "2026-04-01", endDate: "2026-04-29" }) });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(outcome.ok).toBe(false);
+    expect(periodSetting(outcome)).toMatchObject({
+      expectedPeriod: { startDate: "2026-04-01", endDate: "2026-04-30" }, renderedPeriodBefore: expect.stringContaining("Sep 1, 2026 - Sep 30, 2026"),
+      pickerValuesEntered: ["Apr 01, 2026", "Apr 30, 2026"], entry: expect.objectContaining({ ok: true, strategy: "insert-text" }), applyClicked: true,
+      renderedPeriodAfter: expect.stringContaining("Apr 1, 2026 - Apr 29, 2026"), sourcePage: "/dashboard",
+    });
+ }, 60_000);
+
+  it.each([
+    ["September report, Klaviyo left on April", monthPeriod("2026-04-01", "2026-04-30", "", ""), september, ["Sep 01, 2026", "Sep 30, 2026"]],
+    ["October report, Klaviyo left on April (start after the shown end: end is entered first)", monthPeriod("2026-04-01", "2026-04-30", "", ""), monthPeriod("2026-10-01", "2026-10-31", "2026-09-01", "2026-09-30"), ["Oct 01, 2026", "Oct 31, 2026"]],
+    ["January 2026 report, Klaviyo left on October 2026", monthPeriod("2026-10-01", "2026-10-31", "", ""), monthPeriod("2026-01-01", "2026-01-31", "2025-12-01", "2025-12-31"), ["Jan 01, 2026", "Jan 31, 2026"]],
+    ["December 2025 report, Klaviyo left on January 2026 (year boundary)", monthPeriod("2026-01-01", "2026-01-31", "", ""), monthPeriod("2025-12-01", "2025-12-31", "2025-11-01", "2025-11-30"), ["Dec 01, 2025", "Dec 31, 2025"]],
+    ["February 2026 report", september, monthPeriod("2026-02-01", "2026-02-28", "2026-01-01", "2026-01-31"), ["Feb 01, 2026", "Feb 28, 2026"]],
+    ["leap-year February 2028 report", september, monthPeriod("2028-02-01", "2028-02-29", "2028-01-01", "2028-01-31"), ["Feb 01, 2028", "Feb 29, 2028"]],
+  ])("%s", async (_case, left, report, committed) => {
+    const home = homeLeftOn(left);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.top_flows, report);
+    expect(describeOutcome(outcome)).toBe("ok");
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: report.startDate, endDate: report.endDate } });
+    expect(home.committed()).toEqual(committed);
+  });
+
+  it("a page already on the report month is used as it is: the picker is never opened", async () => {
+    const home = homeLeftOn(april);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: "2026-04-01", endDate: "2026-04-30" } });
+    expect(home.applyClicks()).toBe(0);
+  });
+
+  it("fields that accept programmatic writes keep working (first strategy)", async () => {
+    homeLeftOn(september, { fields: "plain", afterApply: () => null });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    // Klaviyo never re-renders here, so it fails after Apply; the entry itself took on the first strategy.
+    expect(periodSetting(outcome)).toMatchObject({ entry: expect.objectContaining({ ok: true, strategy: "set-value" }), applyClicked: true });
+  }, 60_000);
+
+  it("never clicks Apply when Klaviyo's fields refuse the report dates, and produces no capture target", async () => {
+    const home = homeLeftOn(september, { fields: "frozen" });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED", message: expect.stringContaining("Apply was not clicked") });
+    expect(home.applyClicks()).toBe(0);
+    expect("targetRect" in outcome).toBe(false);
+    expect(periodSetting(outcome)).toMatchObject({ entry: expect.objectContaining({ ok: false, attempts: expect.arrayContaining([expect.objectContaining({ strategy: "set-value", matched: false })]) }), valuesAfterSet: ["Sep 01, 2026", "Sep 30, 2026"], pickerDismissed: true });
+  }, 15_000);
+
+  it("fails closed when Apply succeeds but Klaviyo renders another range", async () => {
+    homeLeftOn(september, { afterApply: () => rangeText(september) });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED" });
+    expect("targetRect" in outcome).toBe(false);
+  }, 60_000);
+
+  it("fails closed when Klaviyo restores its stored range after Apply, and the next fresh attempt reconciles again", async () => {
+    homeLeftOn(september, { revertAfterMs: 0 });
+    const first = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(first.ok).toBe(false);
+    expect("targetRect" in first).toBe(false);
+    // A retry reloads the page (fresh source) and establishes the period again from the report.
+    const home = homeLeftOn(september);
+    const second = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+    expect(describeOutcome(second)).toBe("ok");
+    expect(home.committed()).toEqual(["Apr 01, 2026", "Apr 30, 2026"]);
+  }, 60_000);
+
+  it("fails closed, without Apply, when the shared period helper was not loaded into the page", async () => {
+    const holder = globalThis as unknown as { __tentionPeriodEntry?: unknown }; const helper = holder.__tentionPeriodEntry;
+    delete holder.__tentionPeriodEntry;
+    try {
+      const home = homeLeftOn(september);
+      const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, april);
+      expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED", message: expect.stringContaining("shared period helper was not loaded") });
+      expect(home.applyClicks()).toBe(0);
+    } finally { holder.__tentionPeriodEntry = helper; }
+  });
+});
+
+/**
+ * Live run dfedae86 (Club Furniture April 2026, Klaviyo left on September): the Time period dialog shows ONE combined
+ * range control "Sep 01, 2026 — Sep 30, 2026" whose values belong to the component. Direct writes were re-rendered back
+ * and text insertion emptied it; only its calendar changes the range. Every case starts from the range an earlier
+ * report left and must end on the report's own month through the calendar — or fail closed without Apply or capture.
+ */
+describe("Klaviyo combined date-range control: the calendar sets any report month", () => {
+  const month = (startDate: string, endDate: string) => ({ startDate, endDate, previousStartDate: "", previousEndDate: "" });
+  const label = (iso: string) => new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(`${iso}T00:00:00Z`));
+  const pageRange = (range: { startDate: string; endDate: string }) => `${label(range.startDate)} - ${label(range.endDate)} compared to previous period`;
+
+  function homeWithRangeControl(left: { startDate: string; endDate: string }, options: RangeCalendarOptions & { afterApply?: "render" | "reset" } = {}) {
+    dashboard(pageRange(left));
+    let applyClicks = 0;
+    const dialog = document.createElement("div"); dialog.setAttribute("role", "dialog"); dialog.style.display = "none";
+    dialog.innerHTML = `<label>Time period</label><button aria-haspopup="listbox">Custom</button>
+      <span>Date range</span><div class="DateRangePickerInput"><input type="text" placeholder="Start Date" /><span aria-hidden="true">—</span><input type="text" placeholder="End Date" /></div>
+      <label>Comparison period</label><button aria-haspopup="listbox">Previous period</button>
+      <button id="apply">Apply</button><button id="cancel">Cancel</button>`;
+    document.querySelector("header")!.append(dialog);
+    const [start, end] = Array.from(dialog.querySelectorAll<HTMLInputElement>("input"));
+    const calendar = installRangeCalendar(start!, end!, left, options);
+    document.querySelector("[aria-label='Time period']")!.addEventListener("click", () => { dialog.style.display = ""; });
+    dialog.querySelector("#cancel")!.addEventListener("click", () => { dialog.style.display = "none"; calendar.close(); });
+    dialog.querySelector("#apply")!.addEventListener("click", () => {
+      applyClicks += 1; dialog.style.display = "none"; calendar.close();
+      const [from, to] = calendar.range();
+      const shown = options.afterApply === "reset" || !from || !to ? pageRange(left) : pageRange({ startDate: from, endDate: to });
+      window.setTimeout(() => { for (const node of Array.from(document.querySelectorAll("header p, #summary-card p, #flows-card p"))) node.textContent = shown; }, 300);
+    });
+    return { calendar, applyClicks: () => applyClicks };
+  }
+  const run = (outcome: Awaited<ReturnType<typeof prepareDashboardCaptureDocument>>) => outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify(outcome.diagnostics?.periodSetting)}`.slice(0, 3000);
+  const setting = (outcome: Awaited<ReturnType<typeof prepareDashboardCaptureDocument>>) => (outcome.ok ? null : outcome.diagnostics?.periodSetting) as Record<string, unknown> | null;
+
+  it.each([
+    ["September → April 2026", month("2026-09-01", "2026-09-30"), month("2026-04-01", "2026-04-30"), 5, "previous"],
+    ["November → April 2026", month("2026-11-01", "2026-11-30"), month("2026-04-01", "2026-04-30"), 7, "previous"],
+    ["April → September 2026", month("2026-04-01", "2026-04-30"), month("2026-09-01", "2026-09-30"), 4, "next"],
+    ["October 2026 → January 2027", month("2026-10-01", "2026-10-31"), month("2027-01-01", "2027-01-31"), 2, "next"],
+    ["January 2026 → December 2025", month("2026-01-01", "2026-01-31"), month("2025-12-01", "2025-12-31"), 1, "previous"],
+    ["September → February 2026", month("2026-09-01", "2026-09-30"), month("2026-02-01", "2026-02-28"), 7, "previous"],
+    ["September 2026 → leap-year February 2028", month("2026-09-01", "2026-09-30"), month("2028-02-01", "2028-02-29"), 16, "next"],
+  ] as const)("%s through the calendar, stepping exactly as many months as needed", async (_case, left, report, steps, direction) => {
+    const home = homeWithRangeControl(left);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, report);
+    expect(run(outcome)).toBe("ok");
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: report.startDate, endDate: report.endDate } });
+    expect(home.calendar.range()).toEqual([report.startDate, report.endDate]);
+    expect(home.calendar.clicked()).toEqual([`start:${report.startDate}`, `end:${report.endDate}`]);
+    expect(home.calendar.navigations()).toBe(steps);
+    expect(home.applyClicks()).toBe(1);
+    expect(direction).toMatch(/previous|next/);
+  }, 60_000);
+
+  it("records the real picker structure and the calendar interaction for diagnosis", async () => {
+    homeWithRangeControl(month("2026-09-01", "2026-09-30"), { afterApply: "reset" });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, month("2026-04-01", "2026-04-30"));
+    expect(outcome.ok).toBe(false);
+    const diagnostics = setting(outcome)!;
+    expect(diagnostics).toMatchObject({ expectedPeriod: { startDate: "2026-04-01", endDate: "2026-04-30" }, renderedPeriodBefore: expect.stringContaining("Sep 1, 2026 - Sep 30, 2026"), applyClicked: true, renderedPeriodAfter: expect.stringContaining("Sep 1, 2026 - Sep 30, 2026"), sourcePage: "/dashboard" });
+    expect(diagnostics.entry).toMatchObject({ ok: true, strategy: "calendar",
+      calendar: { openedBy: "start-field", calendarMonthBefore: ["September 2026", "October 2026"], navigation: Array(5).fill("previous"), datesClicked: [expect.objectContaining({ iso: "2026-04-01", via: "aria-label" }), expect.objectContaining({ iso: "2026-04-30", via: "aria-label" })], rangeAfterSelection: ["Apr 01, 2026", "Apr 30, 2026"] },
+      pickerStructure: { beforeOpen: expect.objectContaining({ combinedControl: expect.objectContaining({ className: "DateRangePickerInput" }), fields: [expect.objectContaining({ placeholder: "Start Date", value: "Sep 01, 2026" }), expect.objectContaining({ placeholder: "End Date", value: "Sep 30, 2026" })] }),
+        afterOpen: expect.objectContaining({ monthHeadings: ["September 2026", "October 2026"], navButtons: { previous: expect.stringContaining("previous month"), next: expect.stringContaining("next month") } }) } });
+  }, 60_000);
+
+  it("a page already on the report month is used as it is: no picker, no calendar, no Apply", async () => {
+    const home = homeWithRangeControl(month("2026-04-01", "2026-04-30"));
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.top_flows, month("2026-04-01", "2026-04-30"));
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: "2026-04-01", endDate: "2026-04-30" } });
+    expect(home.calendar.clicked()).toEqual([]); expect(home.applyClicks()).toBe(0);
+  });
+
+  it.each([
+    ["adjacent-month cells labelled with their own dates", { outsideDays: "labelled" as const }],
+    ["number-only day cells with number-only adjacent-month cells", { outsideDays: "number-only" as const, numberOnlyDays: true }],
+  ])("never clicks an adjacent-month cell: %s", async (_case, options) => {
+    // April 2026 starts on a Wednesday and ends on a Thursday: March 29–31 and May 1–2 sit in April's own grid.
+    const home = homeWithRangeControl(month("2026-09-01", "2026-09-30"), options);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, month("2026-04-01", "2026-04-30"));
+    expect(run(outcome)).toBe("ok");
+    expect(home.calendar.clicked()).toEqual(["start:2026-04-01", "end:2026-04-30"]);
+    expect(home.calendar.clicked().some((entry) => entry.endsWith(":outside"))).toBe(false);
+  }, 60_000);
+
+  it("reads a month heading painted in pieces and a one-month calendar", async () => {
+    const home = homeWithRangeControl(month("2026-09-01", "2026-09-30"), { splitCaption: true, monthsShown: 1 });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, month("2026-04-01", "2026-04-30"));
+    expect(run(outcome)).toBe("ok");
+    expect(home.calendar.clicked()).toEqual(["start:2026-04-01", "end:2026-04-30"]);
+    expect(home.calendar.navigations()).toBe(5);
+  }, 60_000);
+
+  it("fails closed when the picker selection succeeds but Apply leaves Klaviyo on the old month; no capture target", async () => {
+    const home = homeWithRangeControl(month("2026-09-01", "2026-09-30"), { afterApply: "reset" });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, month("2026-04-01", "2026-04-30"));
+    expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED" });
+    expect("targetRect" in outcome).toBe(false);
+    expect(home.calendar.range()).toEqual(["2026-04-01", "2026-04-30"]);
+  }, 60_000);
+
+  it("never clicks Apply while the range control still shows the old month, and captures nothing", async () => {
+    // A calendar with no month navigation cannot reach April from September; every other entry is rendered back.
+    const home = homeWithRangeControl(month("2026-09-01", "2026-09-30"));
+    const removeNavigation = new MutationObserver(() => document.querySelectorAll(".DayPickerNavigation").forEach((node) => node.remove()));
+    removeNavigation.observe(document.body, { childList: true, subtree: true });
+    try {
+      const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, month("2026-04-01", "2026-04-30"));
+      expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED", message: expect.stringContaining("Apply was not clicked") });
+      expect(home.applyClicks()).toBe(0);
+      expect("targetRect" in outcome).toBe(false);
+      expect((setting(outcome)!.entry as { calendar: { failure: string } }).calendar.failure).toMatch(/No previous-month button/);
+      expect(setting(outcome)!.valuesAfterSet).toEqual(["Sep 01, 2026", "Sep 30, 2026"]);
+    } finally { removeNavigation.disconnect(); }
+  }, 60_000);
+});
+
+/**
+ * Report cover values: Klaviyo Home → Business performance summary DOM text, exactly as rendered live (run c3d31628,
+ * Sep 1–30, 2026), read only after the card itself proved the report month. Never OCR.
+ */
+describe("Business performance summary values for the report cover", () => {
+  const sep = { startDate: "2026-09-01", endDate: "2026-09-30", previousStartDate: "2026-08-01", previousEndDate: "2026-08-31" };
+  const row = (label: string, value: string, share: string) => `<div><div><div><span></span></div><p><strong>${label}</strong></p></div><div><p>${value}</p></div><p>${share}</p></div>`;
+  function liveSummary(range: string, rows: { campaigns?: string | null; flows?: string | null; email?: string | null; sms?: string | null } = {}) {
+    const value = (key: keyof typeof rows, fallback: string) => rows[key] === undefined ? fallback : rows[key];
+    dashboard(`${range} compared to previous period`);
+    document.getElementById("summary-card")!.innerHTML = `<div><span><span><span><h3 id="summary-heading">Business performance summary</h3></span><span>${range}</span></span></span></div>
+      <div><div><div><h2>$584,032.35</h2><p>Total revenue</p><div><span><span>48%</span></span><p>vs. previous period</p></div></div>
+      <div><h2>$173,849.26</h2><p>Attributed revenue (29.77% of total)</p><div><span><span>5%</span></span><p>vs. previous period</p></div></div></div>
+      <div><div><h6>Attributed revenue</h6></div><div><div><div><div><span></span></div><p><strong>Per recipient</strong></p></div><div><p>$0.51</p></div></div>
+      ${value("campaigns", "$56,527.51") === null ? "" : row("Campaigns", value("campaigns", "$56,527.51")!, "32.52%")}${value("flows", "$117,321.75") === null ? "" : row("Flows", value("flows", "$117,321.75")!, "67.48%")}
+      ${value("email", "$156,674.44") === null ? "" : row("Email", value("email", "$156,674.44")!, "90.12%")}${value("sms", "$17,174.82") === null ? "" : row("Text message", value("sms", "$17,174.82")!, "9.88%")}
+      <div><div><div><span></span></div><p><strong>Push</strong></p></div><div><p><a><span>Set up push notifications</span></a></p></div></div>
+      <div><div><div><span></span></div><p><strong>WhatsApp</strong></p></div><div><p><a><span>Set up WhatsApp</span></a></p></div></div></div></div></div>`;
+  }
+
+  it("reads Total revenue, Email (not total attributed), Campaigns and Flows beside their own labels", async () => {
+    liveSummary("Sep 1, 2026 - Sep 30, 2026");
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, sep);
+    expect(outcome).toMatchObject({ ok: true, businessPerformanceIssues: [], businessPerformance: {
+      totalRevenue: "$584,032.35", totalAttributedRevenue: "$173,849.26", emailAttributedRevenue: "$156,674.44", smsAttributedRevenue: "$17,174.82",
+      campaignRevenue: "$56,527.51", flowRevenue: "$117,321.75", visiblePeriodText: "Sep 1, 2026 - Sep 30, 2026" } });
+  });
+
+  it("reads the Attributed revenue total even when Klaviyo splits its label across elements, and records what it read", async () => {
+    liveSummary("Oct 1, 2026 - Oct 31, 2026");
+    const label = Array.from(document.querySelectorAll("#summary-card p")).find((node) => node.textContent?.startsWith("Attributed revenue ("))!;
+    label.innerHTML = "Attributed revenue <span>(20.83% of total)</span>";
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, { startDate: "2026-10-01", endDate: "2026-10-31", previousStartDate: "2026-09-01", previousEndDate: "2026-09-30" });
+    expect(outcome).toMatchObject({ ok: true, businessPerformance: { totalAttributedRevenue: "$173,849.26" },
+      businessPerformanceReadout: { totalAttributedRevenue: { labels: expect.arrayContaining(["Attributed revenue (20.83% of total)"]), values: ["$173,849.26"] }, flowRevenue: { labels: ["Flows"], values: ["$117,321.75"] } } });
+  });
+
+  it("names the missing metric instead of inventing a value", async () => {
+    liveSummary("Sep 1, 2026 - Sep 30, 2026", { flows: null });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, sep);
+    expect(outcome).toMatchObject({ ok: true, businessPerformance: null, businessPerformanceIssues: [expect.stringContaining("Revenue from Flows")] });
+  });
+
+  it("keeps a missing Text message channel as absent, not zero", async () => {
+    liveSummary("Sep 1, 2026 - Sep 30, 2026", { sms: null });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, sep);
+    expect(outcome).toMatchObject({ ok: true, businessPerformance: { smsAttributedRevenue: null, emailAttributedRevenue: "$156,674.44" } });
+  });
+
+  it("reads nothing while the card shows another period", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "requestAnimationFrame"] });
+    try {
+      liveSummary("Sep 1, 2026 - Sep 30, 2026");
+      const result = prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, { startDate: "2026-04-01", endDate: "2026-04-30", previousStartDate: "2026-03-01", previousEndDate: "2026-03-31" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const outcome = await result;
+      expect(outcome.ok).toBe(false);
+      expect("businessPerformance" in outcome).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("reads no cover values for Top 5 Flows", async () => {
+    liveSummary("Sep 1, 2026 - Sep 30, 2026");
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.top_flows, sep);
+    expect(outcome.ok && "businessPerformance" in outcome).toBe(false);
+  });
+});
+
+/**
+ * Cross-client period reconciliation (run c80dcbab, Steven Dann October 2026). The adapter receives no client identity:
+ * only the state Klaviyo Home was left in differs between accounts, so every case below is a page state, and the same
+ * report month must come out of each one.
+ */
+describe("report period from any Klaviyo Home state, for any client", () => {
+  const october = { startDate: "2026-10-01", endDate: "2026-10-31", previousStartDate: "2026-09-01", previousEndDate: "2026-09-30" };
+  const shown = (padded: string) => padded.replace(/ 0(\d),/, " $1,");
+  interface HomeState { timePeriod: "Last 30 days" | "Custom"; timeFields: [string, string]; comparison: "Previous period" | "Custom"; comparisonFields: [string, string]; rendered: string; restoreOnApply?: "first" | "always" }
+  /** Klaviyo Home's live Time period dialog: Time period picker + its range, then Comparison period picker + its range. */
+  function klaviyoHome(state: HomeState) {
+    dashboard(state.rendered);
+    let opened = 0; let applies = 0;
+    const picker = document.createElement("div"); picker.setAttribute("role", "dialog"); picker.style.display = "none";
+    picker.innerHTML = `<label>Time period</label><button id="tp" aria-haspopup="listbox">${state.timePeriod}</button>
+      <div id="range"${state.timePeriod === "Custom" ? "" : ` style="display:none"`}><span>Date range</span><input placeholder="Start Date" value="${state.timeFields[0]}" /><input placeholder="End Date" value="${state.timeFields[1]}" /></div>
+      <label>Comparison period</label><button id="cp" aria-haspopup="listbox">${state.comparison}</button>
+      <div id="cmp-range"${state.comparison === "Custom" ? "" : ` style="display:none"`}><span>Date range</span><input placeholder="Start Date" value="${state.comparisonFields[0]}" /><input placeholder="End Date" value="${state.comparisonFields[1]}" /></div>
+      <button id="apply">Apply</button><button id="cancel">Cancel</button>`;
+    document.querySelector("header")!.append(picker);
+    const field = (selector: string) => Array.from(picker.querySelectorAll<HTMLInputElement>(`${selector} input`)).map((input) => input.value);
+    const close = () => { picker.style.display = "none"; document.getElementById("tp-options")?.remove(); };
+    document.querySelector("[aria-label='Time period']")!.addEventListener("click", () => { opened += 1; picker.style.display = ""; });
+    picker.querySelector("#tp")!.addEventListener("click", () => {
+      const list = document.createElement("ul"); list.id = "tp-options"; list.setAttribute("role", "listbox");
+      list.innerHTML = `<li role="option">Last 30 days</li><li role="option">Custom</li>`;
+      list.lastElementChild!.addEventListener("click", () => { picker.querySelector("#tp")!.textContent = "Custom"; (picker.querySelector("#range") as HTMLElement).style.display = ""; list.remove(); });
+      document.body.append(list);
+    });
+    picker.querySelector("#cancel")!.addEventListener("click", close);
+    picker.querySelector("#apply")!.addEventListener("click", () => {
+      applies += 1; close();
+      const custom = picker.querySelector("#tp")!.textContent === "Custom";
+      const [start, end] = field("#range"); const [cmpStart, cmpEnd] = field("#cmp-range");
+      const comparison = picker.querySelector("#cp")!.textContent === "Custom" ? `${shown(cmpStart!)} - ${shown(cmpEnd!)}` : "previous period";
+      // Klaviyo restoring its stored rolling range after Apply.
+      const restore = state.restoreOnApply === "always" || (state.restoreOnApply === "first" && applies === 1);
+      if (restore) { picker.querySelector("#tp")!.textContent = "Last 30 days"; (picker.querySelector("#range") as HTMLElement).style.display = "none"; }
+      const text = custom && !restore ? `${shown(start!)} - ${shown(end!)} compared to ${comparison}` : state.rendered;
+      window.setTimeout(() => { document.querySelector("header p")!.textContent = text; for (const card of Array.from(document.querySelectorAll("#summary-card p, #flows-card p"))) card.textContent = text; }, 300);
+    });
+    return { opened: () => opened, applies: () => applies, timeFields: () => field("#range"), comparisonFields: () => field("#cmp-range"), timePeriod: () => picker.querySelector("#tp")!.textContent };
+  }
+  const outcomeText = (outcome: Awaited<ReturnType<typeof prepareDashboardCaptureDocument>>) => outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify(outcome.diagnostics?.periodSetting)}`;
+  /** Club Furniture's state before its passing October run: Time period already Custom on October. */
+  const alreadyOnOctober: HomeState = { timePeriod: "Custom", timeFields: ["Oct 01, 2026", "Oct 31, 2026"], comparison: "Previous period", comparisonFields: ["", ""], rendered: "Oct 1, 2026 - Oct 31, 2026 compared to previous period" };
+  /** Steven Dann's live state in run c80dcbab: Time period "Last 30 days", Comparison period Custom on Oct 1–31. */
+  const stevenDannLive: HomeState = { timePeriod: "Last 30 days", timeFields: ["Jul 02, 2026", "Aug 01, 2026"], comparison: "Custom", comparisonFields: ["Oct 01, 2026", "Oct 31, 2026"], rendered: "Oct 7, 2026 - Nov 6, 2026 compared to Oct 1, 2026 - Oct 31, 2026" };
+
+  it("already on the report month (Club Furniture's state): proves it and never opens the picker", async () => {
+    const home = klaviyoHome(alreadyOnOctober);
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october))).toBe("ok");
+    expect(home.opened()).toBe(0);
+  });
+
+  it("Last 30 days with a Custom comparison (Steven Dann, run c80dcbab): switches Time period to Custom and sets Oct 1–31, never touching the comparison fields", async () => {
+    const home = klaviyoHome(stevenDannLive);
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october);
+    expect(outcomeText(outcome)).toBe("ok");
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: "2026-10-01", endDate: "2026-10-31" } });
+    expect(home.timePeriod()).toBe("Custom");
+    // Right on the first Apply: the Time period itself was set, not the comparison's fields.
+    expect(home.applies()).toBe(1);
+    expect(home.timeFields()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+    expect(home.comparisonFields()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+    expect(document.querySelector("#summary-card p")!.textContent).toBe("Oct 1, 2026 - Oct 31, 2026 compared to Oct 1, 2026 - Oct 31, 2026");
+  }, 30_000);
+
+  it("never takes the comparison half for the report month, even before the selected range is painted", async () => {
+    const home = klaviyoHome({ ...stevenDannLive, rendered: "Time period compared to Oct 1, 2026 - Oct 31, 2026" });
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october))).toBe("ok");
+    expect(home.opened()).toBeGreaterThan(0);
+    expect(home.timeFields()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+  }, 30_000);
+
+  it("another calendar month left Custom (September) → October", async () => {
+    const home = klaviyoHome({ timePeriod: "Custom", timeFields: ["Sep 01, 2026", "Sep 30, 2026"], comparison: "Previous period", comparisonFields: ["", ""], rendered: "Sep 1, 2026 - Sep 30, 2026 compared to previous period" });
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october))).toBe("ok");
+    expect(home.timeFields()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+  }, 30_000);
+
+  it("Apply restores Last 30 days once: the second round re-selects Custom, enters the month again and confirms it", async () => {
+    const home = klaviyoHome({ ...stevenDannLive, restoreOnApply: "first" });
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october))).toBe("ok");
+    expect(home.applies()).toBe(2);
+    expect(document.querySelector("header p")!.textContent).toBe("Oct 1, 2026 - Oct 31, 2026 compared to Oct 1, 2026 - Oct 31, 2026");
+  }, 60_000);
+
+  it("a period Klaviyo will not change is never captured, and both rounds are reported", async () => {
+    klaviyoHome({ ...stevenDannLive, restoreOnApply: "always" });
+    const outcome = await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october);
+    expect(outcome).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED" });
+    expect(outcome.ok ? null : outcome.diagnostics?.periodSetting).toMatchObject({ rounds: [
+      expect.objectContaining({ round: 1, pickerMode: "Last 30 days", applyClicked: true, retryReason: expect.any(String), renderedPeriodAfter: expect.stringContaining("Oct 7, 2026 - Nov 6, 2026") }),
+      expect.objectContaining({ round: 2, applyClicked: true }),
+    ] });
+  }, 60_000);
+
+  it("the same report month comes out whichever client's state comes first: Club Furniture's, then Steven Dann's, on one tab", async () => {
+    klaviyoHome(alreadyOnOctober);
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.overview, october))).toBe("ok");
+    const steven = klaviyoHome(stevenDannLive);
+    expect(outcomeText(await prepareDashboardCaptureDocument(DASHBOARD_TARGETS.top_flows, october))).toBe("ok");
+    expect(steven.timeFields()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+  }, 60_000);
 });

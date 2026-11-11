@@ -1,13 +1,17 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
-import { createScreenshotSourceProof, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { clientReportSnapshot, clientReportTargetsSchema, clientSetupBlockers, clientSetupStatus, createScreenshotSourceProof, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { deriveNewClientId } from "../lib/client-id.js";
+import { cleanTargetInput, targetInput } from "../features/clients/client-targets.js";
+import type { ClientSetupSources } from "./App.js";
 import type { CaptureService } from "../features/screenshot-capture/capture-service.js";
 import type { KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
 import type { AutoCaptureService, AutoCaptureState } from "../features/automatic-capture/auto-capture-service.js";
 import type { BusinessReviewDiscoveryResult } from "../features/klaviyo-navigation/business-review-discovery.js";
 import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
+import { formatCalendarRange, formatReportMonth } from "../lib/dates/month-options.js";
 /** A report created before Section 10: exactly the frozen nine-section core. */
 const { email_subscriber_growth: _sectionTen, ...NINE_SECTION_CONFIGURATION } = DEFAULT_DRAFT_SECTION_CONFIGURATION;
 import { App } from "./App.js";
@@ -81,15 +85,24 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
     const draft = (await reports()).find((item) => item.client.id === clientId);
     return { ...targets, profile: draft ? { name: draft.client.name, timezone: draft.client.timezone, currency: draft.client.currency, conversionMetric: { label: "Placed Order", providerMetricId: null }, sections: null } : null };
   }) as ApiClient["getClientReportTargets"];
+  // Report fixtures stand for onboarded clients: unless a test sets `getClientSetup`, the client's setup is READY.
+  // It reads the targets through their implementation so getClientReportTargets call counts stay untouched.
+  if (!overrides.getClientSetup) api.getClientSetup = vi.fn(async (clientId: string) => {
+    const setup = await vi.mocked(api.getClientReportTargets).getMockImplementation()!(clientId);
+    return { clientId, name: setup?.profile?.name ?? clientId, status: "READY", blockers: [], setup };
+  }) as ApiClient["getClientSetup"];
   return api;
 }
 function baseMockApi(overrides: Partial<Record<keyof ApiClient, unknown>>): ApiClient {
   return {
     listClientConfigurations: vi.fn().mockResolvedValue([]),
+    listClientSetups: vi.fn().mockResolvedValue([]),
+    createClient: vi.fn(),
     health: vi.fn().mockResolvedValue({ ok: true }),
     createReportDraft: vi.fn().mockResolvedValue(report),
     getReportDraft: vi.fn().mockResolvedValue(report),
     deleteReportDraft: vi.fn().mockResolvedValue(undefined),
+    deleteClientReport: vi.fn().mockResolvedValue({ reportId: report.id, driveFilesRetained: 0 }),
     listReportDrafts: vi.fn().mockResolvedValue([]),
     validateReportDraft: vi.fn().mockResolvedValue(report.validation),
     getReportHistory: vi.fn().mockResolvedValue([]),
@@ -117,6 +130,12 @@ function baseMockApi(overrides: Partial<Record<keyof ApiClient, unknown>>): ApiC
 /** Source-setup hooks for tests: `take` returns what the service worker verified at the toolbar click. */
 const sourceHooks = (take: () => Promise<unknown>, persisted = vi.fn().mockResolvedValue(null)) => ({ take: take as never, persisted, watch: () => () => undefined });
 /** Client configuration that returns what was last saved, so the panel's reload confirmation is real. */
+/** Final generation needs a configured currency (on the report) and conversion metric ID (on the client profile). */
+function withConfiguredDataDefinition<T extends ReportDraft>(draft: T, api: ApiClient): T {
+  const read = api.getClientReportTargets;
+  api.getClientReportTargets = vi.fn(async (clientId: string) => ({ ...(await read(clientId)), profile: { name: draft.client.name, timezone: draft.client.timezone, currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "TEST01" }, sections: null } })) as ApiClient["getClientReportTargets"];
+  return draft;
+}
 function rememberingTargets(api: ApiClient, initial?: Record<string, unknown>) {
   let saved: Record<string, unknown> | null = initial ?? null;
   const read = api.getClientReportTargets;
@@ -140,39 +159,7 @@ describe("extension report workflow", () => {
     renderApp(mockApi({ health: vi.fn().mockRejectedValue(new ApiError("NETWORK_ERROR", "offline", null)) }));
     expect(await screen.findByText("API unavailable")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry connection" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
-  });
-  it("renders completed month and derived immutable periods", async () => {
-    const user = userEvent.setup(); renderApp(mockApi());
-    await screen.findByText("Connected");
-    await user.type(screen.getByLabelText("Timezone"), "America/New_York");
-    expect(await screen.findByRole("option", { name: "August 2026" })).toBeInTheDocument();
-    expect(screen.getByText("Aug 1, 2026 – Aug 31, 2026")).toBeInTheDocument();
-    expect(screen.getByText("Jul 1, 2026 – Jul 31, 2026")).toBeInTheDocument();
-  });
-  it("creates a report without sending period boundaries", async () => {
-    const api = mockApi(); const user = userEvent.setup(); renderApp(api);
-    await screen.findByText("Connected");
-    await user.type(screen.getByLabelText("Client Name"), "Orion Supplements");
-    await user.type(screen.getByLabelText("Timezone"), "America/New_York");
-    await user.click(screen.getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(api.createReportDraft).toHaveBeenCalled());
-    const payload = vi.mocked(api.createReportDraft).mock.calls[0]?.[0];
-    expect(payload).toMatchObject({ client: { id: "orion-supplements" }, reportMonth: { year: 2026, month: 8 } });
-    expect(payload).not.toHaveProperty("period");
-  });
-  it("shows duplicate guidance and loads the existing report", async () => {
-    const api = mockApi({
-      createReportDraft: vi.fn().mockRejectedValue(new ApiError("REPORT_DRAFT_ALREADY_EXISTS", "duplicate", 409)),
-      listReportDrafts: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([report]),
-    });
-    const user = userEvent.setup(); renderApp(api); await screen.findByText("Connected");
-    await user.type(screen.getByLabelText("Client Name"), "Orion Supplements");
-    await user.type(screen.getByLabelText("Timezone"), "America/New_York");
-    await user.click(screen.getByRole("button", { name: "Continue" }));
-    expect(await screen.findByText("A monthly report already exists for this client and month.")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Load existing report" }));
-    expect(await screen.findByRole("heading", { name: "Orion Supplements" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ Add New Client" })).toBeDisabled();
   });
   it("shows compact required progress and keeps optional and disabled sections out of the runner", async () => {
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }));
@@ -198,7 +185,8 @@ describe("extension report workflow", () => {
     expect(await screen.findByRole("heading", { name: "AutoLEDTech.com" })).toBeInTheDocument();
     expect(screen.getByText("Captured: 9 / 9 · Pending review: 9 · Approved: 0 · Missing/stale: 0")).toBeInTheDocument();
     expect(screen.getAllByText("Captured · Pending review")).toHaveLength(9);
-    expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText("Automatic capture: 9 / 9 sections captured")).toBeInTheDocument();
+    expect(screen.queryByText(/Approve all .* required screenshots/)).toBeNull();
     expect(screen.getByText(/final-only sections below are separate from the 9 automatic captures/)).toBeInTheDocument();
     const finalOnly = within(screen.getByRole("region", { name: "Final Report Readiness" }));
     expect(finalOnly.getByText("Signup Form Performance")).toBeInTheDocument();
@@ -213,7 +201,7 @@ describe("extension report workflow", () => {
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     expect(api.getReportDraft).toHaveBeenCalledWith("f577d631-a1f6-4cc0-9052-68e30460876d");
     expect(await screen.findByRole("heading", { name: "AutoLEDTech.com" })).toBeInTheDocument();
-    expect(screen.getByText("August 2026")).toBeInTheDocument();
+    expect(document.querySelector(".report-month")).toHaveTextContent("August 2026");
   });
   it("rebuilds completed checklist state from the persisted report after the extension view reloads", async () => {
     const persisted = { ...runnerReport(["overview"]), id: "f577d631-a1f6-4cc0-9052-68e30460876d", client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null }, reportMonth: { year: 2026, month: 8 }, period: { startDate: "2026-08-01", endDate: "2026-08-31", previousStartDate: "2026-07-01", previousEndDate: "2026-07-31" } };
@@ -349,7 +337,7 @@ describe("extension report workflow", () => {
     const artifact = { reportId: canonical.id, reportVersion: canonical.version, fileName: "Club-Furniture-2026-08-Performance-Review.pdf", byteSize: 1000, sha256: "a".repeat(64), physicalPageCount: 7, developmentOnly: true as const };
     const api = mockApi({
       listReportDrafts: vi.fn().mockResolvedValue([canonical]), getReportDraft: vi.fn().mockResolvedValue(canonical),
-      generateDevelopmentReviewPdf: vi.fn().mockResolvedValue(artifact), getDevelopmentReviewPdfStatus: vi.fn().mockRejectedValueOnce(new ApiError("PDF_REVIEW_NOT_GENERATED", "Not generated yet.", 404)).mockResolvedValue(artifact),
+      generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn(), generateDevelopmentReviewPdf: vi.fn().mockResolvedValue(artifact), getDevelopmentReviewPdfStatus: vi.fn().mockRejectedValueOnce(new ApiError("PDF_REVIEW_NOT_GENERATED", "Not generated yet.", 404)).mockResolvedValue(artifact),
     });
     const user = userEvent.setup(); const opened = vi.spyOn(window, "open").mockReturnValue(null);
     renderApp(api);
@@ -360,11 +348,290 @@ describe("extension report workflow", () => {
     expect(await screen.findByText(/Saved for report version 2 · 7 pages/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Preview Review PDF" }));
     expect(await screen.findByTitle("Development Review PDF Preview")).toHaveAttribute("src", `http://127.0.0.1:4000/api/v1/dev/report-drafts/${canonical.id}/partial-review/pdf`);
-    await user.click(screen.getByRole("button", { name: "Open PDF" }));
+    await user.click(screen.getByRole("button", { name: "Open Review PDF" }));
     expect(opened).toHaveBeenCalledWith(`http://127.0.0.1:4000/api/v1/dev/report-drafts/${canonical.id}/partial-review/pdf`, "_blank", "noopener,noreferrer");
-    await user.click(screen.getByRole("button", { name: "Download PDF" }));
+    await user.click(screen.getByRole("button", { name: "Download Review PDF" }));
     expect(opened).toHaveBeenCalledWith(`http://127.0.0.1:4000/api/v1/dev/report-drafts/${canonical.id}/partial-review/pdf?download=1`, "_blank", "noopener,noreferrer");
     expect(api.getDevelopmentReviewPdfStatus).toHaveBeenCalledWith(canonical.id, canonical.version);
+    expect(screen.getByText("This is a temporary review PDF. It does not update Google Drive or the editable Google Doc.")).toBeInTheDocument();
+    expect(api.generatePdf).not.toHaveBeenCalled();
+    // Captured 9/9, but the data definition is incomplete: nothing is generated, and approval is not what blocks it.
+    const final = screen.getByLabelText("Final Client Report");
+    expect(final).toHaveTextContent("Captured9/9"); expect(final).toHaveTextContent("Automated validationBLOCKED"); expect(final).toHaveTextContent("Final PDFBLOCKED");
+    expect(final).toHaveTextContent("Google DriveBLOCKED"); expect(final).toHaveTextContent("Google DocBLOCKED"); expect(final).toHaveTextContent("Human reviewOptional");
+    expect(final).toHaveTextContent("Reason: CURRENCY_NOT_CONFIGURED, CONVERSION_METRIC_ID_NOT_CONFIGURED");
+    expect(final).not.toHaveTextContent(/Approve all/);
+    expect(within(final).queryByRole("button", { name: /Generate Final Report|Retry Final Report/ })).toBeNull();
+    expect(api.autoGenerateFinalReport).not.toHaveBeenCalled();
+  });
+  describe("automatic final report after a validated automatic capture, with human review optional", () => {
+    function capturedNine() {
+      const canonical = structuredClone(runnerReport());
+      canonical.id = "e1376a59-9eb5-40a4-9fc1-2da03facb005";
+      canonical.client = { id: "club-furniture", name: "Club Furniture", timezone: "America/New_York", currency: "USD" };
+      canonical.reportMonth = { year: 2026, month: 9 };
+      canonical.period = { startDate: "2026-09-01", endDate: "2026-09-30", previousStartDate: "2026-08-01", previousEndDate: "2026-08-31" };
+      canonical.version = 10;
+      const types: ScreenshotType[] = ["overview", "top_flows", "top_campaigns", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability"];
+      canonical.screenshots = types.map((type, index) => ({
+        id: `imported-${type}`, clientId: canonical.client.id, reportMonth: canonical.reportMonth, type, capturedAt: NOW.toISOString(),
+        sourceUrl: "https://www.klaviyo.com/analytics/dashboards", width: 100, height: 100, approved: false, approvedAt: null,
+        captureOrigin: "live_acceptance_import" as const, periodConfirmed: true, storageKey: `reports/${canonical.id}/${type}.png`, mimeType: "image/png" as const,
+        byteSize: 100, sha256: (index + 1).toString(16).repeat(64), sourceProof: createScreenshotSourceProof(type, canonical.period),
+      }));
+      return { canonical, types };
+    }
+    const artifactFor = (reportId: string, drive: "uploaded" | "failed", doc: "synced" | "failed") => ({ id: "c0000000-0000-4000-8000-000000000001", reportId, storageKey: `reports/${reportId}/artifacts/a.pdf`, mimeType: "application/pdf" as const, byteSize: 10, sha256: "b".repeat(64), sourceFingerprint: "c".repeat(64), templateVersion: "monthly-report-v1", generatedAt: NOW.toISOString(),
+      driveDelivery: drive === "uploaded"
+        ? { driveUploadStatus: "uploaded" as const, driveFileName: "Club Furniture - September 2026.pdf", driveFileId: "pdf-id", driveFolderId: "folder-id", driveWebViewLink: "https://drive.google.com/file/d/pdf-id/view", driveUploadedAt: NOW.toISOString(), driveUploadAction: "updated" as const, driveErrorCode: null, driveAttemptedAt: NOW.toISOString() }
+        : { driveUploadStatus: "failed" as const, driveFileName: "Club Furniture - September 2026.pdf", driveFileId: null, driveFolderId: null, driveWebViewLink: null, driveUploadedAt: null, driveUploadAction: null, driveErrorCode: "DRIVE_UPLOAD_FAILED", driveAttemptedAt: NOW.toISOString() },
+      googleDoc: doc === "synced"
+        ? { googleDocStatus: "synced" as const, googleDocName: "Club Furniture - September 2026", googleDocId: "doc-id", googleDocFolderId: "folder-id", googleDocWebViewLink: "https://docs.google.com/document/d/doc-id/edit", googleDocUpdatedAt: NOW.toISOString(), googleDocVersion: "3", googleDocAction: "updated" as const, googleDocErrorCode: null, googleDocAttemptedAt: NOW.toISOString() }
+        : { googleDocStatus: "failed" as const, googleDocName: "Club Furniture - September 2026", googleDocId: null, googleDocFolderId: null, googleDocWebViewLink: null, googleDocUpdatedAt: null, googleDocVersion: null, googleDocAction: null, googleDocErrorCode: "GOOGLE_DOC_WRITE_FAILED", googleDocAttemptedAt: NOW.toISOString() } });
+    /** Approves one capture per call and bumps the version, as the backend does. */
+    function liveBackend(canonical: ReportDraft) {
+      let current = canonical; const calls: string[] = [];
+      return { calls, get: () => current,
+        approveImportedScreenshot: vi.fn(async (_id: string, type: ScreenshotType, input: { expectedVersion: number }) => { calls.push(`approve:${type}@${input.expectedVersion}`); current = { ...current, version: current.version + 1, screenshots: current.screenshots.map((shot) => shot.type === type ? { ...shot, approved: true, approvedAt: NOW.toISOString() } : shot) }; return current; }),
+        applyEvent: vi.fn(async (_id: string, event: string, version: number) => { calls.push(`event:${event}@${version}`); current = { ...current, status: "ready_for_review" as const, version: current.version + 1 }; return current; }),
+      };
+    }
+
+    const machineValidated = (draft: ReportDraft): ReportDraft => ({ ...draft, screenshots: draft.screenshots.map((shot) => ({ ...shot, automatedValidatedAt: NOW.toISOString() })) });
+
+    it("generates the final PDF, Drive PDF and Google Doc automatically with no approval and no Generate click", async () => {
+      const { canonical } = capturedNine();
+      const generated = { ...machineValidated(canonical), status: "generated" as const, version: 13 };
+      const autoGenerateFinalReport = vi.fn().mockResolvedValue({ report: generated, artifact: artifactFor(canonical.id, "uploaded", "synced") });
+      const live = liveBackend(canonical);
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([canonical]), getReportDraft: vi.fn().mockResolvedValue(canonical), autoGenerateFinalReport, approveImportedScreenshot: live.approveImportedScreenshot, applyEvent: live.applyEvent, generatePdf: vi.fn(),
+        getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifactFor(canonical.id, "uploaded", "synced")) });
+      withConfiguredDataDefinition(canonical, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Final PDFPASS"));
+      expect(autoGenerateFinalReport).toHaveBeenCalledTimes(1);
+      expect(autoGenerateFinalReport).toHaveBeenCalledWith(canonical.id, canonical.version, canonical.reportMonth);
+      // Nothing was approved, submitted or generated through the human path.
+      expect(live.approveImportedScreenshot).not.toHaveBeenCalled(); expect(live.applyEvent).not.toHaveBeenCalled(); expect(api.generatePdf).not.toHaveBeenCalled();
+      const done = screen.getByLabelText("Final Client Report");
+      expect(done).toHaveTextContent("Captured9/9"); expect(done).toHaveTextContent("Automated validationPASS");
+      expect(done).toHaveTextContent("Google DrivePASS"); expect(done).toHaveTextContent("Google DocPASS"); expect(done).toHaveTextContent("Human reviewOptional");
+      expect(within(done).getByRole("link", { name: "Open Drive PDF" })).toHaveAttribute("href", "https://drive.google.com/file/d/pdf-id/view");
+      expect(within(done).getByRole("link", { name: "Open Editable Google Doc" })).toHaveAttribute("href", "https://docs.google.com/document/d/doc-id/edit");
+      expect(within(done).queryByRole("button", { name: /Generate Final Report|Retry Final Report/ })).toBeNull();
+      expect(screen.queryByText(/Approve all .* before generating/)).toBeNull();
+    });
+
+    it("keeps Review & Approve as optional QA after the automatic report; approving does not generate again", async () => {
+      const { canonical, types } = capturedNine();
+      const generated = { ...machineValidated(canonical), status: "generated" as const, version: 13 };
+      const live = liveBackend(generated);
+      const autoGenerateFinalReport = vi.fn(async (_id: string, version: number) => { live.calls.push(`auto@${version}`); return { report: live.get(), artifact: artifactFor(canonical.id, "uploaded", "synced") }; });
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getPendingImportedScreenshotImage: vi.fn().mockResolvedValue(new Blob(["png"])), approveImportedScreenshot: live.approveImportedScreenshot, applyEvent: live.applyEvent, generatePdf: vi.fn(), autoGenerateFinalReport,
+        getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifactFor(canonical.id, "uploaded", "synced")) });
+      withConfiguredDataDefinition(generated, api); mockObjectUrls();
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Final PDFPASS"));
+      // A generated report with a current artifact is never generated again on open.
+      expect(autoGenerateFinalReport).not.toHaveBeenCalled();
+      const qa = screen.getByLabelText("Optional Human Review");
+      await user.click(within(qa).getByRole("button", { name: "Review & Approve 9 Captures" }));
+      expect(await screen.findAllByRole("img", { name: /^Saved .* capture$/ })).toHaveLength(9);
+      await user.click(screen.getByRole("button", { name: "Approve All 9" }));
+      await waitFor(() => expect(live.calls.at(-1)).toBe("auto@22"));
+      expect(live.calls).toEqual([...types.map((type, index) => `approve:${type}@${13 + index}`), "auto@22"]);
+      expect(live.applyEvent).not.toHaveBeenCalled(); expect(api.generatePdf).not.toHaveBeenCalled();
+    });
+
+    it("shows a failed backend validation with a retry, never recaptures, and keeps optional review showing the failing capture", async () => {
+      const { canonical } = capturedNine();
+      mockObjectUrls();
+      const autoGenerateFinalReport = vi.fn().mockRejectedValue(new ApiError("REQUIRED_SCREENSHOT_ASSET_MISSING", "Automatic capture flow_metrics failed stored-byte verification (hash, size or dimensions); nothing was generated.", 400));
+      const getPending = vi.fn(async (_id: string, type: ScreenshotType) => { if (type === "flow_metrics") throw new ApiError("IMPORTED_SCREENSHOT_REVIEW_REJECTED", "Imported screenshot source proof or period is stale or invalid.", 400); return new Blob(["png"]); });
+      const service = automaticService({ status: "idle" } as never);
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([canonical]), getReportDraft: vi.fn().mockResolvedValue(canonical), getPendingImportedScreenshotImage: getPending, approveImportedScreenshot: vi.fn(), generatePdf: vi.fn(), autoGenerateFinalReport });
+      withConfiguredDataDefinition(canonical, api);
+      const user = userEvent.setup(); renderApp(api, undefined, undefined, service);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      expect(await screen.findByText(/Automatic final report failed: REQUIRED_SCREENSHOT_ASSET_MISSING: Automatic capture flow_metrics failed stored-byte verification/)).toBeInTheDocument();
+      const final = screen.getByLabelText("Final Client Report");
+      expect(final).toHaveTextContent("Automated validationFAIL"); expect(final).not.toHaveTextContent("Final PDFPASS");
+      expect(service.start).not.toHaveBeenCalled();
+      await user.click(within(final).getByRole("button", { name: "Retry Final Report" }));
+      await waitFor(() => expect(autoGenerateFinalReport).toHaveBeenCalledTimes(2));
+      expect(service.start).not.toHaveBeenCalled();
+      await user.click(screen.getByRole("button", { name: "Review & Approve 9 Captures" }));
+      expect(await screen.findByText(/flow_metrics: Imported screenshot source proof or period is stale or invalid/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Approve All 9" })).toBeDisabled();
+      expect(api.approveImportedScreenshot).not.toHaveBeenCalled(); expect(api.generatePdf).not.toHaveBeenCalled();
+    });
+
+    it("does not generate while a data blocker is open", async () => {
+      const { canonical } = capturedNine();
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([canonical]), getReportDraft: vi.fn().mockResolvedValue(canonical), generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn() });
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      const final = await screen.findByLabelText("Final Client Report");
+      await waitFor(() => expect(final).toHaveTextContent("CONVERSION_METRIC_ID_NOT_CONFIGURED"));
+      expect(final).toHaveTextContent("Automated validationBLOCKED");
+      expect(screen.getByRole("button", { name: "Review & Approve 9 Captures" })).toBeDisabled();
+      expect(api.autoGenerateFinalReport).not.toHaveBeenCalled();
+    });
+
+    it("regenerates automatically when a generated report's captures changed after generation", async () => {
+      const { canonical } = capturedNine();
+      const generated = { ...canonical, status: "generated" as const, version: 22 };
+      const autoGenerateFinalReport = vi.fn(() => new Promise(() => undefined));
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getCurrentPdfArtifact: vi.fn().mockRejectedValue(new ApiError("PDF_ARTIFACT_STALE", "No current generated PDF exists.", 404)), autoGenerateFinalReport });
+      withConfiguredDataDefinition(generated, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      await waitFor(() => expect(autoGenerateFinalReport).toHaveBeenCalledWith(generated.id, 22, generated.reportMonth));
+    });
+
+    const generatedNine = () => { const { canonical } = capturedNine(); return { ...canonical, status: "generated" as const, version: 22, screenshots: canonical.screenshots.map((shot) => ({ ...shot, automatedValidatedAt: NOW.toISOString() })) }; };
+
+    it("shows direct links to the Drive PDF, the editable Google Doc and the month folder — two different files", async () => {
+      const generated = generatedNine();
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifactFor(generated.id, "uploaded", "synced")), autoGenerateFinalReport: vi.fn() });
+      withConfiguredDataDefinition(generated, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      const files = await screen.findByLabelText("Report files");
+      expect(within(files).getByRole("link", { name: "Open Drive PDF" })).toHaveAttribute("href", "https://drive.google.com/file/d/pdf-id/view");
+      expect(within(files).getByRole("link", { name: "Open Editable Google Doc" })).toHaveAttribute("href", "https://docs.google.com/document/d/doc-id/edit");
+      expect(within(files).getByRole("link", { name: "Open September 2026 Folder" })).toHaveAttribute("href", "https://drive.google.com/drive/folders/folder-id");
+      const final = screen.getByLabelText("Final Client Report");
+      expect(within(final).getByRole("button", { name: "Open Final PDF" })).toBeInTheDocument(); expect(within(final).getByRole("button", { name: "Download Final PDF" })).toBeInTheDocument();
+      expect(within(final).queryByRole("button", { name: /Retry/ })).toBeNull();
+    });
+
+    it("keeps an existing Doc openable beside Retry when its sync failed", async () => {
+      const generated = generatedNine();
+      const failed = artifactFor(generated.id, "uploaded", "failed");
+      const artifact = { ...failed, googleDoc: { ...failed.googleDoc, googleDocId: "doc-id", googleDocFolderId: "folder-id", googleDocWebViewLink: "https://docs.google.com/document/d/doc-id/edit", googleDocErrorCode: "GOOGLE_DOC_EDITED_IN_DRIVE" } };
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifact), autoGenerateFinalReport: vi.fn() });
+      withConfiguredDataDefinition(generated, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      const files = await screen.findByLabelText("Report files");
+      expect(within(files).getByRole("link", { name: "Open Existing Google Doc" })).toHaveAttribute("href", "https://docs.google.com/document/d/doc-id/edit");
+      expect(within(screen.getByLabelText("Final Client Report")).getByRole("button", { name: "Retry Google Doc" })).toBeInTheDocument();
+    });
+
+    it("never adopts an unverified Doc by itself: it shows it, and adopts that exact Doc only on Adopt Existing Doc", async () => {
+      const generated = generatedNine();
+      const failed = artifactFor(generated.id, "uploaded", "failed");
+      const candidate = { ...failed, googleDoc: { ...failed.googleDoc, googleDocErrorCode: "GOOGLE_DOC_NOT_TENTION_MANAGED", googleDocFolderId: "folder-id", googleDocCandidateId: "found-doc", googleDocCandidateWebViewLink: "https://docs.google.com/document/d/found-doc/edit" } };
+      const adoptGoogleDoc = vi.fn().mockResolvedValue(artifactFor(generated.id, "uploaded", "synced"));
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getCurrentPdfArtifact: vi.fn().mockResolvedValue(candidate), adoptGoogleDoc, retryGoogleDoc: vi.fn(), autoGenerateFinalReport: vi.fn() });
+      withConfiguredDataDefinition(generated, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      const notice = await screen.findByLabelText("Unverified Google Doc");
+      expect(notice).toHaveTextContent("Existing Google Doc found but not verified as Tention-managed.");
+      expect(within(notice).getByRole("link", { name: "Open Existing Google Doc" })).toHaveAttribute("href", "https://docs.google.com/document/d/found-doc/edit");
+      expect(adoptGoogleDoc).not.toHaveBeenCalled();
+      await user.click(within(notice).getByRole("button", { name: "Adopt Existing Doc" }));
+      await waitFor(() => expect(adoptGoogleDoc).toHaveBeenCalledWith(generated.id, "found-doc"));
+      await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Google DocPASS"));
+      expect(screen.queryByLabelText("Unverified Google Doc")).toBeNull();
+      expect(api.retryGoogleDoc).not.toHaveBeenCalled();
+    });
+
+    it("retries only Drive, then only the Google Doc, from the existing PDF without generating again", async () => {
+      const { canonical } = capturedNine();
+      const generated = { ...canonical, status: "generated" as const, version: 22, screenshots: canonical.screenshots.map((shot) => ({ ...shot, approved: true, approvedAt: NOW.toISOString() })) };
+      const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([generated]), getReportDraft: vi.fn().mockResolvedValue(generated), getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifactFor(generated.id, "failed", "failed")),
+        retryDriveDelivery: vi.fn().mockResolvedValue(artifactFor(generated.id, "uploaded", "failed")), retryGoogleDoc: vi.fn().mockResolvedValue(artifactFor(generated.id, "uploaded", "synced")), generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn() });
+      withConfiguredDataDefinition(generated, api);
+      const user = userEvent.setup(); renderApp(api);
+      await user.click(await screen.findByRole("button", { name: "Open Report" }));
+      const final = screen.getByLabelText("Final Client Report");
+      await waitFor(() => expect(final).toHaveTextContent("Google DriveFAIL · DRIVE_UPLOAD_FAILED"));
+      expect(final).toHaveTextContent("Final PDFPASS");
+      await user.click(within(final).getByRole("button", { name: "Retry Google Drive upload" }));
+      await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Google DrivePASS"));
+      await user.click(within(screen.getByLabelText("Final Client Report")).getByRole("button", { name: "Retry Google Doc" }));
+      await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Google DocPASS"));
+      expect(api.retryDriveDelivery).toHaveBeenCalledWith(generated.id); expect(api.retryGoogleDoc).toHaveBeenCalledWith(generated.id);
+      expect(api.generatePdf).not.toHaveBeenCalled(); expect(api.autoGenerateFinalReport).not.toHaveBeenCalled();
+    });
+  });
+
+  it("always shows which client, month and periods the open report is for", async () => {
+    const report = runnerReport();
+    renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]), getReportDraft: vi.fn().mockResolvedValue(report) }));
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Open Report" }));
+    const header = document.querySelector(".period-preview")!;
+    expect(header).toHaveTextContent(`Client${report.client.name}`);
+    expect(header).toHaveTextContent(`Report Month${formatReportMonth(report.reportMonth)}`);
+    expect(header).toHaveTextContent(`Reporting Period${formatCalendarRange(report.period.startDate, report.period.endDate)}`);
+    expect(header).toHaveTextContent(`Previous Comparison${formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}`);
+  });
+  it("generates the final client report for the displayed month automatically and shows the PDF, Drive PDF and Google Doc results with links", async () => {
+    const ready = { ...runnerReport(runnerScreenshotTypes), status: "ready_for_review" as const, version: 11 };
+    ready.client = { ...ready.client, currency: "USD" };
+    const generated = { ...ready, status: "generated" as const, version: 12 };
+    const artifact = { id: "c0000000-0000-4000-8000-000000000001", reportId: ready.id, storageKey: `reports/${ready.id}/artifacts/a.pdf`, mimeType: "application/pdf" as const, byteSize: 10, sha256: "b".repeat(64), sourceFingerprint: "c".repeat(64), templateVersion: "monthly-report-v1", generatedAt: NOW.toISOString(),
+      driveDelivery: { driveUploadStatus: "uploaded" as const, driveFileName: "Report - August 2026.pdf", driveFileId: "pdf-id", driveFolderId: "folder-id", driveWebViewLink: "https://drive.google.com/file/d/pdf-id/view", driveUploadedAt: NOW.toISOString(), driveUploadAction: "created" as const, driveErrorCode: null, driveAttemptedAt: NOW.toISOString() },
+      googleDoc: { googleDocStatus: "synced" as const, googleDocName: "Report - August 2026", googleDocId: "doc-id", googleDocFolderId: "folder-id", googleDocWebViewLink: "https://docs.google.com/document/d/doc-id/edit", googleDocUpdatedAt: NOW.toISOString(), googleDocVersion: "3", googleDocAction: "created" as const, googleDocErrorCode: null, googleDocAttemptedAt: NOW.toISOString() } };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([ready]), getReportDraft: vi.fn().mockResolvedValue(ready), generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn().mockResolvedValue({ report: generated, artifact }), getCurrentPdfArtifact: vi.fn().mockResolvedValue(artifact) });
+    withConfiguredDataDefinition(ready, api);
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await waitFor(() => expect(api.autoGenerateFinalReport).toHaveBeenCalledWith(ready.id, ready.version, ready.reportMonth));
+    expect(api.generatePdf).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByLabelText("Final Client Report")).toHaveTextContent("Final PDFPASS"));
+    const done = screen.getByLabelText("Final Client Report");
+    expect(done).toHaveTextContent("Google DrivePASS"); expect(done).toHaveTextContent("Google DocPASS");
+    expect(within(done).getByRole("link", { name: "Open Drive PDF" })).toHaveAttribute("href", "https://drive.google.com/file/d/pdf-id/view");
+    expect(within(done).getByRole("link", { name: "Open Editable Google Doc" })).toHaveAttribute("href", "https://docs.google.com/document/d/doc-id/edit");
+    expect(within(done).queryByRole("button", { name: /Retry|Generate Final Report/ })).toBeNull();
+    expect(within(done).getByRole("button", { name: "Open Final PDF" })).toBeInTheDocument();
+  });
+  it("does not generate at 9/9 approved and reviewed while currency and the Placed Order metric ID are unconfigured", async () => {
+    const ready = { ...runnerReport(runnerScreenshotTypes), status: "ready_for_review" as const, version: 11 };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([ready]), getReportDraft: vi.fn().mockResolvedValue(ready), generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn() });
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    const final = screen.getByLabelText("Final Client Report");
+    await waitFor(() => expect(final).toHaveTextContent("Final PDFBLOCKED"));
+    expect(within(final).queryByRole("button", { name: /Generate Final Report|Retry Final Report/ })).toBeNull();
+    expect(api.autoGenerateFinalReport).not.toHaveBeenCalled();
+    expect(final).toHaveTextContent("CURRENCY_NOT_CONFIGURED");
+    expect(final).toHaveTextContent("CONVERSION_METRIC_ID_NOT_CONFIGURED");
+    expect(api.generatePdf).not.toHaveBeenCalled();
+  });
+  it("applies the client's verified profile currency to a report frozen with none, changing only the currency", async () => {
+    const ready = { ...runnerReport(runnerScreenshotTypes), status: "ready_for_review" as const, version: 11 };
+    const withCurrency = { ...ready, client: { ...ready.client, currency: "USD" }, version: 12 };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([ready]), getReportDraft: vi.fn().mockResolvedValue(ready), applyClientProfileCurrency: vi.fn().mockResolvedValue(withCurrency), generatePdf: vi.fn(), autoGenerateFinalReport: vi.fn(() => new Promise(() => undefined)) });
+    withConfiguredDataDefinition(ready, api);
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    const final = screen.getByLabelText("Final Client Report");
+    expect(final).toHaveTextContent("CURRENCY_NOT_CONFIGURED");
+    await user.click(await within(final).findByRole("button", { name: "Apply client currency (USD) to this report" }));
+    expect(api.applyClientProfileCurrency).toHaveBeenCalledWith(ready.id, ready);
+    await waitFor(() => expect(screen.getByLabelText("Final Client Report")).not.toHaveTextContent("CURRENCY_NOT_CONFIGURED"));
+    // Once the data definition is complete the final report starts on its own.
+    await waitFor(() => expect(api.autoGenerateFinalReport).toHaveBeenCalledWith(ready.id, withCurrency.version, ready.reportMonth));
+    expect(api.generatePdf).not.toHaveBeenCalled();
+  });
+  it("shows REPORT_MONTH_MISMATCH and no results when the backend refuses a month mismatch", async () => {
+    const ready = { ...runnerReport(runnerScreenshotTypes), status: "ready_for_review" as const, version: 11 };
+    ready.client = { ...ready.client, currency: "USD" };
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([ready]), getReportDraft: vi.fn().mockResolvedValue(ready), autoGenerateFinalReport: vi.fn().mockRejectedValue(new ApiError("REPORT_MONTH_MISMATCH", "The report month is inconsistent.", 409)) });
+    withConfiguredDataDefinition(ready, api);
+    const user = userEvent.setup(); renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    expect(await screen.findByText(/REPORT_MONTH_MISMATCH: The report month is inconsistent/)).toBeInTheDocument();
+    const final = screen.getByLabelText("Final Client Report");
+    expect(final).not.toHaveTextContent("Final PDFPASS"); expect(final).not.toHaveTextContent("Google DrivePASS");
+    expect(within(final).queryByRole("link")).toBeNull();
   });
   it("does not render retired List Growth configuration or let it block the current report", async () => {
     const targetless = { clientId: "orion", businessReview: null, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, createdAt: null, updatedAt: null };
@@ -486,6 +753,7 @@ describe("extension report workflow", () => {
   });
   it("persists capture review completion in the UI and keeps reopening review idempotent", async () => {
     const awaitingReview = { ...runnerReport(runnerScreenshotTypes), status: "draft" as const, version: 10 };
+    awaitingReview.client = { ...awaitingReview.client, currency: "USD" };
     const completed = { ...awaitingReview, status: "ready_for_review" as const, version: 11 };
     const api = mockApi({
       listReportDrafts: vi.fn().mockResolvedValue([awaitingReview]), getReportDraft: vi.fn().mockResolvedValue(awaitingReview),
@@ -500,7 +768,6 @@ describe("extension report workflow", () => {
     expect(await screen.findByLabelText("Capture Review")).toHaveTextContent("Completed");
     expect(screen.getByRole("button", { name: "View Review" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Preview Report" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Generate PDF" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "View Review" }));
     expect(await screen.findByRole("button", { name: "Back to report" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Back to report" }));
@@ -547,13 +814,13 @@ describe("extension report workflow", () => {
     expect(await screen.findByText("Report validation blocks review submission.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Complete Capture Review" })).toBeInTheDocument();
   });
-  it("returns to setup without deleting the current report when starting a new report", async () => {
+  it("returns to the clients screen without deleting the current report when starting a new report", async () => {
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) });
     const user = userEvent.setup(); renderApp(api);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await user.click(screen.getByRole("button", { name: "Start New Report" }));
-    expect(await screen.findByRole("heading", { name: "Report setup" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "+ New Monthly Report" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Clients" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ Add New Client" })).toBeInTheDocument();
     expect(api.deleteReportDraft).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Open Report" })).toBeInTheDocument();
   });
@@ -581,7 +848,7 @@ describe("extension report workflow", () => {
     const confirmedDialog = screen.getByRole("dialog", { name: "Delete report?" });
     await user.type(within(confirmedDialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
     await user.click(within(confirmedDialog).getByRole("button", { name: "Delete Report" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Report deleted.");
+    expect(await screen.findByRole("status")).toHaveTextContent("August 2026 report deleted.");
     expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
     expect(screen.queryByText("Orion Supplements")).toBeNull();
     expect(screen.getByText("Second Client")).toBeInTheDocument();
@@ -622,7 +889,7 @@ describe("extension report workflow", () => {
     const confirmedDialog = screen.getByRole("dialog", { name: "Delete report?" });
     await user.type(within(confirmedDialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
     await user.click(within(confirmedDialog).getByRole("button", { name: "Delete Report" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Report deleted.");
+    expect(await screen.findByRole("status")).toHaveTextContent("August 2026 report deleted.");
     expect(api.deleteReportDraft).toHaveBeenCalledWith(report.id, report.version);
     expect(screen.queryByRole("button", { name: "Open Report" })).toBeNull();
   });
@@ -1135,6 +1402,41 @@ describe("capture workflow cross-section safety", () => {
     expect(screen.queryByText(/Executive Summary/)).not.toBeInTheDocument();
     expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
   });
+  it.each([["Flow Performance", "flow_performance"], ["Campaign Metrics", "campaign_metrics"]] as const)("retakes only %s while it is captured but pending review, without rerunning the other sections", async (label, type) => {
+    const initial = runnerReport(runnerScreenshotTypes);
+    initial.screenshots = initial.screenshots.map((shot) => ({ ...shot, approved: false, approvedAt: null, captureOrigin: "live_acceptance_import" as const }));
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), uploadScreenshotImage: vi.fn(), approveImportedScreenshot: vi.fn(),
+    }));
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACTION_NOT_INVOKED" as const, message: "Click the toolbar icon." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined) };
+    const user = userEvent.setup();
+    const { container } = render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={service} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn())} now={() => new Date(NOW)} />);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    // Every captured, pending required section offers its own retake next to its review.
+    await screen.findAllByRole("button", { name: "Retake saved capture" });
+    const checklist = [...container.querySelectorAll<HTMLElement>(".runner-checklist")].find((list) => !list.closest("[aria-label='Automatic Capture Progress']"))!;
+    expect(within(checklist).getAllByRole("button", { name: "Retake saved capture" })).toHaveLength(runnerScreenshotTypes.length);
+    expect(screen.queryByRole("button", { name: /^Resume Automatic Capture/ })).not.toBeInTheDocument();
+    const row = within(checklist).getByText(label, { selector: "strong" }).closest("li")!;
+    await user.click(within(row).getByRole("button", { name: "Retake saved capture" }));
+    await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
+    // A resume run planned for exactly this section; nothing else is captured, uploaded, or approved.
+    expect(api.startLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.objectContaining({ mode: "resume", plannedSections: [type] }));
+    expect(vi.mocked(service.start).mock.calls.map(([request]) => request.screenshotType)).toEqual([type]);
+    expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
+    expect(api.approveImportedScreenshot).not.toHaveBeenCalled();
+  });
+  it("offers no pending retake for an approved section; approved evidence keeps its own Retake", async () => {
+    const initial = runnerReport(runnerScreenshotTypes);
+    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), startLocalAutomaticCaptureRun: vi.fn() });
+    const user = userEvent.setup(); const { container } = renderApp(api);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await screen.findAllByRole("button", { name: "Retake" });
+    expect(within([...container.querySelectorAll<HTMLElement>(".runner-checklist")].find((list) => !list.closest("[aria-label='Automatic Capture Progress']"))!).getAllByRole("button", { name: "Retake" })).toHaveLength(runnerScreenshotTypes.length);
+    expect(screen.queryByRole("button", { name: "Retake saved capture" })).not.toBeInTheDocument();
+  });
   it("saves the Subscriber Growth source from one toolbar click, confirmed by reloading the client configuration", async () => {
     const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
     const api = rememberingTargets(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial) }));
@@ -1342,16 +1644,64 @@ describe("client setup preflight for automatic capture", () => {
     expect(screen.queryByText(/could not be discovered automatically/i)).toBeNull();
   });
 
-  it.each([
-    ["the authorized tab shows another account", { ok: false, code: "ACCOUNT_CONTEXT_MISMATCH", message: "The authenticated Klaviyo account differs from this client’s saved account binding. No dashboard URL was saved." }],
-    ["the toolbar grant is missing", { ok: false, code: "ACTION_NOT_INVOKED", message: "Open the intended client’s Klaviyo account and click the Tention Reports extension before discovery." }],
-  ])("fails closed with the typed reason when %s", async (_case, failure) => {
-    const discovery = vi.fn().mockResolvedValue(failure);
-    const { api, service, render } = setup(savedTargets, discovery); render();
+  const noGrant = { ok: false as const, code: "ACTION_NOT_INVOKED" as const, message: "Open the intended client’s Klaviyo account and click the Tention Reports extension before discovery." };
+  const wrongAccount = { ok: false as const, code: "ACCOUNT_CONTEXT_MISMATCH" as const, message: "The authenticated Klaviyo account differs from this client’s saved account binding. No dashboard URL was saved." };
+  /** Renders with an injectable Tention Reports toolbar click (the activeTab grant event). */
+  function renderWithToolbar(api: ApiClient, service: AutoCaptureService, discovery: ReturnType<typeof vi.fn>) {
+    const listeners = new Set<() => void>();
+    const watchToolbarClick = vi.fn((callback: () => void) => { listeners.add(callback); return () => listeners.delete(callback); });
+    render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() } as never} automaticCaptureService={service} discoverBusinessReviewSource={discovery as never} watchToolbarClick={watchToolbarClick} now={() => new Date(NOW)} />);
+    return { clickToolbar: () => act(() => { for (const listener of listeners) listener(); }) };
+  }
+
+  it("a configured client without a toolbar grant needs Klaviyo tab access, not client setup", async () => {
+    const discovery = vi.fn().mockResolvedValue(noGrant);
+    const { api, service } = setup(savedTargets, discovery); renderWithToolbar(api, service, discovery);
     await openAndStart();
-    expect(await screen.findByText(`Client setup needs attention before capture. ${failure.code}: ${failure.message}`)).toBeInTheDocument();
+    const notice = await screen.findByRole("alert", { name: "Klaviyo tab access required" });
+    expect(notice).toHaveTextContent("Open Acme Home in Klaviyo and click the Tention Reports extension once to continue.");
+    expect(screen.queryByText(/Client setup needs attention/)).toBeNull();
     expect(service.start).not.toHaveBeenCalled();
     expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+  });
+
+  it("continues the pending start by itself after one toolbar click, re-verifying the saved account first", async () => {
+    const discovery = vi.fn().mockResolvedValueOnce(noGrant).mockResolvedValueOnce(accountVerified);
+    const { api, service } = setup(savedTargets, discovery); const toolbar = renderWithToolbar(api, service, discovery);
+    await openAndStart();
+    await screen.findByRole("alert", { name: "Klaviyo tab access required" });
+    expect(service.start).not.toHaveBeenCalled();
+    await toolbar.clickToolbar();
+    // No second Start click: the grant resumes the same start, and the saved account is proven again first.
+    await waitFor(() => expect(service.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "overview" })));
+    expect(discovery).toHaveBeenCalledTimes(2);
+    expect(discovery).toHaveBeenLastCalledWith(expect.objectContaining({ clientName: "Acme Home", configuredUrl: savedUrl, verifySavedAccountOnly: true }));
+    expect(screen.queryByRole("alert", { name: "Klaviyo tab access required" })).toBeNull();
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+  });
+
+  it("does nothing on a toolbar click when no start is waiting", async () => {
+    const discovery = vi.fn().mockResolvedValue(accountVerified);
+    const { api, service } = setup(savedTargets, discovery); const toolbar = renderWithToolbar(api, service, discovery);
+    await userEvent.setup().click(await screen.findByRole("button", { name: "Open Report" }));
+    await screen.findByRole("button", { name: /Start Automatic Capture/ });
+    await toolbar.clickToolbar();
+    expect(discovery).not.toHaveBeenCalled(); expect(service.start).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when another client's Klaviyo account is open, also after a toolbar click on that account", async () => {
+    const discovery = vi.fn().mockResolvedValue(wrongAccount);
+    const { api, service } = setup(savedTargets, discovery); const toolbar = renderWithToolbar(api, service, discovery);
+    await openAndStart();
+    const notice = await screen.findByRole("alert", { name: "Wrong Klaviyo account" });
+    expect(notice).toHaveTextContent("could not be verified as Acme Home. Nothing was captured.");
+    expect(notice).toHaveTextContent("ACCOUNT_CONTEXT_MISMATCH");
+    await toolbar.clickToolbar();
+    await waitFor(() => expect(discovery).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("alert", { name: "Wrong Klaviyo account" })).toBeInTheDocument();
+    expect(service.start).not.toHaveBeenCalled();
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Client setup needs attention/)).toBeNull();
   });
 
   it("still blocks Business Review sections when no verified Business Review exists, then clears the old error after a successful save", async () => {
@@ -1364,7 +1714,7 @@ describe("client setup preflight for automatic capture", () => {
     expect(discovery).toHaveBeenLastCalledWith(expect.not.objectContaining({ verifySavedAccountOnly: true }));
     expect(service.start).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
-    await waitFor(() => expect(api.saveClientReportTargets).toHaveBeenCalledWith("acme-home", expect.objectContaining({ businessReview: expect.objectContaining({ dashboardUrl: savedUrl, accountLabel: "AC Acme Home" }) })));
+    await waitFor(() => expect(api.saveClientReportTargets).toHaveBeenCalledWith("acme-home", expect.objectContaining({ businessReview: expect.objectContaining({ dashboardUrl: savedUrl, accountLabel: "Acme Home" }) })));
     await waitFor(() => expect(service.start).toHaveBeenCalled());
     expect(screen.queryByText(/could not be discovered automatically/i)).toBeNull();
     expect(screen.queryByText(/BUSINESS_REVIEW_NOT_DISCOVERED/)).toBeNull();
@@ -1401,34 +1751,6 @@ describe("canonical client configuration in the extension", () => {
   const profile = (name: string, timezone: string) => ({ name, timezone, currency: null, conversionMetric: { label: "Placed Order", providerMetricId: null }, sections: null });
   const configured = (clientId: string, name: string, timezone: string) => ({ clientId, profile: profile(name, timezone), businessReview: null, sourceUrls: null, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, welcomeFlowListing: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, createdAt: NOW.toISOString(), updatedAt: NOW.toISOString() });
 
-  it.each([
-    ["alpha-goods", "Alpha Goods", "America/New_York"],
-    ["beta-outfitters", "Beta Outfitters", "Asia/Kolkata"],
-  ])("creates a %s report from the saved profile without asking for the timezone again", async (clientId, name, timezone) => {
-    const api = mockApi({ listClientConfigurations: vi.fn().mockResolvedValue([configured("alpha-goods", "Alpha Goods", "America/New_York"), configured("beta-outfitters", "Beta Outfitters", "Asia/Kolkata")]) });
-    const user = userEvent.setup(); renderApp(api);
-    await screen.findByText("Connected");
-    await user.type(screen.getByLabelText("Client Name"), name);
-    expect(await screen.findByLabelText("Client timezone")).toHaveTextContent(`Timezone ${timezone} · saved client configuration`);
-    expect(screen.queryByLabelText("Timezone")).toBeNull();
-    await user.click(screen.getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: clientId, name, timezone } })));
-    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
-  });
-
-  it("asks a new client for its timezone once and saves it on the client before the first report", async () => {
-    const api = mockApi();
-    const user = userEvent.setup(); renderApp(api);
-    await screen.findByText("Connected");
-    await user.type(screen.getByLabelText("Client Name"), "Delta Home");
-    expect(screen.getByText("New client: this timezone is saved once and reused for every report.")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("Timezone"), "Europe/London");
-    await user.click(screen.getByRole("button", { name: "Continue" }));
-    await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "delta-home", name: "Delta Home", timezone: "Europe/London" } })));
-    expect(api.saveClientReportTargets).toHaveBeenCalledWith("delta-home", expect.objectContaining({ profile: expect.objectContaining({ name: "Delta Home", timezone: "Europe/London" }) }));
-    expect(vi.mocked(api.saveClientReportTargets).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.createReportDraft).mock.invocationCallOrder[0]!);
-  });
-
   it("blocks capture for a report whose timezone differs from the saved client configuration and never rewrites it", async () => {
     const draft = { ...runnerReport(), client: { id: "alpha-goods", name: "Alpha Goods", timezone: "America/Chicago", currency: null } };
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([draft]), getReportDraft: vi.fn().mockResolvedValue(draft), getClientReportTargets: vi.fn().mockResolvedValue(configured("alpha-goods", "Alpha Goods", "America/New_York")) });
@@ -1454,6 +1776,8 @@ describe("canonical client configuration in the extension", () => {
     expect(screen.getByLabelText("Client timezone")).toHaveValue("");
     await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
     expect(await screen.findByText(/CLIENT_CONFIGURATION_REQUIRED/)).toBeInTheDocument();
+    // Genuinely missing configuration is reported as such, never as a Klaviyo tab-access step.
+    expect(screen.queryByRole("alert", { name: "Klaviyo tab access required" })).toBeNull();
     expect(service.start).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText("Client timezone"), "America/Chicago");
     await user.click(screen.getByRole("button", { name: "Save Client Timezone" }));
@@ -1461,5 +1785,704 @@ describe("canonical client configuration in the extension", () => {
     expect(await screen.findByText("America/Chicago · saved client configuration")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
     await waitFor(() => expect(service.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "overview", accountUrl: "https://www.klaviyo.com/dashboard" })));
+  });
+});
+
+
+describe("client onboarding (phase 1) before monthly reports (phase 2)", () => {
+  const ONBOARDING_NOW = new Date("2026-11-06T12:00:00Z");
+  const READY_SOURCES = { deliverabilityUrl: "https://www.klaviyo.com/analytics/deliverability/email/score", subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" };
+  const STEVEN_REVIEW = { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/01SDBR", displayName: "Business Review", accountLabel: "Steven Dann" };
+  const targets = (clientId: string, value: Record<string, unknown>) => clientReportTargetsSchema.parse({ clientId, createdAt: null, updatedAt: null, ...value });
+  const club = () => targets("club-furniture", { profile: { name: "Club Furniture", timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "KyqTnx" }, sections: null }, businessReview: { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/01CF", displayName: "Business Review", accountLabel: "CL Club Furniture" }, sourceUrls: READY_SOURCES });
+  const readySteven = () => targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "SDmet1" }, sections: null }, businessReview: STEVEN_REVIEW, sourceUrls: READY_SOURCES });
+
+  /** A stateful fake of the API's client endpoints, computing status with the same shared validator the API uses. */
+  function backend(initial: ClientReportTargets[] = [], drafts: ReportDraft[] = []) {
+    const store = new Map(initial.map((value) => [value.clientId, value]));
+    const summary = (value: ClientReportTargets) => { const blockers = clientSetupBlockers(value, [...store.values()]); return { clientId: value.clientId, name: value.profile?.name ?? value.clientId, status: clientSetupStatus(blockers), blockers, setup: structuredClone(value) }; };
+    const reports = [...drafts];
+    const api = mockApi({
+      listClientSetups: vi.fn(async () => [...store.values()].filter(({ profile }) => profile).map(summary).sort((a, b) => a.name.localeCompare(b.name))),
+      getClientSetup: vi.fn(async (clientId: string) => summary(store.get(clientId)!)),
+      createClient: vi.fn(async (name: string) => {
+        const clientId = deriveNewClientId(name);
+        if (store.get(clientId)?.profile) throw new ApiError("CLIENT_ALREADY_EXISTS", `${name} already exists.`, 409, { error: "CLIENT_ALREADY_EXISTS", clientId });
+        store.set(clientId, targets(clientId, { profile: { name, timezone: null } }));
+        return summary(store.get(clientId)!);
+      }),
+      getClientReportTargets: vi.fn(async (clientId: string) => structuredClone(store.get(clientId) ?? targets(clientId, {}))),
+      saveClientReportTargets: vi.fn(async (clientId: string, input: Record<string, unknown>) => {
+        const metricId = (input.profile as ClientReportTargets["profile"])?.conversionMetric.providerMetricId;
+        if (metricId && [...store.values()].some((other) => other.clientId !== clientId && other.profile?.conversionMetric.providerMetricId === metricId)) throw new ApiError("CONVERSION_METRIC_ID_ALREADY_BOUND", "This Klaviyo metric ID is already saved on another client.", 409);
+        store.set(clientId, targets(clientId, input)); return structuredClone(store.get(clientId)!);
+      }),
+      listReportDrafts: vi.fn(async (filters?: { clientId?: string; year?: number; month?: number }) => reports.filter((draft) => (!filters?.clientId || draft.client.id === filters.clientId) && (!filters?.month || draft.reportMonth.month === filters.month))),
+      createReportDraft: vi.fn(async (request: { client: { id: string }; reportMonth: { year: number; month: number }; sections: Record<string, string> }) => {
+        const value = store.get(request.client.id)!;
+        const blockers = clientSetupBlockers(value, [...store.values()]);
+        if (blockers.length) throw new ApiError("CLIENT_SETUP_INCOMPLETE", "Client setup is incomplete.", 409, { error: "CLIENT_SETUP_INCOMPLETE", blockers });
+        if (reports.some((draft) => draft.client.id === request.client.id && draft.reportMonth.month === request.reportMonth.month)) throw new ApiError("REPORT_DRAFT_ALREADY_EXISTS", "duplicate", 409);
+        const created: ReportDraft = { ...report, id: "33333333-3333-4333-8333-333333333333", client: clientReportSnapshot(value), reportMonth: request.reportMonth as ReportDraft["reportMonth"], period: { startDate: "2026-10-01", endDate: "2026-10-31", previousStartDate: "2026-09-01", previousEndDate: "2026-09-30" }, sections: request.sections as ReportDraft["sections"] };
+        reports.push(created); return created;
+      }),
+    });
+    api.getReportDraft = vi.fn(async (id: string) => reports.find((draft) => draft.id === id) ?? report) as ApiClient["getReportDraft"];
+    // Mirrors DELETE /clients/:clientId/reports/:reportId: one report only, never the client; Drive files are never deleted.
+    api.deleteClientReport = vi.fn(async (clientId: string, reportId: string) => {
+      const index = reports.findIndex((draft) => draft.id === reportId);
+      if (index < 0) throw new ApiError("REPORT_NOT_FOUND", "This report no longer exists.", 404);
+      if (reports[index]!.client.id !== clientId) throw new ApiError("REPORT_CLIENT_MISMATCH", "This report belongs to another client.", 409);
+      if (reports[index]!.status === "generating") throw new ApiError("REPORT_DELETE_BLOCKED_GENERATING", "This report is currently generating. Try again after generation finishes.", 409);
+      const [removed] = reports.splice(index, 1);
+      return { reportId, driveFilesRetained: removed!.status === "generated" ? 2 : 0 };
+    }) as ApiClient["deleteClientReport"];
+    return { api, store, reports };
+  }
+  function discoveryFakes() {
+    const toolbar: Array<() => void> = []; const metricWatchers: Array<() => void> = [];
+    const sources = {
+      verifyDeliverability: vi.fn(async () => ({ ok: true as const, deliverabilityUrl: READY_SOURCES.deliverabilityUrl, accountLabel: "Steven Dann" })),
+      takeConversionMetric: vi.fn(async () => ({ ok: true as const, metricId: "SDmet1", headings: ["Placed Order"], title: "Placed Order | Klaviyo", accountLabels: ["Steven Dann"], sourceUrl: "https://www.klaviyo.com/metric/SDmet1/placed-order" })),
+      watchConversionMetric: (callback: () => void) => { metricWatchers.push(callback); return () => undefined; },
+    } satisfies ClientSetupSources;
+    const subscriberGrowth = { take: vi.fn(async () => ({ ok: true, subscriberGrowthUrl: READY_SOURCES.subscriberGrowthUrl, accountLabels: ["Steven Dann"] })), persisted: vi.fn().mockResolvedValue(null), watch: () => () => undefined };
+    const verifyAccount = vi.fn(async (input: { clientName: string; verifySavedAccountOnly?: boolean; configuredUrl?: string | null }): Promise<BusinessReviewDiscoveryResult> => input.verifySavedAccountOnly
+      ? { ok: true, verification: "saved_target_account", dashboardUrl: input.configuredUrl!, accountLabel: input.clientName, accountMatchesClient: true }
+      : { ok: true, dashboardUrl: STEVEN_REVIEW.dashboardUrl, accountLabel: input.clientName, accountMatchesClient: true, evidence: { businessReviewHeading: true, growthOverview: true, campaignPerformance: true, flowPerformance: true } });
+    return { sources, subscriberGrowth, verifyAccount, clickToolbar: () => act(() => { for (const callback of toolbar) callback(); }), metricPageRead: () => act(() => { for (const callback of metricWatchers) callback(); }), watchToolbarClick: (callback: () => void) => { toolbar.push(callback); return () => undefined; } };
+  }
+  function renderOnboarding(api: ApiClient, fakes = discoveryFakes(), automaticCaptureService?: AutoCaptureService) {
+    render(<App api={api} discoverBusinessReviewSource={fakes.verifyAccount as never} subscriberGrowthSource={fakes.subscriberGrowth as never} clientSetupSources={fakes.sources} watchToolbarClick={fakes.watchToolbarClick} {...(automaticCaptureService ? { automaticCaptureService } : {})} now={() => new Date(ONBOARDING_NOW)} />);
+    return fakes;
+  }
+  const checklistRow = (label: string) => within(screen.getByRole("list", { name: "Client setup checklist" })).getByText(label).closest("li")!;
+
+  it("lists every client with its server-computed setup status", async () => {
+    const { api } = backend([club(), targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York" } })]);
+    renderOnboarding(api);
+    expect(await screen.findByRole("button", { name: "Club Furniture READY" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Steven Dann SETUP INCOMPLETE" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "+ Add New Client" })).toBeEnabled();
+  });
+
+  it("adds a brand-new client from its name (a name is required), then shows only the setup checklist — no report creation", async () => {
+    const { api } = backend();
+    const user = userEvent.setup(); renderOnboarding(api);
+    await user.click(await screen.findByRole("button", { name: "+ Add New Client" }));
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter the client name.");
+    expect(api.createClient).not.toHaveBeenCalled();
+    await user.type(screen.getByLabelText("Client Name"), "Steven Dann");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    expect(api.createClient).toHaveBeenCalledWith("Steven Dann");
+    expect(await screen.findByRole("list", { name: "Client setup checklist" })).toBeInTheDocument();
+    expect(checklistRow("Client Name")).toHaveTextContent("Steven Dann");
+    expect(checklistRow("Currency")).toHaveTextContent("The client's ISO currency code is not configured.");
+    expect(screen.getByText("SETUP INCOMPLETE")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Create New Report" })).toBeNull();
+    // The large Advanced Targets form stays collapsed under Advanced / Debug.
+    expect(screen.getByText("Advanced / Debug").closest("details")).not.toHaveAttribute("open");
+  });
+
+  it("without Klaviyo tab access nothing is verified or saved, and it says what to do", async () => {
+    const { api } = backend([targets("steven-dann", { profile: { name: "Steven Dann", timezone: null } })]);
+    const fakes = discoveryFakes();
+    fakes.verifyAccount.mockResolvedValueOnce({ ok: false, code: "ACTION_NOT_INVOKED", message: "Open the intended client’s Klaviyo account and click the Tention Reports extension before discovery." });
+    const user = userEvent.setup(); renderOnboarding(api, fakes);
+    await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+    await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+    expect(await screen.findByText("Open Steven Dann's Klaviyo account in Chrome and click the Tention Reports extension. The account and its Business Review dashboard are verified automatically.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Verify Klaviyo Account" }));
+    expect(await screen.findByText(/click the Tention Reports extension before discovery/)).toBeInTheDocument();
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+  });
+
+  it("refuses the wrong Klaviyo account: shows expected and detected, saves nothing", async () => {
+    const { api } = backend([targets("steven-dann", { profile: { name: "Steven Dann", timezone: null } })]);
+    const fakes = discoveryFakes();
+    fakes.verifyAccount.mockResolvedValueOnce({ ok: false, code: "ACCOUNT_CONTEXT_MISMATCH", message: "The authenticated Klaviyo account does not match the selected client.", diagnostics: { accountLabel: "CL Club Furniture" } });
+    const user = userEvent.setup(); renderOnboarding(api, fakes);
+    await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+    await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+    await screen.findByRole("region", { name: "Klaviyo Account" });
+    fakes.clickToolbar();
+    const alert = await screen.findByRole("alert", { name: "Wrong Klaviyo account" });
+    expect(alert).toHaveTextContent("Expected:Steven Dann");
+    expect(alert).toHaveTextContent("Detected:CL Club Furniture");
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+  });
+
+  it("onboards Steven Dann to READY from his own Klaviyo pages, then creates October 2026 and starts automatic capture", async () => {
+    const { api, store } = backend([club()]);
+    const fakes = discoveryFakes();
+    const user = userEvent.setup(); renderOnboarding(api, fakes);
+    await user.click(await screen.findByRole("button", { name: "+ Add New Client" }));
+    await user.type(screen.getByLabelText("Client Name"), "Steven Dann");
+    await user.click(screen.getByRole("button", { name: "Continue" }));
+    await screen.findByRole("list", { name: "Client setup checklist" });
+    // Toolbar click on Steven Dann's Klaviyo: account + Business Review are verified and saved by themselves.
+    fakes.clickToolbar();
+    await waitFor(() => expect(checklistRow("Klaviyo Account")).toHaveTextContent("Steven Dann"));
+    expect(fakes.verifyAccount).toHaveBeenCalledWith(expect.objectContaining({ clientName: "Steven Dann", configuredUrl: null }));
+    expect(checklistRow("Business Review")).toHaveTextContent("Verified");
+    await user.type(screen.getByLabelText("Timezone"), "America/New_York");
+    await user.click(screen.getByRole("button", { name: "Save Timezone" }));
+    await user.selectOptions(screen.getByLabelText("Currency"), "USD");
+    await user.click(screen.getByRole("button", { name: "Save Currency" }));
+    // The metric page read at the toolbar click is used by itself; its ID is Steven Dann's own.
+    fakes.metricPageRead();
+    await waitFor(() => expect(checklistRow("Metric ID")).toHaveTextContent("SDmet1"));
+    await user.click(screen.getByRole("button", { name: "Verify Deliverability" }));
+    await user.click(screen.getByRole("button", { name: "Verify Subscriber Growth" }));
+    expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+    expect(screen.getByText("READY")).toBeInTheDocument();
+    expect(store.get("steven-dann")).toMatchObject({ profile: { timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "SDmet1" } }, businessReview: STEVEN_REVIEW, sourceUrls: READY_SOURCES });
+    expect(store.get("club-furniture")!.profile!.conversionMetric.providerMetricId).toBe("KyqTnx");
+
+    await user.click(screen.getByRole("button", { name: "Create New Report" }));
+    expect(await screen.findByLabelText("Report Month")).toHaveValue("2026-10");
+    expect(screen.queryByRole("option", { name: "November 2026" })).toBeNull();
+    expect(screen.getByText("Oct 1, 2026 – Oct 31, 2026")).toBeInTheDocument();
+    expect(screen.getByText("Sep 1, 2026 – Sep 30, 2026")).toBeInTheDocument();
+    const saves = vi.mocked(api.saveClientReportTargets).mock.calls.length;
+    await user.click(screen.getByRole("button", { name: "Create & Start Automatic Capture" }));
+    await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "steven-dann" }, reportMonth: { year: 2026, month: 10 } })));
+    expect(vi.mocked(api.createReportDraft).mock.calls[0]![0]).not.toHaveProperty("period");
+    // Automatic capture starts by itself on the new report: all 10 sections, for Steven Dann's October.
+    expect(await screen.findByText("Step 1 of 10")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Executive Summary" })).toBeInTheDocument();
+    expect(screen.getByText("Steven Dann", { selector: ".report-month" })).toBeInTheDocument();
+    // Capture starts by itself: its preflight re-proves the saved account; nothing is configured again.
+    await waitFor(() => expect(fakes.verifyAccount).toHaveBeenCalledWith(expect.objectContaining({ verifySavedAccountOnly: true, configuredAccountLabel: "Steven Dann" })));
+    expect(vi.mocked(api.saveClientReportTargets).mock.calls.length).toBe(saves);
+  });
+
+  describe("Delete Report in a client's Reports list (one month only)", () => {
+    const monthReport = (id: string, month: number, status: ReportDraft["status"]): ReportDraft => ({ ...report, id, client: clientReportSnapshot(readySteven()), reportMonth: { year: 2026, month: month as ReportDraft["reportMonth"]["month"] }, status });
+    const october = () => monthReport("55555555-5555-4555-8555-555555555555", 10, "generated");
+    const september = () => monthReport("66666666-6666-4666-8666-666666666666", 9, "captures_incomplete");
+    const july = () => monthReport("77777777-7777-4777-8777-777777777777", 7, "failed");
+    async function openSteven(drafts: ReportDraft[]) {
+      const backendState = backend([readySteven()], drafts);
+      const user = userEvent.setup(); renderOnboarding(backendState.api);
+      await user.click(await screen.findByRole("button", { name: "Steven Dann READY" }));
+      const list = await screen.findByRole("region", { name: "Reports" });
+      return { ...backendState, user, list, row: (month: string) => within(list).getByText(month).closest("li")! };
+    }
+
+    it("12. shows Open Report and Delete Report on every report row", async () => {
+      const { list, row } = await openSteven([october(), september(), july()]);
+      for (const month of ["October 2026", "September 2026", "July 2026"]) {
+        expect(within(row(month)).getByRole("button", { name: "Open Report" })).toBeInTheDocument();
+        expect(within(row(month)).getByRole("button", { name: `Delete ${month} report` })).toHaveTextContent("Delete Report");
+      }
+      expect(within(list).getByRole("button", { name: "Delete October 2026 report" })).toHaveClass("danger");
+    });
+
+    it("asks for confirmation first and names the month and client; 11. Cancel deletes nothing", async () => {
+      const { api, user, row } = await openSteven([october(), september()]);
+      await user.click(within(row("October 2026")).getByRole("button", { name: "Delete October 2026 report" }));
+      const dialog = screen.getByRole("alertdialog", { name: "Delete October 2026 report?" });
+      expect(dialog).toHaveTextContent("Client:Steven Dann");
+      expect(dialog).toHaveTextContent("This will remove this report and its stored report data.");
+      expect(within(dialog).getByRole("button", { name: "Delete Report" })).toHaveClass("danger-solid");
+      expect(api.deleteClientReport).not.toHaveBeenCalled();
+      await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(api.deleteClientReport).not.toHaveBeenCalled();
+      expect(row("October 2026")).toHaveTextContent("Generated");
+    });
+
+    it("13. deletes only the selected month, removes its row at once, stays on the client page, and the client stays READY", async () => {
+      const { api, user, list, row } = await openSteven([october(), september(), july()]);
+      // The history refresh never answers: the row must still go away immediately.
+      vi.mocked(api.listReportDrafts).mockImplementation(() => new Promise(() => undefined));
+      await user.click(within(row("July 2026")).getByRole("button", { name: "Delete July 2026 report" }));
+      await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete Report" }));
+      expect(await screen.findByRole("status")).toHaveTextContent("July 2026 report deleted.");
+      expect(api.deleteClientReport).toHaveBeenCalledTimes(1);
+      expect(api.deleteClientReport).toHaveBeenCalledWith("steven-dann", "77777777-7777-4777-8777-777777777777");
+      expect(within(list).queryByText("July 2026")).toBeNull();
+      expect(row("October 2026")).toHaveTextContent("Generated");
+      expect(row("September 2026")).toHaveTextContent("In progress");
+      expect(screen.getByRole("heading", { name: "Steven Dann" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Create New Report" })).toBeEnabled();
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("15. a generated report's Drive files are reported as not deleted", async () => {
+      const { user, row } = await openSteven([october()]);
+      await user.click(within(row("October 2026")).getByRole("button", { name: "Delete October 2026 report" }));
+      await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete Report" }));
+      expect(await screen.findByRole("status")).toHaveTextContent("October 2026 report deleted. Drive files were not deleted.");
+      // A recent month stays listed as "Not created" so it can be created again; the report's buttons are gone.
+      expect(row("October 2026")).toHaveTextContent("Not created");
+      expect(within(row("October 2026")).queryByRole("button")).toBeNull();
+    });
+
+    it("5. blocks a generating report without opening the confirmation or calling the API", async () => {
+      const { api, user, row } = await openSteven([monthReport("88888888-8888-4888-8888-888888888888", 10, "generating")]);
+      await user.click(within(row("October 2026")).getByRole("button", { name: "Delete October 2026 report" }));
+      expect(screen.getByRole("alert")).toHaveTextContent("This report is currently generating. Try again after generation finishes.");
+      expect(screen.queryByRole("alertdialog")).toBeNull();
+      expect(api.deleteClientReport).not.toHaveBeenCalled();
+    });
+
+    it("10. the deleted month can be created again from the client's saved READY setup", async () => {
+      const { api, user, row } = await openSteven([october(), september()]);
+      await user.click(within(row("October 2026")).getByRole("button", { name: "Delete October 2026 report" }));
+      await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete Report" }));
+      await screen.findByRole("status");
+      await user.click(screen.getByRole("button", { name: "Create New Report" }));
+      await user.click(await screen.findByRole("button", { name: "Create & Start Automatic Capture" }));
+      await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "steven-dann" }, reportMonth: { year: 2026, month: 10 } })));
+      await expect(vi.mocked(api.createReportDraft).mock.results[0]!.value).resolves.toMatchObject({ client: clientReportSnapshot(readySteven()), reportMonth: { year: 2026, month: 10 } });
+    });
+  });
+
+  describe("one reconciliation after a report is deleted or found missing (Recent Reports, client Reports, open report)", () => {
+    const steven = (id: string, month: number, status: ReportDraft["status"]): ReportDraft => ({ ...report, id, client: clientReportSnapshot(readySteven()), reportMonth: { year: 2026, month: month as ReportDraft["reportMonth"]["month"] }, status });
+    const SEPTEMBER_ID = "99999999-9999-4999-8999-999999999999";
+    const OCTOBER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const CLUB_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const clubReport = (): ReportDraft => ({ ...report, id: CLUB_ID, client: clientReportSnapshot(club()), reportMonth: { year: 2026, month: 9 }, status: "generated" });
+    /** Steven Dann (September generated, October in progress) and Club Furniture (September generated). */
+    function start(options: { open?: string } = {}) {
+      const state = backend([readySteven(), club()], [steven(SEPTEMBER_ID, 9, "generated"), steven(OCTOBER_ID, 10, "captures_incomplete"), clubReport()]);
+      const { api, reports } = state;
+      // The canonical endpoints: a deleted report is gone (404), exactly like the API.
+      api.getReportDraft = vi.fn(async (id: string) => { const found = reports.find((draft) => draft.id === id); if (!found) throw new ApiError("REPORT_NOT_FOUND", "Report not found.", 404); return structuredClone(found); }) as ApiClient["getReportDraft"];
+      api.deleteReportDraft = vi.fn(async (id: string) => { const index = reports.findIndex((draft) => draft.id === id); if (index < 0) throw new ApiError("REPORT_NOT_FOUND", "Report not found.", 404); reports.splice(index, 1); }) as ApiClient["deleteReportDraft"];
+      if (options.open) window.sessionStorage.setItem("tention.active-report-id", options.open);
+      const reload = vi.fn(); vi.stubGlobal("location", { ...window.location, reload });
+      const user = userEvent.setup(); renderOnboarding(api);
+      return { ...state, user, reload };
+    }
+    afterEach(() => { vi.unstubAllGlobals(); });
+    const recentList = () => screen.getByRole("heading", { name: "Recent Reports" }).closest("section")!;
+    const recentRow = (client: string, month: string) => within(recentList()).queryAllByRole("listitem").find((item) => item.textContent?.includes(client) && item.textContent.includes(month)) ?? null;
+    const clientReports = () => screen.getByRole("region", { name: "Reports" });
+    const clientRow = (month: string) => within(clientReports()).getByText(month).closest("li")!;
+    async function openStevenPage(user: ReturnType<typeof userEvent.setup>) {
+      await user.click(await screen.findByRole("button", { name: "Steven Dann READY" }));
+      await screen.findByRole("region", { name: "Reports" });
+    }
+    async function deleteFromClientPage(user: ReturnType<typeof userEvent.setup>, month: string) {
+      await user.click(within(clientRow(month)).getByRole("button", { name: `Delete ${month} report` }));
+      await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Delete Report" }));
+    }
+
+    it("1–4, 9, 10, 13, 15. a client-page delete removes it from client Reports and Recent Reports at once; other months and clients remain", async () => {
+      const { api, user, reload } = start();
+      await openStevenPage(user);
+      expect(recentRow("Steven Dann", "September 2026")).not.toBeNull();
+      const listCallsBefore = vi.mocked(api.listReportDrafts).mock.calls.length;
+      await deleteFromClientPage(user, "September 2026");
+      expect(await within(clientReports()).findByRole("status")).toHaveTextContent("September 2026 report deleted.");
+      // Client Reports: the month stays as "Not created" (it can be created again) with no Open/Delete.
+      expect(clientRow("September 2026")).toHaveTextContent("Not created");
+      expect(within(clientRow("September 2026")).queryByRole("button", { name: "Open Report" })).toBeNull();
+      expect(within(clientRow("September 2026")).queryByRole("button", { name: /Delete/ })).toBeNull();
+      // Recent Reports: gone, with no Open/Delete left anywhere for it.
+      await waitFor(() => expect(recentRow("Steven Dann", "September 2026")).toBeNull());
+      // Other months of this client and other clients remain.
+      expect(clientRow("October 2026")).toHaveTextContent("In progress");
+      expect(recentRow("Steven Dann", "October 2026")).not.toBeNull();
+      expect(recentRow("Club Furniture", "September 2026")).not.toBeNull();
+      // 15. Both lists were refetched from the API after the delete (authoritative state), without a page reload.
+      const refetches = vi.mocked(api.listReportDrafts).mock.calls.slice(listCallsBefore);
+      expect(refetches).toEqual(expect.arrayContaining([[], [{ clientId: "steven-dann" }]]));
+      expect(reload).not.toHaveBeenCalled();
+      expect(screen.queryByText("Report not found.")).toBeNull();
+    });
+
+    it("2. a Recent Reports delete removes it from the open client's Reports immediately", async () => {
+      const { api, user } = start();
+      await openStevenPage(user);
+      // The client page's refetch never answers: the row must still go at once.
+      vi.mocked(api.listReportDrafts).mockImplementation((filters?: { clientId?: string }) => filters?.clientId ? new Promise(() => undefined) : Promise.resolve([]));
+      await user.click(within(recentRow("Steven Dann", "September 2026")!).getByRole("button", { name: "Delete Report" }));
+      const dialog = screen.getByRole("dialog", { name: "Delete report?" });
+      await user.type(within(dialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
+      await user.click(within(dialog).getByRole("button", { name: "Delete Report" }));
+      await waitFor(() => expect(clientRow("September 2026")).toHaveTextContent("Not created"));
+      expect(within(clientRow("September 2026")).queryByRole("button")).toBeNull();
+      expect(clientRow("October 2026")).toHaveTextContent("In progress");
+    });
+
+    it("5 + 7. deleting the open report clears it and returns to its client page, not a dead report screen", async () => {
+      const { user } = start();
+      await openStevenPage(user);
+      await user.click(within(clientRow("September 2026")).getByRole("button", { name: "Open Report" }));
+      await screen.findByText("Report options");
+      expect(window.sessionStorage.getItem("tention.active-report-id")).toBe(SEPTEMBER_ID);
+      await user.click(screen.getByText("Report options"));
+      await user.click(screen.getByRole("button", { name: "Delete Report" }));
+      const dialog = screen.getByRole("dialog", { name: "Delete report?" });
+      await user.type(within(dialog).getByRole("textbox", { name: "Type DELETE to confirm" }), "DELETE");
+      await user.click(within(dialog).getByRole("button", { name: "Delete Report" }));
+      expect(await screen.findByRole("status")).toHaveTextContent("September 2026 report deleted.");
+      expect(await screen.findByRole("heading", { name: "Steven Dann" })).toBeInTheDocument();
+      expect(screen.queryByText("Report options")).toBeNull();
+      expect(window.sessionStorage.getItem("tention.active-report-id")).toBeNull();
+      await waitFor(() => expect(clientRow("September 2026")).toHaveTextContent("Not created"));
+      expect(recentRow("Steven Dann", "September 2026")).toBeNull();
+    });
+
+    it("6. deleting another month leaves a different report openable and selectable", async () => {
+      const { user } = start();
+      await openStevenPage(user);
+      await deleteFromClientPage(user, "September 2026");
+      await within(clientReports()).findByRole("status");
+      await user.click(within(clientRow("October 2026")).getByRole("button", { name: "Open Report" }));
+      await screen.findByText("Report options");
+      expect(window.sessionStorage.getItem("tention.active-report-id")).toBe(OCTOBER_ID);
+    });
+
+    it("8. a stale Recent Reports entry whose report is gone (404) is removed, returns to its client, and shows a small notice", async () => {
+      const { user, reports } = start();
+      await screen.findByText("Recent Reports");
+      await waitFor(() => expect(recentRow("Steven Dann", "September 2026")).not.toBeNull());
+      reports.splice(reports.findIndex((draft) => draft.id === SEPTEMBER_ID), 1); // deleted elsewhere
+      await user.click(within(recentRow("Steven Dann", "September 2026")!).getByRole("button", { name: "Open Report" }));
+      expect(await screen.findByRole("status")).toHaveTextContent("That report no longer exists.");
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.queryByText("Report not found.")).toBeNull();
+      expect(await screen.findByRole("heading", { name: "Steven Dann" })).toBeInTheDocument();
+      await waitFor(() => expect(recentRow("Steven Dann", "September 2026")).toBeNull());
+      expect(recentRow("Club Furniture", "September 2026")).not.toBeNull();
+    });
+
+    it("8. an old report link restored from the session that no longer exists is dropped without a persistent error", async () => {
+      start({ open: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" });
+      expect(await screen.findByRole("status")).toHaveTextContent("That report no longer exists.");
+      expect(screen.queryByText("Report not found.")).toBeNull();
+      expect(window.sessionStorage.getItem("tention.active-report-id")).toBeNull();
+      expect(await screen.findByRole("heading", { name: "Clients" })).toBeInTheDocument();
+    });
+
+    it("11 + 12. the deleted month is created again and appears normally in Recent Reports", async () => {
+      const { api, user } = start();
+      await openStevenPage(user);
+      await deleteFromClientPage(user, "October 2026");
+      await within(clientReports()).findByRole("status");
+      await waitFor(() => expect(recentRow("Steven Dann", "October 2026")).toBeNull());
+      await user.click(screen.getByRole("button", { name: "Create New Report" }));
+      await user.click(await screen.findByRole("button", { name: "Create & Start Automatic Capture" }));
+      await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "steven-dann" }, reportMonth: { year: 2026, month: 10 } })));
+      await user.click(await screen.findByRole("button", { name: "Clients" }));
+      await waitFor(() => expect(recentRow("Steven Dann", "October 2026")).not.toBeNull());
+      expect(within(recentRow("Steven Dann", "October 2026")!).getByRole("button", { name: "Open Report" })).toBeInTheDocument();
+    });
+
+    it("14. a failed delete removes nothing", async () => {
+      const { api, user } = start();
+      await openStevenPage(user);
+      vi.mocked(api.deleteClientReport).mockRejectedValueOnce(new ApiError("NETWORK_ERROR", "offline", null));
+      await deleteFromClientPage(user, "September 2026");
+      expect(await within(clientReports()).findByRole("alert")).toHaveTextContent("September 2026 report could not be deleted.");
+      expect(clientRow("September 2026")).toHaveTextContent("Generated");
+      expect(within(clientRow("September 2026")).getByRole("button", { name: "Open Report" })).toBeInTheDocument();
+      expect(recentRow("Steven Dann", "September 2026")).not.toBeNull();
+    });
+  });
+
+  describe("Klaviyo account label: the real account name, never another client", () => {
+    const boundAsInitials = () => targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "QuWhQ9" } }, businessReview: { ...STEVEN_REVIEW, accountLabel: "ST Steven Dann" }, sourceUrls: { deliverabilityUrl: READY_SOURCES.deliverabilityUrl } });
+
+    it("saves the real Klaviyo account name, not the avatar initials the page reader picks up with it", async () => {
+      const { api, store } = backend([club()]);
+      const fakes = discoveryFakes();
+      fakes.verifyAccount.mockResolvedValueOnce({ ok: true, dashboardUrl: STEVEN_REVIEW.dashboardUrl, accountLabel: "ST Steven Dann", accountMatchesClient: true, evidence: { businessReviewHeading: true, growthOverview: true, campaignPerformance: true, flowPerformance: true } });
+      const user = userEvent.setup(); renderOnboarding(api, fakes);
+      await user.click(await screen.findByRole("button", { name: "+ Add New Client" }));
+      await user.type(screen.getByLabelText("Client Name"), "Steven Dann");
+      await user.click(screen.getByRole("button", { name: "Continue" }));
+      await screen.findByRole("list", { name: "Client setup checklist" });
+      fakes.clickToolbar();
+      await waitFor(() => expect(store.get("steven-dann")!.businessReview?.accountLabel).toBe("Steven Dann"));
+      expect(checklistRow("Klaviyo Account")).toHaveTextContent("Steven Dann");
+      expect(store.get("club-furniture")!.businessReview!.accountLabel).toBe("CL Club Furniture");
+    });
+
+    it("accepts Steven Dann's Subscriber Growth page against the old 'ST Steven Dann' binding and reaches READY", async () => {
+      const { api, store } = backend([club(), boundAsInitials()]);
+      const fakes = discoveryFakes();
+      fakes.subscriberGrowth.take.mockResolvedValueOnce({ ok: true, subscriberGrowthUrl: READY_SOURCES.subscriberGrowthUrl, accountLabels: ["Steven Dann", "Help"] });
+      const user = userEvent.setup(); renderOnboarding(api, fakes);
+      await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+      await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+      await user.click(await screen.findByRole("button", { name: "Verify Subscriber Growth" }));
+      expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.sourceUrls?.subscriberGrowthUrl).toBe(READY_SOURCES.subscriberGrowthUrl);
+    });
+
+    it("still refuses a Subscriber Growth page from Club Furniture's account", async () => {
+      const { api, store } = backend([club(), boundAsInitials()]);
+      const fakes = discoveryFakes();
+      fakes.subscriberGrowth.take.mockResolvedValueOnce({ ok: true, subscriberGrowthUrl: READY_SOURCES.subscriberGrowthUrl, accountLabels: ["CL Club Furniture"] });
+      const user = userEvent.setup(); renderOnboarding(api, fakes);
+      await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+      await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+      await user.click(await screen.findByRole("button", { name: "Verify Subscriber Growth" }));
+      expect(await screen.findByText("This page appears to belong to another Klaviyo account. Nothing was saved.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.sourceUrls?.subscriberGrowthUrl).toBeUndefined();
+      expect(fakes.subscriberGrowth.persisted).toHaveBeenCalledWith(expect.objectContaining({ saved: false, failureCode: "SUBSCRIBER_GROWTH_ACCOUNT_UNPROVEN" }));
+    });
+  });
+
+  describe("Subscriber Growth source: verify, current page, or pasted URL — this client's only", () => {
+    const GROWTH = "https://www.klaviyo.com/people/subscribers";
+    /** Steven Dann as he is live now: everything verified except Subscriber Growth. */
+    const stevenWithoutGrowth = () => targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "QuWhQ9" } }, businessReview: STEVEN_REVIEW, sourceUrls: { deliverabilityUrl: READY_SOURCES.deliverabilityUrl } });
+    async function openGrowthSetup(fakes = discoveryFakes()) {
+      const { api, store } = backend([club(), stevenWithoutGrowth()]);
+      const user = userEvent.setup(); renderOnboarding(api, fakes);
+      await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+      await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+      const panel = await screen.findByLabelText("Subscriber Growth setup");
+      return { api, store, user, panel, fakes };
+    }
+    const probed = (accountLabels: string[], url = GROWTH) => ({ ok: true, subscriberGrowthUrl: url, accountLabels });
+
+    it("auto-verifies when the page shows no readable account name by re-proving the saved binding, and reaches READY", async () => {
+      const fakes = discoveryFakes(); fakes.subscriberGrowth.take.mockResolvedValueOnce(probed(["Profiles", "Help"]));
+      const { store, user, panel } = await openGrowthSetup(fakes);
+      await user.click(within(panel).getByRole("button", { name: "Verify Subscriber Growth" }));
+      expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+      expect(fakes.verifyAccount).toHaveBeenCalledWith(expect.objectContaining({ verifySavedAccountOnly: true, configuredAccountLabel: "Steven Dann" }));
+      expect(store.get("steven-dann")!.sourceUrls).toEqual({ deliverabilityUrl: READY_SOURCES.deliverabilityUrl, subscriberGrowthUrl: GROWTH });
+      expect(checklistRow("Subscriber Growth")).toHaveTextContent("Verified");
+      expect(fakes.subscriberGrowth.persisted).toHaveBeenCalledWith({ saved: true, sourceUrl: GROWTH, failureCode: null });
+    });
+
+    it("blocks when the authorized tab is another client's account, and offers fallbacks when the account cannot be read", async () => {
+      const fakes = discoveryFakes();
+      fakes.subscriberGrowth.take.mockResolvedValue(probed([]));
+      fakes.verifyAccount.mockResolvedValueOnce({ ok: false, code: "ACCOUNT_CONTEXT_MISMATCH", message: "differs" }).mockResolvedValueOnce({ ok: false, code: "ACCOUNT_CONTEXT_NOT_VERIFIED", message: "not found" });
+      const { api, user, panel } = await openGrowthSetup(fakes);
+      await user.click(within(panel).getByRole("button", { name: "Verify Subscriber Growth" }));
+      expect(await within(panel).findByRole("alert", { name: "WRONG KLAVIYO ACCOUNT" })).toHaveTextContent("This page appears to belong to another Klaviyo account. Nothing was saved.");
+      await user.click(within(panel).getByRole("button", { name: "Verify Subscriber Growth" }));
+      expect(await within(panel).findByRole("alert", { name: "AUTO VERIFICATION FAILED" })).toHaveTextContent("Use the current Subscriber Growth page or paste its URL.");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("Use Current Subscriber Growth Page: shows the client, source and stable URL, and saves only on Confirm", async () => {
+      const fakes = discoveryFakes(); fakes.subscriberGrowth.take.mockResolvedValueOnce(probed([], `${GROWTH}?view=overview`));
+      const { api, store, user, panel } = await openGrowthSetup(fakes);
+      await user.click(within(panel).getByRole("button", { name: "Use Current Subscriber Growth Page" }));
+      const confirm = await within(panel).findByRole("group", { name: "Confirm Subscriber Growth source" });
+      expect(confirm).toHaveTextContent("Client:Steven Dann");
+      expect(confirm).toHaveTextContent("Source:Subscriber Growth");
+      expect(confirm).toHaveTextContent(`URL:${GROWTH}`);
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+      await user.click(within(confirm).getByRole("button", { name: "Confirm & Save" }));
+      expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.sourceUrls?.subscriberGrowthUrl).toBe(GROWTH);
+      expect(fakes.subscriberGrowth.persisted).toHaveBeenCalledWith(expect.objectContaining({ saved: true }));
+    });
+
+    it("Use Current Subscriber Growth Page never offers a page that shows Club Furniture's account", async () => {
+      const fakes = discoveryFakes(); fakes.subscriberGrowth.take.mockResolvedValueOnce(probed(["CL Club Furniture"]));
+      const { api, user, panel } = await openGrowthSetup(fakes);
+      await user.click(within(panel).getByRole("button", { name: "Use Current Subscriber Growth Page" }));
+      expect(await within(panel).findByRole("alert", { name: "WRONG KLAVIYO ACCOUNT" })).toBeInTheDocument();
+      expect(within(panel).queryByRole("group", { name: "Confirm Subscriber Growth source" })).toBeNull();
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("saves a pasted URL as the stable route (query removed) on this client only, without copying Club Furniture's setup", async () => {
+      const { api, store, user, panel } = await openGrowthSetup();
+      await user.type(within(panel).getByLabelText("Subscriber Growth URL"), `${GROWTH}?channel=email&view=growth`);
+      await user.click(within(panel).getByRole("button", { name: "Save Subscriber Growth Source" }));
+      expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.sourceUrls?.subscriberGrowthUrl).toBe(GROWTH);
+      expect(vi.mocked(api.saveClientReportTargets).mock.calls.map(([clientId]) => clientId)).toEqual(["steven-dann"]);
+      expect(store.get("club-furniture")).toEqual(club());
+    });
+
+    it.each([
+      ["an unrelated Klaviyo page", "https://www.klaviyo.com/analytics/metrics"],
+      ["another host", "https://evil.example/people/subscribers"],
+      ["text that is not a URL", "people/subscribers"],
+    ])("rejects %s", async (_case, value) => {
+      const { api, user, panel } = await openGrowthSetup();
+      await user.type(within(panel).getByLabelText("Subscriber Growth URL"), value);
+      await user.click(within(panel).getByRole("button", { name: "Save Subscriber Growth Source" }));
+      expect(within(panel).getByRole("alert", { name: "INVALID_SUBSCRIBER_GROWTH_URL" })).toHaveTextContent("Paste the Klaviyo Subscriber Growth URL, such as https://www.klaviyo.com/people/subscribers.");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Conversion Metric: current page, pasted URL or manual ID — always this client's own", () => {
+    const QUWHQ9_URL = "https://www.klaviyo.com/metric/QuWhQ9/placed-order";
+    /** Steven Dann as onboarded live: account bound as "ST Steven Dann", timezone and currency saved, metric missing. */
+    const stevenWithoutMetric = (sources: Record<string, string> | null = null) => targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York", currency: "USD" }, businessReview: { ...STEVEN_REVIEW, accountLabel: "ST Steven Dann" }, sourceUrls: sources });
+    async function openMetricSetup(initial: ClientReportTargets[], fakes = discoveryFakes()) {
+      const { api, store } = backend(initial);
+      const user = userEvent.setup(); renderOnboarding(api, fakes);
+      await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+      await user.click(await screen.findByRole("button", { name: "Continue Client Setup" }));
+      const card = await screen.findByRole("region", { name: "Conversion Metric" });
+      return { api, store, user, card, fakes };
+    }
+    const page = (accountLabels: string[], overrides: Record<string, unknown> = {}) => ({ ok: true as const, metricId: "QuWhQ9", headings: ["Placed Order"], title: "Placed Order | Klaviyo", accountLabels, sourceUrl: QUWHQ9_URL, ...overrides });
+
+    it("detects Placed Order automatically, accepting a harmless account-label variation, and updates the checklist at once", async () => {
+      const fakes = discoveryFakes(); fakes.sources.takeConversionMetric.mockResolvedValueOnce(page(["ST", "Steven Dann", "Analytics"]));
+      const { store, user, card } = await openMetricSetup([club(), stevenWithoutMetric()], fakes);
+      expect(card).toHaveTextContent("Status: Not configured");
+      await user.click(within(card).getByRole("button", { name: "Use Current Klaviyo Page" }));
+      await waitFor(() => expect(checklistRow("Metric ID")).toHaveTextContent("QuWhQ9"));
+      expect(checklistRow("Conversion Metric")).toHaveTextContent("Placed Order");
+      expect(store.get("steven-dann")!.profile!.conversionMetric).toEqual({ label: "Placed Order", providerMetricId: "QuWhQ9" });
+      // Still INCOMPLETE: the remaining sources are listed exactly.
+      expect(screen.getByText("SETUP INCOMPLETE")).toBeInTheDocument();
+      expect(checklistRow("Deliverability")).toHaveTextContent("has not been verified");
+      expect(checklistRow("Subscriber Growth")).toHaveTextContent("has not been verified");
+      expect(store.get("club-furniture")!.profile!.conversionMetric.providerMetricId).toBe("KyqTnx");
+    });
+
+    it("keeps wrong-account protection: another client's Klaviyo page is blocked and nothing is saved", async () => {
+      const fakes = discoveryFakes(); fakes.sources.takeConversionMetric.mockResolvedValueOnce(page(["CL Club Furniture"], { metricId: "KyqTnx", sourceUrl: "https://www.klaviyo.com/metric/KyqTnx/placed-order" }));
+      const { api, user, card } = await openMetricSetup([club(), stevenWithoutMetric()], fakes);
+      await user.click(within(card).getByRole("button", { name: "Use Current Klaviyo Page" }));
+      expect(await within(card).findByRole("alert", { name: "WRONG KLAVIYO ACCOUNT" })).toHaveTextContent("This page appears to belong to another Klaviyo account. Nothing was saved.");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("refuses a page that is not Placed Order", async () => {
+      const fakes = discoveryFakes(); fakes.sources.takeConversionMetric.mockResolvedValueOnce(page(["Steven Dann"], { metricId: "Act1v3", headings: ["Active on Site"], title: "Active on Site", sourceUrl: "https://www.klaviyo.com/metric/Act1v3/active-on-site" }));
+      const { api, user, card } = await openMetricSetup([stevenWithoutMetric()], fakes);
+      await user.click(within(card).getByRole("button", { name: "Use Current Klaviyo Page" }));
+      expect(await within(card).findByRole("alert", { name: "AUTO DETECTION FAILED" })).toHaveTextContent("found: Active on Site");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("when automatic detection cannot prove the account, the pasted URL (with query) is parsed, confirmed and saved", async () => {
+      const fakes = discoveryFakes(); fakes.sources.takeConversionMetric.mockResolvedValueOnce(page(["ST", "Metrics"]));
+      const { api, store, user, card } = await openMetricSetup([club(), stevenWithoutMetric()], fakes);
+      await user.click(within(card).getByRole("button", { name: "Use Current Klaviyo Page" }));
+      expect(await within(card).findByRole("alert", { name: "AUTO DETECTION FAILED" })).toHaveTextContent("We couldn't verify this metric automatically. You can paste the Placed Order metric URL or enter the Provider Metric ID manually.");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+      await user.type(within(card).getByLabelText("Paste Metric URL"), `${QUWHQ9_URL}?function=&dimension=&value=`);
+      await user.click(within(card).getByRole("button", { name: "Save From URL" }));
+      const confirm = within(card).getByRole("group", { name: "Confirm metric ID" });
+      expect(confirm).toHaveTextContent("Detected Metric:Placed Order");
+      expect(confirm).toHaveTextContent("Provider Metric ID:QuWhQ9");
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+      await user.click(within(confirm).getByRole("button", { name: "Confirm & Save" }));
+      await waitFor(() => expect(checklistRow("Metric ID")).toHaveTextContent("QuWhQ9"));
+      expect(vi.mocked(api.saveClientReportTargets).mock.calls.map(([clientId]) => clientId)).toEqual(["steven-dann"]);
+      expect(store.get("steven-dann")!.profile!.conversionMetric.providerMetricId).toBe("QuWhQ9");
+      expect(store.get("club-furniture")!.profile!.conversionMetric.providerMetricId).toBe("KyqTnx");
+    });
+
+    it("rejects an invalid metric URL", async () => {
+      const { api, user, card } = await openMetricSetup([stevenWithoutMetric()]);
+      await user.type(within(card).getByLabelText("Paste Metric URL"), "https://www.klaviyo.com/metric/QuWhQ9/active-on-site");
+      await user.click(within(card).getByRole("button", { name: "Save From URL" }));
+      expect(within(card).getByRole("alert", { name: "INVALID_METRIC_URL" })).toHaveTextContent("Paste a Klaviyo Placed Order URL such as /metric/<id>/placed-order.");
+      expect(within(card).queryByRole("group", { name: "Confirm metric ID" })).toBeNull();
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("saves a manually entered ID (whitespace trimmed) only after confirming it is this client's own, and reaches READY when nothing else is missing", async () => {
+      const { store, user, card } = await openMetricSetup([club(), stevenWithoutMetric(READY_SOURCES)]);
+      // Never prefilled from another client.
+      expect(within(card).getByLabelText("Provider Metric ID")).toHaveValue("");
+      await user.type(within(card).getByLabelText("Provider Metric ID"), "  QuWhQ9  ");
+      await user.click(within(card).getByRole("button", { name: "Save Metric ID" }));
+      const confirm = within(card).getByRole("group", { name: "Confirm metric ID" });
+      expect(confirm).toHaveTextContent("Client:Steven Dann");
+      expect(confirm).toHaveTextContent("Metric:Placed Order");
+      expect(confirm).toHaveTextContent("Provider Metric ID:QuWhQ9");
+      expect(confirm).toHaveTextContent("Confirm that this ID came from Steven Dann's own Klaviyo account.");
+      await user.click(within(confirm).getByRole("button", { name: "Confirm & Save" }));
+      expect(await screen.findByText("Client setup complete.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.profile!.conversionMetric).toEqual({ label: "Placed Order", providerMetricId: "QuWhQ9" });
+    });
+
+    it.each([
+      ["QuW hQ9", "A Klaviyo metric ID has no spaces."],
+      [QUWHQ9_URL, "Enter only the Klaviyo metric ID, not the full URL."],
+      ["QuWhQ9$", "A Klaviyo metric ID contains only letters and digits (for example QuWhQ9)."],
+    ])("rejects the manual ID %j with a specific message", async (value, message) => {
+      const { api, user, card } = await openMetricSetup([stevenWithoutMetric()]);
+      await user.type(within(card).getByLabelText("Provider Metric ID"), value);
+      await user.click(within(card).getByRole("button", { name: "Save Metric ID" }));
+      expect(within(card).getByRole("alert", { name: "INVALID_PROVIDER_METRIC_ID" })).toHaveTextContent(message);
+      expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    });
+
+    it("never reuses Club Furniture's metric ID for Steven Dann, even when typed by hand", async () => {
+      const { store, user, card } = await openMetricSetup([club(), stevenWithoutMetric()]);
+      await user.type(within(card).getByLabelText("Provider Metric ID"), "KyqTnx");
+      await user.click(within(card).getByRole("button", { name: "Save Metric ID" }));
+      await user.click(within(card).getByRole("button", { name: "Confirm & Save" }));
+      expect(await within(card).findByText("This Klaviyo metric ID is already saved on another client.")).toBeInTheDocument();
+      expect(store.get("steven-dann")!.profile!.conversionMetric.providerMetricId).toBeNull();
+      expect(store.get("club-furniture")!.profile!.conversionMetric.providerMetricId).toBe("KyqTnx");
+      expect(checklistRow("Metric ID")).not.toHaveTextContent("KyqTnx");
+    });
+  });
+
+  it("an INCOMPLETE client cannot create a report and shows exactly what is missing", async () => {
+    const { api } = backend([targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York" }, businessReview: STEVEN_REVIEW, sourceUrls: READY_SOURCES })]);
+    const user = userEvent.setup(); renderOnboarding(api);
+    await user.click(await screen.findByRole("button", { name: "Steven Dann SETUP INCOMPLETE" }));
+    const missing = await screen.findByRole("alert", { name: "Client setup incomplete" });
+    expect(within(missing).getAllByRole("listitem").map((item) => item.textContent)).toEqual(["Currency", "Placed Order metric ID"]);
+    expect(screen.getByRole("button", { name: "Create New Report" })).toBeDisabled();
+    expect(api.createReportDraft).not.toHaveBeenCalled();
+  });
+
+  it("a READY client starts each new month from its saved configuration only: no setup or discovery is repeated", async () => {
+    const september: ReportDraft = { ...report, id: "44444444-4444-4444-8444-444444444444", client: clientReportSnapshot(readySteven()), reportMonth: { year: 2026, month: 9 }, status: "generated" };
+    const { api } = backend([readySteven()], [september]);
+    const fakes = discoveryFakes();
+    const user = userEvent.setup(); renderOnboarding(api, fakes);
+    await user.click(await screen.findByRole("button", { name: "Steven Dann READY" }));
+    const reports = await screen.findByRole("region", { name: "Reports" });
+    expect(within(reports).getByText("September 2026").closest("li")).toHaveTextContent("Generated");
+    expect(within(reports).getByText("October 2026").closest("li")).toHaveTextContent("Not created");
+    await user.click(screen.getByRole("button", { name: "Create New Report" }));
+    await user.click(await screen.findByRole("button", { name: "Create & Start Automatic Capture" }));
+    await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "steven-dann" }, reportMonth: { year: 2026, month: 10 } })));
+    expect(api.saveClientReportTargets).not.toHaveBeenCalled();
+    expect(fakes.sources.takeConversionMetric).not.toHaveBeenCalled();
+    expect(fakes.sources.verifyDeliverability).not.toHaveBeenCalled();
+  });
+
+  it("offers the existing report when the month already has one", async () => {
+    const october: ReportDraft = { ...report, id: "55555555-5555-4555-8555-555555555555", client: clientReportSnapshot(readySteven()), reportMonth: { year: 2026, month: 10 } };
+    const { api } = backend([readySteven()], [october]);
+    const user = userEvent.setup(); renderOnboarding(api);
+    await user.click(await screen.findByRole("button", { name: "Steven Dann READY" }));
+    await user.click(await screen.findByRole("button", { name: "Create New Report" }));
+    await user.click(await screen.findByRole("button", { name: "Create & Start Automatic Capture" }));
+    expect(await screen.findByText("A October 2026 report already exists for Steven Dann.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Open existing report" }));
+    expect(await screen.findByRole("heading", { name: "Steven Dann" })).toBeInTheDocument();
+  });
+
+  it("an open report of a client that is no longer READY cannot capture or generate", async () => {
+    const draft = { ...runnerReport(), client: { id: "steven-dann", name: "Steven Dann", timezone: "America/New_York", currency: "USD" } };
+    const incomplete = targets("steven-dann", { profile: { name: "Steven Dann", timezone: "America/New_York", currency: "USD" }, businessReview: STEVEN_REVIEW, sourceUrls: READY_SOURCES });
+    const { api } = backend([incomplete], [draft]);
+    const service: AutoCaptureService = { start: vi.fn(), get: vi.fn().mockResolvedValue(null), clear: vi.fn() };
+    const user = userEvent.setup(); renderOnboarding(api, discoveryFakes(), service);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    const missing = await screen.findByRole("alert", { name: "Client setup incomplete" });
+    expect(missing).toHaveTextContent("Placed Order metric ID");
+    expect(screen.getByRole("button", { name: /Start Automatic Capture/ })).toBeDisabled();
+    expect(service.start).not.toHaveBeenCalled();
+  });
+
+  it("Advanced / Debug saves keep every verified source, including Subscriber Growth", () => {
+    const saved = cleanTargetInput(targetInput(readySteven()));
+    expect(saved.sourceUrls).toEqual(READY_SOURCES);
   });
 });

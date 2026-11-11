@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SUMMARY_EVIDENCE } from "./test-support/business-performance.js";
 import type { FastifyInstance } from "fastify";
-import { applyReportEvent, createReportDraft, InMemoryReportDraftRepository, ReportPersistenceError, upsertScreenshotMetadata } from "@tention/report-domain";
-import { createScreenshotSourceProof, type ReportDraft, type ScreenshotRecord, type ScreenshotType } from "@tention/report-schema";
+import { applyReportEvent, createReportDraft, InMemoryClientReportTargetsRepository, InMemoryReportDraftRepository, ReportPersistenceError, upsertScreenshotMetadata } from "@tention/report-domain";
+import { clientReportTargetsInputSchema, createScreenshotSourceProof, type ReportDraft, type ScreenshotRecord, type ScreenshotType } from "@tention/report-schema";
 import { buildApp } from "./app.js";
 import { InMemoryScreenshotStorage } from "./storage/screenshot-storage.js";
 import { InMemoryPdfArtifactStorage } from "./storage/pdf-artifact-storage.js";
@@ -14,7 +15,7 @@ let pdfStorage: InMemoryPdfArtifactStorage;
 const renderedPdf = Buffer.from("%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n");
 let pdfRenderer: { render: ReturnType<typeof vi.fn>; close: () => Promise<void> };
 
-beforeEach(() => { screenshotStorage = new InMemoryScreenshotStorage(); pdfStorage = new InMemoryPdfArtifactStorage(); repository = new InMemoryReportDraftRepository(); pdfRenderer = { render: vi.fn().mockResolvedValue(renderedPdf), close: async () => undefined }; app = buildApp({ now: () => new Date(NOW), screenshotStorage, pdfArtifactStorage: pdfStorage, pdfRenderer, repository }); });
+beforeEach(() => { screenshotStorage = new InMemoryScreenshotStorage(); pdfStorage = new InMemoryPdfArtifactStorage(); repository = new InMemoryReportDraftRepository(); pdfRenderer = { render: vi.fn().mockResolvedValue(renderedPdf), close: async () => undefined }; app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), screenshotStorage, pdfArtifactStorage: pdfStorage, pdfRenderer, repository }); });
 afterEach(async () => app.close());
 
 const body = (overrides: Record<string, unknown> = {}) => ({
@@ -29,9 +30,17 @@ async function create(overrides: Record<string, unknown> = {}) {
 }
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9J5c0AAAAASUVORK5CYII=", "base64");
+/** A client whose currency and conversion metric ID are configured, as final generation requires. */
+async function useConfiguredClient(currency: string | null = "USD", providerMetricId: string | null = "TEST01") {
+  await app.close();
+  const targets = new InMemoryClientReportTargetsRepository();
+  await targets.save("client-1", clientReportTargetsInputSchema.parse({ profile: { name: "Orion", timezone: "Asia/Kolkata", currency, conversionMetric: { label: "Placed Order", providerMetricId }, sections: null } }), NOW);
+  app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), screenshotStorage, pdfArtifactStorage: pdfStorage, pdfRenderer, repository, clientReportTargetsRepository: targets });
+  return targets;
+}
 async function enablePersistentLocalReview() {
   await app.close();
-  app = buildApp({ now: () => new Date(NOW), screenshotStorage, pdfArtifactStorage: pdfStorage, pdfRenderer, repository, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true });
+  app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), screenshotStorage, pdfArtifactStorage: pdfStorage, pdfRenderer, repository, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true });
 }
 async function createPendingImportedOverview() {
   const created = await create({ client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York" }, sections: { executive_summary: "optional" } });
@@ -42,14 +51,14 @@ async function createPendingImportedOverview() {
     id: "11111111-1111-4111-8111-111111111111", clientId: draft.client.id, reportMonth: draft.reportMonth, type: "overview",
     capturedAt: NOW.toISOString(), sourceUrl: "https://www.klaviyo.com/dashboard", width: 1, height: 1, approved: false,
     storageKey, mimeType: "image/png", byteSize: asset.byteSize, sha256: asset.sha256, captureOrigin: "live_acceptance_import",
-    approvedAt: null, periodConfirmed: true, sourceProof: createScreenshotSourceProof("overview", draft.period),
+    approvedAt: null, periodConfirmed: true, sourceProof: createScreenshotSourceProof("overview", draft.period, undefined, null, null, SUMMARY_EVIDENCE),
   };
   await repository.save(upsertScreenshotMetadata(draft, screenshot, "overview", { now: NOW }), draft.version);
   return { draftId: draft.id, sha256: asset.sha256, storageKey };
 }
 async function upload(id: string, type = "overview", expectedVersion = 1, sourceUrl = "https://www.klaviyo.com/dashboard?token=secret") {
   const period = { startDate: "2026-08-01", endDate: "2026-08-31", previousStartDate: "2026-07-01", previousEndDate: "2026-07-31" };
-  const proof = type === "not-a-type" ? null : createScreenshotSourceProof(type as ScreenshotType, period, undefined, type === "top_campaigns" ? { accountIdentity: "Orion", clientTimezone: "Asia/Kolkata", visibleMetricLabel: "Placed Order", rankingMethod: "complete-result-set", eligibleRowCount: 1, includedRowCount: 1, rows: [{ name: "Campaign", type: "Email", status: "Sent", sendDate: "2026-08-01", openRate: "10%", clickRate: "1%", placedOrderValue: 1 }] } : null);
+  const proof = type === "not-a-type" ? null : createScreenshotSourceProof(type as ScreenshotType, period, undefined, type === "top_campaigns" ? { accountIdentity: "Orion", clientTimezone: "Asia/Kolkata", visibleMetricLabel: "Placed Order", rankingMethod: "complete-result-set", eligibleRowCount: 1, includedRowCount: 1, rows: [{ name: "Campaign", type: "Email", status: "Sent", sendDate: "2026-08-01", openRate: "10%", clickRate: "1%", placedOrderValue: 1 }] } : null, null, type === "overview" ? SUMMARY_EVIDENCE : null);
   return app.inject({
     method: "PUT", url: `/api/v1/report-drafts/${id}/screenshots/${type}/image`, payload: type === "overview" ? PNG : Buffer.concat([PNG, Buffer.from(type)]),
     headers: {
@@ -196,7 +205,7 @@ describe("report draft API", () => {
   });
   it("evaluates completion in the client's timezone", async () => {
     await app.close();
-    app = buildApp({ now: () => new Date("2026-08-31T20:00:00Z") });
+    app = buildApp({ requireClientSetupReady: false, now: () => new Date("2026-08-31T20:00:00Z") });
     const india = await create({ reportMonth: { year: 2026, month: 8 } });
     const newYork = await create({
       client: { id: "client-2", name: "New York Client", timezone: "America/New_York" },
@@ -392,12 +401,13 @@ describe("report draft API", () => {
     expect(history.at(-1)).toMatchObject({ eventType: "MARK_CAPTURES_INCOMPLETE", fromStatus: "ready_for_review", toStatus: "captures_incomplete" });
   });
   it("previews without mutation, persists a real PDF artifact, and makes it stale after replacement", async () => {
+    await useConfiguredClient();
     const created = (await create({ sections: { executive_summary: "required" } })).json();
     const uploaded = (await upload(created.id)).json().report;
     const reviewed = (await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(uploaded.version, "SUBMIT_FOR_REVIEW") })).json();
     const beforeHistory = (await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/history` })).json();
     const preview = await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/preview` });
-    expect(preview.statusCode).toBe(200); expect(preview.headers["content-type"]).toContain("text/html"); expect(preview.body).toContain("Performance Report - August 1 - August 31, 2026"); expect(preview.body).toContain('data-report-layout="tention-monthly-v1"');
+    expect(preview.statusCode).toBe(200); expect(preview.headers["content-type"]).toContain("text/html"); expect(preview.body).toContain("Reporting Period: August 2026"); expect(preview.body).not.toContain("Compared with"); expect(preview.body).toContain('data-report-layout="tention-monthly-v1"');
     expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}/history` })).json()).toEqual(beforeHistory);
     const generated = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/generate`, payload: { expectedVersion: reviewed.version } });
     expect(generated.statusCode).toBe(200); expect(generated.json()).toMatchObject({ report: { status: "generated" }, artifact: { mimeType: "application/pdf", byteSize: renderedPdf.length, sourceFingerprint: expect.stringMatching(/^[a-f0-9]{64}$/) } });
@@ -432,7 +442,58 @@ describe("report draft API", () => {
     expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${invalid.id}` })).json()).toMatchObject({ status: "ready_for_review", version: invalid.version });
     expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${invalid.id}/history` })).json().map(({ eventType }: { eventType: string }) => eventType)).toEqual(["REPORT_CREATED"]);
   });
+  it.each([
+    ["the currency is not configured", null, "TEST01", ["CURRENCY_NOT_CONFIGURED"]],
+    ["the Placed Order provider metric ID is not configured", "USD", null, ["CONVERSION_METRIC_ID_NOT_CONFIGURED"]],
+    ["neither is configured", null, null, ["CURRENCY_NOT_CONFIGURED", "CONVERSION_METRIC_ID_NOT_CONFIGURED"]],
+  ] as const)("fails closed before rendering, Drive, or the Doc when %s", async (_case, currency, metricId, codes) => {
+    await useConfiguredClient(currency, metricId);
+    const created = (await create({ sections: { executive_summary: "required" } })).json();
+    const uploaded = (await upload(created.id)).json().report;
+    const reviewed = (await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/events`, payload: eventPayload(uploaded.version, "SUBMIT_FOR_REVIEW") })).json();
+    const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/generate`, payload: { expectedVersion: reviewed.version } });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: "REPORT_DATA_DEFINITION_INCOMPLETE" });
+    expect(response.json().blockers.map(({ code }: { code: string }) => code)).toEqual(codes);
+    expect(pdfRenderer.render).not.toHaveBeenCalled();
+    expect(await repository.listArtifacts(created.id)).toEqual([]);
+    expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).json()).toMatchObject({ status: "ready_for_review", version: reviewed.version });
+  });
+  describe("explicit currency data-definition update", () => {
+    it("fills a null frozen currency from the verified client profile and changes nothing else", async () => {
+      const created = (await create({ sections: { executive_summary: "required" } })).json(); // client-1 has no profile yet: currency null
+      const uploaded = (await upload(created.id)).json().report;
+      const before = (await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).json();
+      expect(before.client.currency).toBeNull();
+      await useConfiguredClient("USD", "TEST01");
+      // useConfiguredClient rebuilt the app on the same repository; the draft is unchanged so far.
+      const response = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/client-currency`, payload: { expectedVersion: uploaded.version } });
+      expect(response.statusCode).toBe(200);
+      const after = response.json();
+      expect(after.client.currency).toBe("USD");
+      expect(after.version).toBe(before.version + 1);
+      for (const key of ["id", "reportMonth", "period", "status", "sections", "screenshots", "createdAt"]) expect(after[key]).toEqual(before[key]);
+      expect({ ...after.client, currency: null }).toEqual(before.client);
+      // Idempotent: applying again changes nothing.
+      const again = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/client-currency`, payload: { expectedVersion: after.version } });
+      expect(again.json().version).toBe(after.version);
+    });
+    it("refuses when the profile has no verified currency, and never replaces a different frozen currency", async () => {
+      const created = (await create({ sections: { executive_summary: "required" } })).json();
+      await useConfiguredClient(null, "TEST01");
+      const missing = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/client-currency`, payload: { expectedVersion: created.version } });
+      expect(missing.statusCode).toBe(400);
+      expect((await app.inject({ method: "GET", url: `/api/v1/report-drafts/${created.id}` })).json()).toMatchObject({ version: created.version, client: { currency: null } });
+      const frozen = { ...(await repository.getById(created.id))!, client: { ...(await repository.getById(created.id))!.client, currency: "CAD" }, version: created.version + 1 };
+      await repository.save(frozen, created.version);
+      await useConfiguredClient("USD", "TEST01");
+      const conflict = await app.inject({ method: "POST", url: `/api/v1/report-drafts/${created.id}/client-currency`, payload: { expectedVersion: frozen.version } });
+      expect(conflict.statusCode).toBe(400);
+      expect((await repository.getById(created.id))!.client.currency).toBe("CAD");
+    });
+  });
   it("records generation failure without claiming generated or creating an artifact", async () => {
+    await useConfiguredClient();
     pdfRenderer.render.mockRejectedValueOnce(new Error("renderer offline"));
     const created = (await create({ sections: { executive_summary: "required" } })).json();
     const uploaded = (await upload(created.id)).json().report;
@@ -486,7 +547,7 @@ describe("report draft API", () => {
     const repository = new InMemoryReportDraftRepository();
     vi.spyOn(repository, "delete").mockRejectedValue(new ReportPersistenceError("REPORT_DELETE_FAILED", "Report draft could not be deleted."));
     screenshotStorage = new InMemoryScreenshotStorage();
-    app = buildApp({ now: () => new Date(NOW), repository, screenshotStorage });
+    app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), repository, screenshotStorage });
     const created = (await create()).json();
     const uploaded = (await upload(created.id)).json().report;
     const storageKey = uploaded.screenshots[0].storageKey;

@@ -28,7 +28,8 @@ describe("Campaigns capture navigation", () => {
     const { navigation, tabs, scripting } = fixture(startUrl);
     await expect(navigation.prepare(request, LIST_URL)).resolves.toMatchObject({ kind: "ready" });
     expect(tabs.update).toHaveBeenCalledWith(7, { url: PERIOD_URL });
-    expect(scripting.executeScript).toHaveBeenCalledTimes(1);
+    expect(scripting.executeScript).toHaveBeenCalledTimes(2);
+    expect((scripting.executeScript.mock.calls as unknown as Array<[{ files?: string[] }]>).map(([details]) => details.files ? "period-helper" : "adapter")).toEqual(["period-helper", "adapter"]);
   });
   it("reloads the Campaigns list fresh even when the authorized tab already shows it for the report period", async () => {
     const { navigation, tabs } = fixture(PERIOD_URL);

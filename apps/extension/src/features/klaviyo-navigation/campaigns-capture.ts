@@ -1,4 +1,5 @@
 import { TOP_CAMPAIGNS_LIMIT, type ReportPeriod } from "@tention/report-schema";
+import type { PeriodEntryApi } from "./injected/period-entry-contract.js";
 
 export const TOP_CAMPAIGN_ROW_COUNT = TOP_CAMPAIGNS_LIMIT;
 export type CampaignsFailureCode =
@@ -346,11 +347,14 @@ export async function prepareCampaignsCaptureDocument(request: CampaignsCaptureR
         date.datePickerStructure = { kind: picker?.kind ?? "unrecognized", inputs: structure.dateInputs.map((input) => ({ type: input.type, label: dateInputLabel(input).slice(0, 80), value: input.value.slice(0, 40) })), calendar: calendarStructure(), presets: popovers().flatMap((node) => Array.from(node.querySelectorAll("[role=option],[role=menuitem],[role=menuitemradio],button,li")).filter(visible).map(text)).filter(Boolean).slice(0, 15) };
         if (!picker) return dateFailure("CAMPAIGNS_DATE_CONTROL_NOT_FOUND", "The Campaigns date picker exposed neither start/end inputs nor a calendar.");
         if (picker.kind === "inputs") {
-          // React tracks the native value setter: set through it, then dispatch the events React listens for.
-          const setValue = (input: HTMLInputElement, value: string) => { input.focus(); const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set; descriptor?.call(input, value); input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true })); input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); input.dispatchEvent(new Event("blur", { bubbles: true })); };
-          setValue(picker.inputs.start!, formatCampaignDateInput(request.period.startDate, picker.inputs.start!)); await nextFrames();
-          setValue(picker.inputs.end!, formatCampaignDateInput(request.period.endDate, picker.inputs.end!)); await nextFrames();
-          date.valuesAfterSet = [picker.inputs.start!.value, picker.inputs.end!.value];
+          // The shared period helper replaces any range kept from another report and proves the fields hold the
+          // report's exact dates; Apply is never clicked on any other values.
+          const periodEntry = (globalThis as unknown as { __tentionPeriodEntry?: PeriodEntryApi }).__tentionPeriodEntry;
+          if (!periodEntry) return dateFailure("REPORT_PERIOD_NOT_CONFIRMED", "The shared period helper was not loaded, so the report month could not be set. Nothing was captured.");
+          const fields = () => { const inputs = resolveDateInputs(); return inputs.start && inputs.end ? { start: inputs.start, end: inputs.end } : null; };
+          const entry = await periodEntry.enterDateRange({ fields, startDate: request.period.startDate, endDate: request.period.endDate, format: (input, iso) => formatCampaignDateInput(iso, input) });
+          date.entry = entry; date.pickerValuesEntered = entry.pickerValuesEntered; date.valuesAfterSet = entry.observed;
+          if (!entry.ok) return dateFailure("REPORT_PERIOD_NOT_CONFIRMED", `Klaviyo's Campaigns date fields did not accept ${request.period.startDate} – ${request.period.endDate}; Apply was not clicked and nothing was captured.`);
         } else {
           const startPicked = await pickCalendarDay(request.period.startDate);
           const endPicked = startPicked && await pickCalendarDay(request.period.endDate);

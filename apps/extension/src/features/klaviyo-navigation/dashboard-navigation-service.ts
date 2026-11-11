@@ -1,4 +1,5 @@
-import type { ReportPeriod } from "@tention/report-schema";
+import type { BusinessPerformanceEvidence, ReportPeriod } from "@tention/report-schema";
+import { injectPeriodEntry } from "./injected/period-entry-contract.js";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
 import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
 import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
@@ -12,7 +13,9 @@ import {
 } from "./dashboard-capture.js";
 
 export type DashboardPreparation =
-  | { kind: "ready"; sourceTabId: number; windowId: number; detectedPeriod: string; observedPeriod: { startDate: string; endDate: string }; target: DashboardTargetBounds }
+  | { kind: "ready"; sourceTabId: number; windowId: number; detectedPeriod: string; observedPeriod: { startDate: string; endDate: string }; target: DashboardTargetBounds;
+      /** Executive Summary only: the verified card's rendered Business performance values, or why they were not read. */
+      businessPerformance?: BusinessPerformanceEvidence | null; businessPerformanceIssues?: string[]; businessPerformanceReadout?: Record<string, unknown> }
   | { kind: "failed"; code: DashboardFailureCode | ActiveTabGrantFailureCode | "SCRIPT_RESULT_EMPTY" | "SCRIPT_RESULT_UNDEFINED" | "SCRIPT_RESULT_INVALID" | "SCRIPT_INJECTION_FAILED" | "PAGE_READY_TIMEOUT"; message: string; sourceTabId?: number; windowId?: number; diagnostics?: Record<string, unknown> };
 
 export interface DashboardCaptureNavigation {
@@ -59,6 +62,8 @@ export class ChromeKlaviyoDashboardCaptureNavigation implements DashboardCapture
       if (!isKlaviyoHomeDashboardUrl(dashboard.url ?? null)) return { kind: "failed", code: "DASHBOARD_NOT_FOUND", message: "The toolbar-authorized tab did not reach the configured Klaviyo Overview dashboard." };
       if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
       injection = { tabId: grant.grant.grantedTabId, urlBefore: dashboard.url ?? null };
+      // The shared period helper first: the adapter replaces whatever month Klaviyo kept with the report's own.
+      await injectPeriodEntry(scripting, grant.grant.grantedTabId);
       const results = await withTimeout(() => scripting.executeScript<unknown>({
         target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareDashboardCaptureDocument,
         args: [DASHBOARD_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }, ...(recoveryRequests(recovery, "extended-readiness") ? [6_000, 25_000] as const : [] as const)],
@@ -69,7 +74,8 @@ export class ChromeKlaviyoDashboardCaptureNavigation implements DashboardCapture
       if (main.result === undefined) return { kind: "failed", code: "SCRIPT_RESULT_UNDEFINED", message: "The dashboard helper returned an undefined result.", diagnostics: { injection: await describe(main) } };
       if (!isAdapterResult(main.result)) return { kind: "failed", code: "SCRIPT_RESULT_INVALID", message: "The dashboard helper returned an invalid result.", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { injection: await describe(main), failureStage: "PAGE_READY", expectedUrl: safeUrl(dashboardUrl ?? dashboard.url), observedUrl: safeUrl(dashboard.url), expectedSourceIdentity: DASHBOARD_TARGETS[screenshotType].sourceIdentity, resultShape: summarizeAdapterResult(main.result) } };
       if (!main.result.ok) return { kind: "failed", code: main.result.code, message: main.result.message, sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, diagnostics: { ...(main.result.diagnostics ?? {}), stageTimingsMs: { ...((main.result.diagnostics?.stageTimingsMs as Record<string, number> | undefined) ?? {}), navigationMs } } };
-      return { kind: "ready", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, detectedPeriod: formatPeriod(period), observedPeriod: main.result.observedPeriod, target: { ...main.result.targetRect, stageTimingsMs: { ...(main.result.targetRect.stageTimingsMs ?? {}), navigationMs } } };
+      return { kind: "ready", sourceTabId: grant.grant.grantedTabId, windowId: grant.grant.grantedWindowId, detectedPeriod: formatPeriod(period), observedPeriod: main.result.observedPeriod, target: { ...main.result.targetRect, stageTimingsMs: { ...(main.result.targetRect.stageTimingsMs ?? {}), navigationMs } },
+        ...(main.result.businessPerformance !== undefined ? { businessPerformance: main.result.businessPerformance, businessPerformanceIssues: main.result.businessPerformanceIssues ?? [], businessPerformanceReadout: main.result.businessPerformanceReadout ?? {} } : {}) };
     } catch (error) {
       if (isChromeOperationTimeout(error)) return { kind: "failed", code: "PAGE_READY_TIMEOUT", message: error.message };
       const diagnostics = injection ? { injection: await injectionFailureDiagnostics({ section: screenshotType, scripting: scripting as never, tabs: tabs as never, tabId: injection.tabId, urlBefore: injection.urlBefore, results: null, main: null, cardAliases: [DASHBOARD_TARGETS[screenshotType].heading], failureStage: "SCRIPT_INJECTION" }), injectionError: chromeErrorMessage(error) } : undefined;

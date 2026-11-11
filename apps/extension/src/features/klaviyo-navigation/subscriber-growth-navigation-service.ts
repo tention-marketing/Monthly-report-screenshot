@@ -1,4 +1,5 @@
 import type { ReportPeriod, SubscriberGrowthEvidence } from "@tention/report-schema";
+import { injectPeriodEntry } from "./injected/period-entry-contract.js";
 import {
   ChromeSessionKlaviyoActiveTabGrantStore, activeTabGrantFailureMessage, registerConfiguredCaptureRoute,
   type ActiveTabGrantFailureCode, type KlaviyoActiveTabGrantStore, verifyKlaviyoActiveTabGrant,
@@ -55,6 +56,7 @@ export class ChromeSubscriberGrowthNavigation implements SubscriberGrowthNavigat
       if (!samePath(tab.url, input.sourceUrl)) return { kind: "failed", code: "SUBSCRIBER_GROWTH_ROUTE_CHANGED", message: "Klaviyo did not stay on the saved Subscriber growth page (it may have redirected to sign-in or another page).", diagnostics: { expectedUrl: safe(input.sourceUrl), observedUrl: safe(tab.url ?? null), tabStatus: tab.status ?? null } };
       const request: SubscriberGrowthCaptureRequest = { purpose: "capture", period: { startDate: input.period.startDate, endDate: input.period.endDate }, clientName: input.clientName, readinessTimeoutMs: input.extendedReadiness ? 90_000 : 60_000, stability: STABILITY };
       const urlBefore = tab.url ?? null;
+      await injectPeriodEntry(scripting, tabId);
       const results = await scripting.executeScript<Promise<SubscriberGrowthAdapterResult | SubscriberGrowthSourceProbe>>({ target: { tabId, frameIds: [0] }, func: prepareSubscriberGrowthDocument, args: [request] });
       const main = results.find(({ frameId }) => frameId === 0) ?? results[0] ?? null;
       const result = main?.result as SubscriberGrowthAdapterResult | undefined;

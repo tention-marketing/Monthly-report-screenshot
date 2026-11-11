@@ -92,7 +92,7 @@ async function main(): Promise<void> {
   report = await repository.save(enableEmailSubscriberGrowth(report, { now: new Date() }), report.version);
   record("Section 10 enabled on the existing report", report.sections.email_subscriber_growth === "required");
 
-  const app = buildApp({ repository, clientReportTargetsRepository: targets, screenshotStorage, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true, repositoryRoot: root });
+  const app = buildApp({ requireClientSetupReady: false, repository, clientReportTargetsRepository: targets, screenshotStorage, enableLocalDevelopmentImports: true, localImportRequiresPersistentStorage: true, repositoryRoot: root });
   const apiAddress = await app.listen({ host: "127.0.0.1", port: 0 });
 
   // Test-only manifest copy: "<all_urls>" lets captureVisibleTab run without a real toolbar gesture.

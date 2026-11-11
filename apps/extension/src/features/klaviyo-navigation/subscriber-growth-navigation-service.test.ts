@@ -45,7 +45,8 @@ describe("Subscriber Growth navigation (Section 10)", () => {
     const result = await navigation.prepare({ period, sourceUrl: SOURCE, clientName: "Club Furniture" });
     expect(result).toMatchObject({ kind: "ready", sourceTabId: 7, windowId: 3, periodEvidence: { startDate: "2026-08-01", endDate: "2026-08-31" }, evidence: { emailSubscribers: 17698 } });
     expect(api.tabs.update).toHaveBeenCalledWith(7, { url: SOURCE });
-    expect(api.scripting.executeScript.mock.calls[0]![0].args[0]).toMatchObject({ period: { startDate: "2026-08-01", endDate: "2026-08-31" }, clientName: "Club Furniture", stability: { requiredStableSamples: 3, sampleIntervalMs: 500 } });
+    expect(api.scripting.executeScript.mock.calls[0]![0]).toMatchObject({ files: ["injected/period-entry.js"] });
+    expect((api.scripting.executeScript.mock.calls as Array<[{ func?: unknown; args: any[] }]>).find(([details]) => details.func)![0].args[0]).toMatchObject({ period: { startDate: "2026-08-01", endDate: "2026-08-31" }, clientName: "Club Furniture", stability: { requiredStableSamples: 3, sampleIntervalMs: 500 } });
     expect(isKlaviyoSupportedCaptureUrl(`${SOURCE}?date=1`)).toBe(true);
     expect(persisted).toHaveBeenCalled();
   });

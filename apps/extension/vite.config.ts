@@ -21,8 +21,10 @@ export default defineConfig({
       input: {
         index: fileURLToPath(new URL("./index.html", import.meta.url)),
         background: fileURLToPath(new URL("./src/background.ts", import.meta.url)),
+        // Shared page helper loaded with chrome.scripting.executeScript({ files }) before period-setting adapters.
+        "period-entry": fileURLToPath(new URL("./src/features/klaviyo-navigation/injected/period-entry.ts", import.meta.url)),
       },
-      output: { entryFileNames: (chunk) => chunk.name === "background" ? "background.js" : "assets/[name]-[hash].js" },
+      output: { entryFileNames: (chunk) => chunk.name === "background" ? "background.js" : chunk.name === "period-entry" ? "injected/period-entry.js" : "assets/[name]-[hash].js" },
     },
   },
 });

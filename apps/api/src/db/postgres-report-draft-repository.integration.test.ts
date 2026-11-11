@@ -26,7 +26,7 @@ suite("PostgresReportDraftRepository with real PostgreSQL", () => {
   beforeAll(async () => {
     pool = new Pool({ connectionString: testUrl });
     await pool.query("DROP TABLE IF EXISTS report_pdf_artifacts, report_lifecycle_events, client_report_targets, report_drafts, schema_migrations CASCADE");
-    expect(await runMigrations(pool)).toEqual(["001_report_drafts.sql", "002_report_lifecycle_events.sql", "003_report_pdf_artifacts.sql", "004_client_report_targets.sql"]);
+    expect(await runMigrations(pool)).toEqual(["001_report_drafts.sql", "002_report_lifecycle_events.sql", "003_report_pdf_artifacts.sql", "004_client_report_targets.sql", "005_report_pdf_artifact_drive_delivery.sql", "006_report_pdf_artifact_google_doc.sql", "007_report_status_auto_validated.sql", "008_client_onboarding.sql"]);
     expect(await runMigrations(pool)).toEqual([]);
   });
   beforeEach(async () => {
@@ -46,6 +46,58 @@ suite("PostgresReportDraftRepository with real PostgreSQL", () => {
     expect(stored?.client.timezone).toBe("Asia/Kolkata");
     expect(stored?.screenshots).toEqual([]);
     expect(stored?.validation).toEqual(initial.validation);
+  });
+  it("stores the report-time client snapshot once and never changes it on later saves", async () => {
+    const snapshotted = createReportDraft({
+      client: { id: "steven-dann", name: "Steven Dann", timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "SDmet1" }, klaviyoAccount: { accountLabel: "Steven Dann", providerAccountId: null } },
+      reportMonth: { year: 2026, month: 10 }, sections: { executive_summary: "required" },
+    }, { now });
+    const stored = await repository.create(snapshotted);
+    expect(stored.client.conversionMetric).toEqual({ label: "Placed Order", providerMetricId: "SDmet1" });
+    const tampered = { ...stored, client: { ...stored.client, conversionMetric: { label: "Placed Order", providerMetricId: "OTHER1" } }, version: stored.version + 1 };
+    const saved = await repository.save(tampered, stored.version);
+    expect(saved.client.conversionMetric).toEqual({ label: "Placed Order", providerMetricId: "SDmet1" });
+    expect((await repository.getById(stored.id))?.client.klaviyoAccount).toEqual({ accountLabel: "Steven Dann", providerAccountId: null });
+    // A report created before onboarding has no snapshot keys at all.
+    expect(Object.keys((await repository.create(draft())).client).sort()).toEqual(["currency", "id", "name", "timezone"]);
+  });
+  it("never saves one client's conversion metric ID on another client", async () => {
+    const input = (name: string) => ({ businessReview: null, sourceUrls: null, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, welcomeFlowListing: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, profile: { name, timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId: "KyqTnx" }, sections: null } });
+    await targetRepository.save("club-furniture", input("Club Furniture"), now);
+    await expect(targetRepository.save("steven-dann", input("Steven Dann"), now)).rejects.toMatchObject({ code: "CONVERSION_METRIC_ID_ALREADY_BOUND" });
+    expect((await targetRepository.get("steven-dann")).profile).toBeNull();
+  });
+  it("allows only a same-account presentation correction of the saved Klaviyo account label", async () => {
+    const input = (accountLabel: string) => ({ profile: null, sourceUrls: null, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, welcomeFlowListing: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, businessReview: { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/01SD", displayName: "Business Review", accountLabel } });
+    await targetRepository.save("steven-dann", input("ST Steven Dann"), now);
+    await expect(targetRepository.save("steven-dann", input("Club Furniture"), now)).rejects.toMatchObject({ code: "CLIENT_ACCOUNT_BINDING_IMMUTABLE" });
+    expect((await targetRepository.save("steven-dann", input("Steven Dann"), now)).businessReview?.accountLabel).toBe("Steven Dann");
+    expect((await targetRepository.get("steven-dann")).businessReview?.accountLabel).toBe("Steven Dann");
+  });
+  it("records Drive delivery on an existing artifact without changing its canonical fields", async () => {
+    const report = await repository.create(draft());
+    const artifactId = crypto.randomUUID();
+    await pool.query(`INSERT INTO report_pdf_artifacts (id, report_id, storage_key, mime_type, byte_size, sha256, source_fingerprint, template_version, generated_at)
+      VALUES ($1, $2, $3, 'application/pdf', 10, $4, $5, 'monthly-report-v1', $6)`, [artifactId, report.id, `reports/${report.id}/artifacts/${artifactId}.pdf`, "a".repeat(64), "b".repeat(64), now.toISOString()]);
+    const before = await repository.getArtifactForFingerprint(report.id, "b".repeat(64));
+    expect(before?.driveDelivery).toBeUndefined();
+    const delivery = { driveUploadStatus: "uploaded" as const, driveFileName: "Orion - August 2026.pdf", driveFileId: "file-1", driveFolderId: "folder-1", driveWebViewLink: "https://drive.google.com/file/d/file-1/view", driveUploadedAt: now.toISOString(), driveUploadAction: "created" as const, driveErrorCode: null, driveAttemptedAt: now.toISOString() };
+    const saved = await repository.saveArtifactDriveDelivery(report.id, artifactId, delivery);
+    expect(saved).toEqual({ ...before, driveDelivery: delivery });
+    expect(await new PostgresReportDraftRepository(pool).listArtifacts(report.id)).toEqual([saved]);
+    await expect(repository.saveArtifactDriveDelivery(report.id, crypto.randomUUID(), delivery)).rejects.toMatchObject({ code: "PERSISTENCE_DATA_INVALID" });
+  });
+  it("records the Google Doc copy separately from Drive PDF delivery on the same artifact", async () => {
+    const report = await repository.create(draft());
+    const artifactId = crypto.randomUUID();
+    await pool.query(`INSERT INTO report_pdf_artifacts (id, report_id, storage_key, mime_type, byte_size, sha256, source_fingerprint, template_version, generated_at)
+      VALUES ($1, $2, $3, 'application/pdf', 10, $4, $5, 'monthly-report-v1', $6)`, [artifactId, report.id, `reports/${report.id}/artifacts/${artifactId}.pdf`, "a".repeat(64), "c".repeat(64), now.toISOString()]);
+    const delivery = { driveUploadStatus: "uploaded" as const, driveFileName: "Orion - August 2026.pdf", driveFileId: "file-1", driveFolderId: "folder-1", driveWebViewLink: "https://drive.google.com/file/d/file-1/view", driveUploadedAt: now.toISOString(), driveUploadAction: "created" as const, driveErrorCode: null, driveAttemptedAt: now.toISOString() };
+    const googleDoc = { googleDocStatus: "synced" as const, googleDocName: "Orion - August 2026", googleDocId: "doc-1", googleDocFolderId: "folder-1", googleDocWebViewLink: "https://docs.google.com/document/d/doc-1/edit", googleDocUpdatedAt: now.toISOString(), googleDocVersion: "7", googleDocAction: "created" as const, googleDocErrorCode: null, googleDocAttemptedAt: now.toISOString() };
+    await repository.saveArtifactDriveDelivery(report.id, artifactId, delivery);
+    const saved = await repository.saveArtifactGoogleDoc(report.id, artifactId, googleDoc);
+    expect(saved).toMatchObject({ id: artifactId, sha256: "a".repeat(64), driveDelivery: delivery, googleDoc });
+    expect((await new PostgresReportDraftRepository(pool).listArtifacts(report.id))[0]).toEqual(saved);
   });
   it("rejects duplicate identity", async () => {
     await repository.create(draft());

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { createScreenshotSourceProof, matchesReportCaptureSpec, screenshotSourceProofSchema, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { MIN_KLAVIYO_VIEWPORT_WIDTH, formatZoom, klaviyoViewportTooNarrowMessage, type KlaviyoViewportNormalization, type KlaviyoZoomRestore } from "./klaviyo-viewport.js";
+import { createScreenshotSourceProof, matchesReportCaptureSpec, screenshotSourceProofSchema, verifyBusinessPerformance, type BusinessPerformanceEvidence, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 import type { ApiClient, AutomaticCaptureSectionResult } from "@tention/api-client";
 import type { AutoCaptureFailureState, AutoCaptureService, AutoCaptureState, ExecutiveSummaryAutoCaptureRequest } from "./auto-capture-service.js";
 import type { ChecklistItem } from "../report-checklist/checklist.js";
@@ -45,6 +46,8 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
   const [runDurationMs, setRunDurationMs] = useState<number | null>(null);
   const [canonicalReport, setCanonicalReport] = useState<ReportDraft | null>(null);
   const started = useRef(false);
+  const [zoom, setZoom] = useState<Extract<KlaviyoViewportNormalization, { ok: true }> | null>(null);
+  const [zoomRestore, setZoomRestore] = useState<KlaviyoZoomRestore | null>(null);
 
   useEffect(() => {
     if (started.current) return;
@@ -54,14 +57,28 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The user's Klaviyo zoom is restored however the run ends: completed, failed, timed out, or refused at preflight.
   async function run() {
+    try { await runCapture(); }
+    finally { setZoomRestore(await service.restoreKlaviyoZoom?.().catch(() => null) ?? null); }
+  }
+
+  async function runCapture() {
     const runStartedAt = new Date(); const runStart = performance.now(); const id = crypto.randomUUID(); setRunId(id);
     let persistedPassCount = 0;
+    let normalization: KlaviyoViewportNormalization | null = null;
     try {
       // Chrome reloads the side panel from disk but keeps an un-restarted service worker on its old code, so
       // the panel's build stamp alone does not prove which page adapters will run.
       const workerBuild = service.getExtensionBuild ? await service.getExtensionBuild() : EXTENSION_BUILD;
       if (workerBuild !== EXTENSION_BUILD) throw new Error(`The extension service worker is running build ${workerBuild ?? "(unknown)"}, but this panel is build ${EXTENSION_BUILD}. Reload the extension in chrome://extensions, reopen the panel, and start again.`);
+      // A too-narrow Klaviyo layout fails every section (the Time period picker does not open, cards clip). The
+      // authorized tab is zoomed out just enough first; when even that cannot help, no run is created.
+      if (service.normalizeKlaviyoViewport) {
+        const normalized = await service.normalizeKlaviyoViewport();
+        if (!normalized.ok) throw new Error(normalized.message);
+        normalization = normalized; setZoom(normalized);
+      }
       await api.startLocalAutomaticCaptureRun({ runId: id, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: runStartedAt.toISOString(), extensionBuild: EXTENSION_BUILD, ...(mode === "resume" ? { mode, plannedSections: plan.map((item) => item.screenshotType!) } : {}) });
       // Capture states (each holding a full-viewport screenshot) left by earlier sections, runs, or months are released.
       await service.clearAll?.().catch(() => undefined);
@@ -116,6 +133,12 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           if (recovery.actions.includes("release-capture-state")) await service.clearAll?.().catch(() => undefined);
           if (recovery.actions.includes("cool-down-before-retry")) await new Promise((resolve) => window.setTimeout(resolve, COOL_DOWN_MS));
           await service.clear(request);
+          // Re-checked before every attempt: a zoom or window change mid-run is normalized again before capturing.
+          if (service.normalizeKlaviyoViewport) {
+            const normalized = await bounded(service.normalizeKlaviyoViewport(), 30_000, "VIEWPORT_TIMEOUT");
+            if (!normalized.ok) throw Object.assign(new Error(normalized.message), { code: normalized.code, permanent: normalized.code === "KLAVIYO_VIEWPORT_CANNOT_BE_NORMALIZED" });
+            normalization = normalized; setZoom(normalized); mark("viewportNormalizedAt");
+          }
           setResults((current) => current.map((result) => result.section === type ? { ...result, phase: "Capturing" } : result));
           const captureStartedAt = performance.now();
           stage = "PAGE_READY";
@@ -127,6 +150,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
 
           if (state.stage === "failed") throw Object.assign(new Error(state.message), { code: state.code, diagnostics: state.diagnostics ?? {}, failureState: state });
           if (state.stage !== "review_ready") throw Object.assign(new Error("Automatic capture ended in an unexpected state."), { code: "AUTOMATIC_CAPTURE_UNEXPECTED_STATE" });
+          if (!(state.target.viewportWidth >= MIN_KLAVIYO_VIEWPORT_WIDTH)) throw Object.assign(new Error(klaviyoViewportTooNarrowMessage(state.target.viewportWidth)), { code: "KLAVIYO_VIEWPORT_TOO_NARROW" });
 
           stage = "VERIFYING_PERIOD";
           // Top Campaigns proof carries the adapter's read-only Campaigns-list evidence.
@@ -138,6 +162,14 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           if (type === "email_subscriber_growth") {
             if (!state.subscriberGrowthEvidence) throw Object.assign(new Error("The Subscriber growth adapter returned no Email → Growth evidence."), { code: "SUBSCRIBER_GROWTH_EVIDENCE_MISSING" });
             proof = createScreenshotSourceProof(type, report.period, undefined, null, state.subscriberGrowthEvidence);
+          }
+          // The Executive Summary proof carries the report cover values, read from the period-verified card's DOM text.
+          // Missing or inconsistent values fail this section (retried) instead of producing a cover that cannot be trusted.
+          if (type === "overview") {
+            const evidence = state.businessPerformanceEvidence ?? null;
+            const issues = evidence ? coverIssues(evidence, report.client.currency) : (state.businessPerformanceIssues?.length ? state.businessPerformanceIssues : ["The Business performance summary values were not read."]);
+            if (!evidence || issues.length) throw Object.assign(new Error(`Report cover values could not be verified: ${issues.join(" ")}`), { code: "EXECUTIVE_SUMMARY_METRICS_UNVERIFIED", diagnostics: { businessPerformance: evidence, businessPerformanceIssues: issues } });
+            proof = createScreenshotSourceProof(type, report.period, undefined, null, null, evidence);
           }
           const proofShape = screenshotSourceProofSchema.safeParse(proof);
           if (!proofShape.success) throw Object.assign(new Error(`Source proof failed schema validation: ${proofShape.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")}`), { code: "SOURCE_PROOF_SCHEMA_INVALID", permanent: true });
@@ -160,10 +192,11 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           const totalMs = Math.round(performance.now() - start);
           const passDiagnostics = {
             attemptNumber: attempt, maxAttempts: MAX_ATTEMPTS, extensionBuild: EXTENSION_BUILD, sourceProof: proof, sourceIdentity: proof.sourceIdentity,
+            ...(type === "overview" && state.stage === "review_ready" && state.businessPerformanceReadout ? { businessPerformanceReadout: state.businessPerformanceReadout } : {}),
             expectedPeriod: proof.expectedPeriod, observedPeriod: state.periodEvidence ?? null, observedPeriodProof: state.periodEvidence ?? null, targetBounds: state.target,
             stageTimingsMs: { ...(state.target.stageTimingsMs ?? {}), navigationMs: numberTiming(state.target.stageTimingsMs, "navigationMs"), pageReadyMs: numberTiming(state.target.stageTimingsMs, "pageReadyMs"), periodSetMs: numberTiming(state.target.stageTimingsMs, "periodSetMs"), cardResolveMs: numberTiming(state.target.stageTimingsMs, "cardResolveMs"), viewSwitchMs: numberTiming(state.target.stageTimingsMs, "viewSwitchMs"), contentReadyMs: numberTiming(state.target.stageTimingsMs, "contentReadyMs"), captureMs, cropMs, uploadMs, backendConfirmMs, totalMs },
             attemptHistory: [...attemptHistory], capturedAt: new Date().toISOString(), fullPageScreenshot: "not available through Chrome extension visible-tab capture",
-            recovery: recoveryRecord, stageTimeline,
+            recovery: recoveryRecord, stageTimeline, viewportNormalization: normalization,
           };
           persistedResult = { ...persistedResult, status: "pass", finishedAt: new Date().toISOString(), durationMs: totalMs, observedUrl: safeUrl(state.captured.sourceUrl), observedSourceIdentity: proof.sourceIdentity, observedPeriod: state.detectedPeriod, visibleControls: state.target.visibleControls ?? [], usableRowCount: typeof state.target.availableRowCount === "number" ? state.target.availableRowCount : null, screenshotResult: "fresh_semantic_crop_saved", sourceProofResult: "PASS", sha256: acknowledgment.sha256, diagnostics: passDiagnostics };
           const confirmPassStarted = performance.now();
@@ -203,7 +236,9 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           const failedResult: AutomaticCaptureSectionResult = {
             ...persistedResult, status: "fail", finishedAt: new Date().toISOString(), durationMs: totalMs,
             observedUrl: safeUrl(typeof diagnostic?.currentUrl === "string" ? diagnostic.currentUrl : capturedFailure?.sourceUrl ?? null),
-            observedPeriod: typeof diagnostic?.observedPeriod === "string" ? diagnostic.observedPeriod : ready?.detectedPeriod ?? null,
+            // The adapter's fallback period text can be a whole page region; the backend caps this field, and a
+            // rejected diagnostic write would pause the run before its retry. Full text stays in dateControlState.
+            observedPeriod: boundedText(typeof diagnostic?.observedPeriod === "string" ? diagnostic.observedPeriod : ready?.detectedPeriod ?? null, OBSERVED_PERIOD_MAX_LENGTH),
             visibleControls: Array.isArray(diagnostic?.visibleControls) ? diagnostic.visibleControls as Record<string, unknown>[] : ready?.target.visibleControls ?? [],
             usableRowCount: typeof diagnostic?.usableRowCount === "number" ? diagnostic.usableRowCount : ready && typeof ready.target.availableRowCount === "number" ? ready.target.availableRowCount : null,
             screenshotResult: capturedFailure ? "failure_viewport_saved" : "not_available", sourceProofResult: "not_created_or_unverified",
@@ -269,6 +304,8 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
     {runId && <p className="support-copy">Diagnostic run ID: <code>{runId}</code></p>}
     <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Not started" : result.status === "running" ? `${result.phase} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
     {!running && <p role="status" className="notice">Fresh captures: {passed} / {plan.length} successful · {canonicalReport ? `${confirmedCaptures.length} / ${allSections.length} captured · ${confirmedPending} pending review · ${confirmedApproved} approved · ${allSections.length - confirmedCaptures.length} missing` : "canonical persistence not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
+    {zoom && <p className="support-copy">Klaviyo zoom: {formatZoom(zoom.originalZoom)} → {formatZoom(zoom.captureZoom)} for capture · viewport {Math.round(zoom.viewport.width)} px (minimum {MIN_KLAVIYO_VIEWPORT_WIDTH} px)</p>}
+    {zoomRestore?.restored && <p className="support-copy">Klaviyo zoom restored to {formatZoom(zoomRestore.originalZoom)}.</p>}
     {runError && <p role="alert" className="notice error-notice">{runError}</p>}
     {!running && <button className="secondary" onClick={() => onClose(canonicalReport ?? undefined)}>Back to report</button>}
   </section></main>;
@@ -303,6 +340,9 @@ async function cropTarget(source: string, target: Target, type: ScreenshotType):
 }
 function loadImage(source: string): Promise<HTMLImageElement> { return new Promise((resolve, reject) => { const image = new Image(); image.onload = () => resolve(image); image.onerror = () => reject(new Error("Captured Klaviyo viewport PNG could not be decoded.")); image.src = source; }); }
 function dataUrlBlob(value: string): Blob { const [header, data] = value.split(","); const type = header?.match(/data:([^;]+)/)?.[1] ?? "image/png"; const binary = atob(data ?? ""); const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0)); return new Blob([bytes], { type }); }
+/** Matches the backend's `observedPeriod` limit in the local automatic-capture section schema. */
+const OBSERVED_PERIOD_MAX_LENGTH = 500;
+function boundedText(value: string | null, maxLength: number): string | null { return value === null || value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`; }
 function safeUrl(value: string | null): string | null { if (!value) return null; try { const url = new URL(value); return `${url.origin}${url.pathname}`; } catch { return null; } }
 // Wrong account, lost authorization, missing configuration, or a login redirect will not change on retry
 // (the shared recovery policy classifies them as permanent); everything else escalates through recovery levels.
@@ -323,4 +363,11 @@ function friendlyFailure(code: string): string {
     : has("CAPTURE", "SCREENSHOT") ? "A fresh screenshot could not be captured."
     : "Automatic capture failed. Diagnostic details were saved for investigation.";
   return `${summary} (${code} · ${classifyFailure(code).category})`;
+}
+
+/** Cover value checks at capture time: all present; with a configured currency, exact, in that currency, and consistent. */
+function coverIssues(evidence: BusinessPerformanceEvidence, currency: string | null): string[] {
+  if (!currency) return (["totalRevenue", "emailAttributedRevenue", "campaignRevenue", "flowRevenue"] as const).filter((key) => !evidence[key]).map((key) => `${key} is missing.`);
+  const verified = verifyBusinessPerformance(evidence, currency);
+  return verified.ok ? [] : verified.issues.map(({ code, message }) => `${code}: ${message}`);
 }

@@ -333,7 +333,7 @@ async function loadPendingImport(repository: ReportDraftRepository, storage: Scr
   if (!screenshot || screenshot.clientId !== draft.client.id || screenshot.reportMonth.year !== draft.reportMonth.year || screenshot.reportMonth.month !== draft.reportMonth.month
     || screenshot.captureOrigin !== "live_acceptance_import" || screenshot.approved || screenshot.approvedAt !== null || !screenshot.storageKey
     || screenshot.mimeType !== "image/png" || !screenshot.sha256 || !screenshot.periodConfirmed || !screenshot.sourceProof) throw new Error("No pending live-acceptance screenshot is available for review.");
-  const expectedProof = createScreenshotSourceProof(type, draft.period, undefined, null, type === "email_subscriber_growth" ? screenshot.sourceProof.subscriberGrowth ?? null : null);
+  const expectedProof = createScreenshotSourceProof(type, draft.period, undefined, null, type === "email_subscriber_growth" ? screenshot.sourceProof.subscriberGrowth ?? null : null, type === "overview" ? screenshot.sourceProof.businessPerformance ?? null : null);
   if (!matchesReportCaptureSpec(type, screenshot.sourceProof) || JSON.stringify(screenshot.sourceProof) !== JSON.stringify(expectedProof)) throw new Error("Imported screenshot source proof or period is stale or invalid.");
   if (draft.screenshots.some((candidate) => candidate.type !== type && candidate.sha256 === screenshot.sha256)) throw new Error("Imported screenshot duplicates another report section.");
   const asset = await storage.get(screenshot.storageKey);

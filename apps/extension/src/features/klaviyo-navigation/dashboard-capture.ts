@@ -1,4 +1,6 @@
 import { REPORT_CAPTURE_SPEC_V1, type ReportPeriod, type ScreenshotType } from "@tention/report-schema";
+import type { PeriodEntryApi } from "./injected/period-entry-contract.js";
+import type { BusinessPerformanceEvidence } from "@tention/report-schema";
 
 /** Klaviyo Home (`/dashboard`) targets: Executive Summary and Top 5 Flows, both for the exact report month. */
 export const dashboardScreenshotTypes = ["overview", "top_flows"] as const satisfies readonly ScreenshotType[];
@@ -72,7 +74,11 @@ export function isCanonicalDashboardScreenshotType(value: ScreenshotType): value
 }
 
 export type DashboardAdapterResult =
-  | { ok: true; sourceUrl: string; targetRect: DashboardTargetBounds; observedPeriod: { startDate: string; endDate: string } }
+  | { ok: true; sourceUrl: string; targetRect: DashboardTargetBounds; observedPeriod: { startDate: string; endDate: string };
+      /** Executive Summary only: the card's own rendered money values, read after its exact period was proven. */
+      businessPerformance?: BusinessPerformanceEvidence | null; businessPerformanceIssues?: string[];
+      /** Per value: the labels found and the values beside them (diagnosis only). */
+      businessPerformanceReadout?: Record<string, { labels: string[]; values: string[] }> }
   | { ok: false; code: DashboardFailureCode; message: string; diagnostics?: Record<string, unknown> };
 
 /**
@@ -93,6 +99,8 @@ export async function prepareDashboardCaptureDocument(
       const stageTimingsMs: Record<string, number> = {};
       // What the Time period step saw and did; every failure from that stage on carries it.
       let periodDiagnostics: Record<string, unknown> | null = null;
+      // Every re-positioning step (scroller, scroll delta, target and visible-area geometry) for failure diagnostics.
+      const positioning: Record<string, unknown>[] = [];
       const operationStartedAt = performance.now();
       let failureStage = "PAGE_READY";
       const diagnosticSnapshot = (code: string, message: string) => {
@@ -127,7 +135,7 @@ export async function prepareDashboardCaptureDocument(
         // The descriptor crosses Chrome's serialization boundary with the
         // injected function; do not access module imports in this failure path.
         const expectedSourceIdentity = target.sourceIdentity;
-        return { code, message: redact(message), failureStage, ...(periodDiagnostics ? { periodSetting: periodDiagnostics } : {}), stageTimingsMs: { ...stageTimingsMs, totalMs: Math.max(0, Math.round(performance.now() - operationStartedAt)) }, currentUrl: safeUrl, expectedUrl: safeUrl, expectedSourceIdentity, expectedPeriod: { startDate: expected.startDate, endDate: expected.endDate }, observedPeriod: periodControl ? visibleText(periodControl) : null, dateControlState: periodControl ? { text: visibleText(periodControl), tag: periodControl.tagName.toLowerCase(), role: periodControl.getAttribute("role"), ariaLabel: redact(periodControl.getAttribute("aria-label") ?? "") } : null, dateDialogState: dateDialog ? visibleText(dateDialog).slice(0, 1000) : null, headings, tableHeaders, expectedSemanticCard: target.heading, expectedView: "default", visibleControls: controls, loading: Array.from(document.querySelectorAll("[aria-busy=true],[role=progressbar],[data-loading=true],[data-asc=Spinner]")).some(isVisible), usableRowCount: table?.querySelectorAll("tbody tr,[role=rowgroup] [role=row]").length ?? null, pageHtml: bodyClone.outerHTML.slice(0, 40_000), cardHtml: sanitizeHtml(card), viewRegionHtml: sanitizeHtml(table?.parentElement ?? null) };
+        return { code, message: redact(message), failureStage, ...(periodDiagnostics ? { periodSetting: periodDiagnostics } : {}), ...(positioning.length ? { positioning: positioning.slice(-6) } : {}), stageTimingsMs: { ...stageTimingsMs, totalMs: Math.max(0, Math.round(performance.now() - operationStartedAt)) }, currentUrl: safeUrl, expectedUrl: safeUrl, expectedSourceIdentity, expectedPeriod: { startDate: expected.startDate, endDate: expected.endDate }, observedPeriod: periodControl ? visibleText(periodControl) : null, dateControlState: periodControl ? { text: visibleText(periodControl), tag: periodControl.tagName.toLowerCase(), role: periodControl.getAttribute("role"), ariaLabel: redact(periodControl.getAttribute("aria-label") ?? "") } : null, dateDialogState: dateDialog ? visibleText(dateDialog).slice(0, 1000) : null, headings, tableHeaders, expectedSemanticCard: target.heading, expectedView: "default", visibleControls: controls, loading: Array.from(document.querySelectorAll("[aria-busy=true],[role=progressbar],[data-loading=true],[data-asc=Spinner]")).some(isVisible), usableRowCount: table?.querySelectorAll("tbody tr,[role=rowgroup] [role=row]").length ?? null, pageHtml: bodyClone.outerHTML.slice(0, 40_000), cardHtml: sanitizeHtml(card), viewRegionHtml: sanitizeHtml(table?.parentElement ?? null) };
       };
       const fail = (code: DashboardFailureCode, message: string): DashboardAdapterResult => ({ ok: false, code, message, diagnostics: (() => { try { return diagnosticSnapshot(code, message); } catch (error) { return { snapshotError: error instanceof Error ? error.message : String(error) }; } })() });
       try {
@@ -163,9 +171,13 @@ export async function prepareDashboardCaptureDocument(
           return null;
         }
         const hasExpectedPeriod = (value: string) => {
-          const range = parseCampaignPeriodText(value);
+          const range = selectedRange(value);
           return range?.startDate === expected.startDate && range?.endDate === expected.endDate;
         };
+        // Only the selected range proves the period: "<selected> compared to <comparison>" is split by the shared helper,
+        // and without the helper nothing is proven (the period step then fails closed).
+        const sharedPeriod = () => (globalThis as unknown as { __tentionPeriodEntry?: PeriodEntryApi }).__tentionPeriodEntry;
+        const selectedRange = (value: string) => { const helper = sharedPeriod(); return helper?.currentPeriodText ? parseCampaignPeriodText(helper.currentPeriodText(value)) : null; };
         // Klaviyo keeps closed pickers (with stale date fields) in the DOM. Proof text must be what is painted
         // on the page: never hidden nodes, never text inside a dialog, popover, or listbox.
         const renderedCache = new Map<Element, boolean>();
@@ -220,10 +232,6 @@ export async function prepareDashboardCaptureDocument(
             window.setTimeout(check, 50);
           }; check();
         });
-        const setValue = (input: HTMLInputElement, value: string) => {
-          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value);
-          input.dispatchEvent(new Event("input", { bubbles: true })); input.dispatchEvent(new Event("change", { bubbles: true }));
-        };
         const format = (iso: string) => {
           const [year, month, day] = iso.split("-").map(Number);
           return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }).format(new Date(Date.UTC(year!, month! - 1, day!)));
@@ -267,70 +275,98 @@ export async function prepareDashboardCaptureDocument(
           const describe = (input: HTMLInputElement) => ({ type: input.type, role: input.getAttribute("role"), label: name(input).slice(0, 80), placeholder: input.placeholder.slice(0, 40), value: input.value.slice(0, 40), shown: shown(input), disabled: input.disabled || input.readOnly });
           const pickers = (open: Element) => Array.from(open.querySelectorAll("select,[role=combobox],button[aria-haspopup],[aria-haspopup=listbox],button")).filter((element) => shown(element) && !/^(?:apply|cancel)$/i.test(normalize(visible(element))));
           const structure = (open: Element) => ({ inputs: Array.from(open.querySelectorAll("input")).map(describe).slice(0, 8), pickers: pickers(open).map((element) => visible(element).slice(0, 40)).slice(0, 6), buttons: Array.from(open.querySelectorAll("button,[role=button],[role=option],[role=radio],[role=menuitem]")).filter(shown).map((element) => visible(element).slice(0, 40)).filter(Boolean).slice(0, 20), text: paintedTextIncludingPopover(open).slice(0, 300) });
-          periodDiagnostics = { regionBefore, dialogFound: false };
-          if (openDialogs().length) await dismissPicker();
-          // Klaviyo opens its picker only for a control on screen; scrolling is a temporary view change.
-          (control as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest", behavior: "auto" }); await nextFrame(); await nextFrame();
-          (control as HTMLElement).click(); await nextFrame();
-          const open = await poll(dialog, dialogTimeoutMs);
-          if (!open) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "Klaviyo's Time period dialog was not found.");
-          Object.assign(periodDiagnostics, { dialogFound: true, dialogBefore: structure(open) });
-          // Only fields painted in the picker count; Time period's own range precedes the comparison period's.
-          const fieldText = (input: HTMLInputElement) => [name(input), input.placeholder, input.getAttribute("aria-label"), input.name].filter(Boolean).join(" ");
-          const pickInputs = () => {
-            const inputs = Array.from(open.querySelectorAll("input")).filter((input) => shown(input) && !input.disabled && !input.readOnly && !["hidden", "checkbox", "radio", "search", "file"].includes(input.type) && input.getAttribute("role") !== "combobox");
-            const start = inputs.find((input) => /start|from/i.test(fieldText(input))) ?? null;
-            const end = start ? inputs.slice(inputs.indexOf(start) + 1).find((input) => /end|\bto\b/i.test(fieldText(input))) ?? null : null;
-            return start && end ? { start, end } : null;
+          const rounds: Record<string, unknown>[] = [];
+          periodDiagnostics = { regionBefore, renderedPeriodBefore: regionBefore, expectedPeriod: { startDate: expected.startDate, endDate: expected.endDate }, sourcePage: location.pathname, dialogFound: false, rounds };
+          const periodEntry = sharedPeriod();
+          if (!periodEntry?.timePeriodSection || !periodEntry.currentPeriodText) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "The shared period helper was not loaded, so the report month could not be set. Nothing was captured.");
+          /**
+           * One pass over Klaviyo's Time period dialog. Round 2 runs only when round 1 applied the dates but the page kept
+           * another range, and it always re-selects Custom before entering the dates again.
+           */
+          const setReportPeriod = async (round: number): Promise<{ confirmed: boolean; failure: string | null }> => {
+            const record: Record<string, unknown> = { round, renderedPeriodBefore: regionText() }; rounds.push(record);
+            if (openDialogs().length) await dismissPicker();
+            const current = periodControl(); if (!current) { record.failureReason = "time period control not found"; return { confirmed: false, failure: "Klaviyo's Time period control was not found." }; }
+            // Klaviyo opens its picker only for a control on screen; scrolling is a temporary view change.
+            (current as HTMLElement).scrollIntoView?.({ block: "center", inline: "nearest", behavior: "auto" }); await nextFrame(); await nextFrame();
+            record.timePeriodControlText = visible(current).slice(0, 80);
+            (current as HTMLElement).click(); await nextFrame();
+            const open = await poll(dialog, dialogTimeoutMs);
+            if (!open) { record.failureReason = "dialog not found"; return { confirmed: false, failure: "Klaviyo's Time period dialog was not found." }; }
+            periodDiagnostics!.dialogFound = true; if (round === 1) periodDiagnostics!.dialogBefore = structure(open);
+            const section = () => periodEntry.timePeriodSection(open);
+            const before = section();
+            record.pickerMode = before.pickerText.slice(0, 40); record.hasComparisonPeriod = before.hasComparison;
+            const shownBefore = before.fields();
+            record.pickerStartValueBefore = shownBefore?.start.value ?? null; record.pickerEndValueBefore = shownBefore?.end.value ?? null;
+            // Switches the Time period picker (never the Comparison period's) to Custom; proven only by its own date fields.
+            const chooseCustomPreset = async () => {
+              const select = section().picker;
+              // The mode Klaviyo showed first; each round's own mode is in `rounds`.
+              if (!("timePeriodSelect" in periodDiagnostics!)) periodDiagnostics!.timePeriodSelect = select ? visible(select).slice(0, 40) : null;
+              if (select instanceof HTMLSelectElement) {
+                const option = Array.from(select.options).find((item) => /^custom\b/i.test(item.text.trim()));
+                if (option) { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, option.value); select.dispatchEvent(new Event("change", { bubbles: true })); periodDiagnostics!.customChosen = true; }
+              } else if (select) {
+                const existing = new Set(Array.from(document.querySelectorAll("*")));
+                (select as HTMLElement).click();
+                // Only an option that appeared for this picker, labelled exactly "Custom" (the page has other "Custom…" text).
+                const custom = await poll(() => Array.from(document.querySelectorAll("[role=option],[role=menuitem],[role=menuitemradio],li,button,[role=button]")).find((element) => !existing.has(element) && shown(element) && /^custom$/i.test(normalize(visible(element)))) as HTMLElement | undefined, 3_000);
+                periodDiagnostics!.customOptionFound = Boolean(custom);
+                if (custom) { custom.click(); periodDiagnostics!.customChosen = true; }
+              }
+              return Boolean(await poll(() => section().isCustom && section().fields(), 3_000));
+            };
+            // A preset ("Last 30 days", "Last 7 days", …) is never kept: Time period must be Custom, whatever fields are
+            // visible elsewhere in the dialog. Round 2 re-selects Custom even when the picker already says so.
+            if (!before.isCustom || !before.fields() || round > 1) record.customChosen = await chooseCustomPreset();
+            const fields = await poll(() => section().fields(), 3_000);
+            if (!fields) { periodDiagnostics!.dialogAfterCustom = structure(open); record.failureReason = "time period date fields not found"; return { confirmed: false, failure: "The requested report period could not be selected safely." }; }
+            // Type in the field's own displayed format ("Aug 01, 2026", "Aug 1, 2026", "08/01/2026", or ISO for date inputs).
+            const formatFor = (input: HTMLInputElement, iso: string) => {
+              const [year, month, day] = iso.split("-") as [string, string, string];
+              if (input.type === "date") return iso;
+              const shownValues = [input.value, ...Array.from(open.querySelectorAll("input")).map((field) => field.value)].filter((value) => /\d{4}/.test(value));
+              if (/\d{1,2}\/\d{1,2}\/\d{4}|mm\/dd/i.test(`${shownValues.join(" ")} ${input.placeholder}`)) return `${month}/${day}/${year}`;
+              const short = format(iso);
+              const padded = !shownValues.some((value) => /\b[a-z]{3}\.? \d, \d{4}/i.test(value)) && shownValues.some((value) => /\b[a-z]{3}\.? \d{2}, \d{4}/i.test(value));
+              return padded ? short.replace(/ (\d),/, " 0$1,") : short;
+            };
+            // Round 2 starts from the calendar-first helper path with fresh fields; the helper itself escalates strategies.
+            const entry = await periodEntry.enterDateRange({ fields: () => section().fields(), startDate: expected.startDate, endDate: expected.endDate, format: formatFor, reselectCustom: chooseCustomPreset });
+            // The first round's entry stays the headline diagnostic; every round keeps its own.
+            record.entry = entry;
+            if (round === 1) { periodDiagnostics!.entry = entry; periodDiagnostics!.pickerValuesEntered = entry.pickerValuesEntered; periodDiagnostics!.valuesAfterSet = entry.observed; }
+            record.interactionMethod = entry.strategy ?? (entry.attempts.length ? entry.attempts.map(({ strategy }) => strategy).join("+") : "none");
+            const after = section().fields();
+            record.pickerStartValueAfter = after?.start.value ?? null; record.pickerEndValueAfter = after?.end.value ?? null;
+            record.pickerModeAfterEntry = section().pickerText.slice(0, 40);
+            if (!entry.ok) { record.failureReason = "date fields did not accept the report dates"; return { confirmed: false, failure: `Klaviyo's date fields did not accept ${expected.startDate} – ${expected.endDate}; Apply was not clicked and nothing was captured.` }; }
+            if (!section().isCustom) { record.failureReason = "time period picker is not Custom"; return { confirmed: false, failure: "Klaviyo's Time period did not stay on Custom; Apply was not clicked and nothing was captured." }; }
+            const apply = await poll(() => Array.from(open.querySelectorAll("button, [role=button]")).find((element) => shown(element) && normalize(visible(element)) === "apply" && !(element as HTMLButtonElement).disabled && element.getAttribute("aria-disabled") !== "true"), 3_000);
+            periodDiagnostics!.dialogAtApply = structure(open);
+            periodDiagnostics!.applyFound = Boolean(apply); record.applyFound = Boolean(apply);
+            if (!apply) { record.failureReason = "apply not found"; return { confirmed: false, failure: "Klaviyo's Apply button was not found." }; }
+            (apply as HTMLElement).click(); periodDiagnostics!.applyClicked = true; record.applyClicked = true;
+            const closed = await waitForClose(open);
+            periodDiagnostics!.dialogClosed = closed; record.dialogClosed = closed;
+            // Klaviyo refetches after Apply; only its re-rendered, painted selected range proves the month.
+            // Round 1 stops waiting once Klaviyo has visibly kept its previous range for a while; round 2 then reacts.
+            const keptSince = Date.now(); const previous = JSON.stringify(selectedRange(String(record.renderedPeriodBefore ?? "")));
+            const settled = () => verifyDashboardPeriod() ? "confirmed" : round === 1 && Date.now() - keptSince >= Math.min(6_000, periodConfirmTimeoutMs) && JSON.stringify(selectedRange(regionText() ?? "")) === previous ? "kept" : null;
+            const confirmed = Boolean(closed && await poll(settled, periodConfirmTimeoutMs) === "confirmed");
+            record.renderedPeriodAfter = regionText(); periodDiagnostics!.regionAfter = record.renderedPeriodAfter; periodDiagnostics!.renderedPeriodAfter = record.renderedPeriodAfter;
+            if (!confirmed) record.failureReason = `page kept ${JSON.stringify(selectedRange(String(record.renderedPeriodAfter ?? "")))} after Apply`;
+            return { confirmed, failure: confirmed ? null : "Klaviyo did not show the selected report month after applying it." };
           };
-          if (!pickInputs()) {
-            // The Time period select (first picker in the dialog) must be switched to Custom to expose its fields.
-            const select = pickers(open)[0];
-            periodDiagnostics.timePeriodSelect = select ? visible(select).slice(0, 40) : null;
-            if (select instanceof HTMLSelectElement) {
-              const option = Array.from(select.options).find((item) => /^custom\b/i.test(item.text.trim()));
-              if (option) { Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, option.value); select.dispatchEvent(new Event("change", { bubbles: true })); periodDiagnostics.customChosen = true; }
-            } else if (select) {
-              (select as HTMLElement).click();
-              const custom = await poll(() => Array.from(document.querySelectorAll("[role=option],[role=menuitem],[role=menuitemradio],li,button,[role=button]")).find((element) => shown(element) && /^custom\b/i.test(normalize(visible(element)))) as HTMLElement | undefined, 3_000);
-              periodDiagnostics.customOptionFound = Boolean(custom);
-              if (custom) { custom.click(); periodDiagnostics.customChosen = true; }
-            }
-          }
-          const fields = await poll(pickInputs, 3_000);
-          if (!fields) { periodDiagnostics.dialogAfterCustom = structure(open); return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "The requested report period could not be selected safely."); }
-          // Type in the field's own displayed format ("Aug 01, 2026", "Aug 1, 2026", "08/01/2026", or ISO for date inputs).
-          const formatFor = (input: HTMLInputElement, iso: string) => {
-            const [year, month, day] = iso.split("-") as [string, string, string];
-            if (input.type === "date") return iso;
-            // Klaviyo may clear a field when Custom is chosen; any field in the picker shows its display format.
-            const shownValues = [input.value, ...Array.from(open.querySelectorAll("input")).map((field) => field.value)].filter((value) => /\d{4}/.test(value));
-            if (/\d{1,2}\/\d{1,2}\/\d{4}|mm\/dd/i.test(`${shownValues.join(" ")} ${input.placeholder}`)) return `${month}/${day}/${year}`;
-            const short = format(iso);
-            // "Aug 1, 2026" anywhere means unpadded days; otherwise "Mmm dd, yyyy" values mean Klaviyo pads them ("Aug 01, 2026").
-            const padded = !shownValues.some((value) => /\b[a-z]{3}\.? \d, \d{4}/i.test(value)) && shownValues.some((value) => /\b[a-z]{3}\.? \d{2}, \d{4}/i.test(value));
-            return padded ? short.replace(/ (\d),/, " 0$1,") : short;
-          };
-          // React tracks the native value setter; focus, set, then fire the events its inputs commit on.
-          const commit = (input: HTMLInputElement, value: string) => {
-            input.focus(); setValue(input, value);
-            input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", bubbles: true }));
-            input.dispatchEvent(new FocusEvent("blur")); input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
-          };
-          commit(fields.start, formatFor(fields.start, expected.startDate)); await nextFrame();
-          commit(fields.end, formatFor(fields.end, expected.endDate)); await nextFrame();
-          periodDiagnostics.valuesAfterSet = [fields.start.value, fields.end.value];
-          const apply = await poll(() => Array.from(open.querySelectorAll("button, [role=button]")).find((element) => shown(element) && normalize(visible(element)) === "apply" && !(element as HTMLButtonElement).disabled && element.getAttribute("aria-disabled") !== "true"), 3_000);
-          periodDiagnostics.dialogAtApply = structure(open);
-          periodDiagnostics.applyFound = Boolean(apply);
-          if (!apply) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "Klaviyo's Apply button was not found.");
-          (apply as HTMLElement).click(); periodDiagnostics.applyClicked = true;
-          const closed = await waitForClose(open);
-          periodDiagnostics.dialogClosed = closed;
-          // Klaviyo refetches after Apply; only its re-rendered, painted Time period region proves the month.
-          const confirmed = closed && await poll(verifyDashboardPeriod, periodConfirmTimeoutMs);
-          periodDiagnostics.regionAfter = regionText();
-          if (!confirmed) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "Klaviyo did not show the selected report month after applying it.");
+          let result = await setReportPeriod(1);
+          // React to what round 1 actually did. Only when Apply was clicked and Klaviyo still shows the range it showed
+          // before (it ignored or restored it, e.g. back to Last 30 days) is a second, different pass worth it: Custom is
+          // re-selected and the dates entered again. Any other outcome is reported as it is.
+          const before = JSON.stringify(selectedRange(String(rounds[0]?.renderedPeriodBefore ?? "")));
+          const kept = JSON.stringify(selectedRange(String(rounds[0]?.renderedPeriodAfter ?? "")));
+          if (!result.confirmed && rounds[0]?.applyClicked && before === kept) { rounds[0]!.retryReason = "Klaviyo kept or restored the previous range after Apply"; result = await setReportPeriod(2); }
+          if (!result.confirmed) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", result.failure ?? "Klaviyo did not show the selected report month.");
           control = periodControl(); if (!control || !hasExpectedPeriod(findDashboardPeriodRegion(control))) return failClosed("REPORT_PERIOD_NOT_CONFIRMED", "Klaviyo did not confirm the selected report month.");
         }
         // Nothing may cover the page when it is captured: a left-open picker would hide the card.
@@ -363,6 +399,44 @@ export async function prepareDashboardCaptureDocument(
             candidate = candidate.parentElement;
           }
           return null;
+        };
+        /**
+         * Business performance summary values beside their own labels: a label's nearest container holding exactly one
+         * money value and no other summary label. Percentages and compact values are never money.
+         */
+        const readBusinessPerformance = (card: Element): { evidence: BusinessPerformanceEvidence | null; issues: string[]; readout: Record<string, { labels: string[]; values: string[] }> } => {
+          const LABELS: Array<[string, RegExp]> = [["totalRevenue", /^total revenue$/i], ["totalAttributedRevenue", /^attributed revenue(?: \(.*\))?$/i], ["campaignRevenue", /^campaigns$/i], ["flowRevenue", /^flows$/i], ["emailAttributedRevenue", /^email$/i], ["smsAttributedRevenue", /^(?:text message|sms)$/i], ["perRecipient", /^per recipient$/i], ["push", /^push$/i], ["whatsapp", /^whatsapp$/i]];
+          const MONEY = /^[-\u2212]?\s*[^\d\s.,%-]{1,4}\s?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[-\u2212]?\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?\s?[^\d\s.,%-]{1,4}$/;
+          const textOf = (element: Element) => (element.textContent ?? "").replace(/\s+/g, " ").trim();
+          const labelKey = (element: Element) => LABELS.find(([, pattern]) => pattern.test(textOf(element)))?.[0] ?? null;
+          const all = Array.from(card.querySelectorAll("*"));
+          // The deepest element whose whole text is the label or the money value, even when Klaviyo splits that text
+          // across child elements ("Attributed revenue <span>(20.83% of total)</span>").
+          const labelled = all.filter((element) => labelKey(element) !== null && !Array.from(element.children).some((child) => labelKey(child) !== null));
+          const leaves = all.filter((element) => MONEY.test(textOf(element)) && !Array.from(element.children).some((child) => MONEY.test(textOf(child))));
+          const valueBeside = (label: Element) => {
+            for (let node: Element | null = label.parentElement, depth = 0; node && node !== card && depth < 4; node = node.parentElement, depth += 1) {
+              if (labelled.filter((other) => node!.contains(other)).length > 1) return null;
+              const monies = leaves.filter((leaf) => node!.contains(leaf) && MONEY.test(textOf(leaf)));
+              if (monies.length === 1) return textOf(monies[0]!);
+              if (monies.length > 1) return null;
+            }
+            return null;
+          };
+          const readout: Record<string, { labels: string[]; values: string[] }> = {};
+          const read = (key: string) => {
+            const labels = labelled.filter((leaf) => labelKey(leaf) === key);
+            const values = [...new Set(labels.map(valueBeside).filter((value): value is string => value !== null))];
+            readout[key] = { labels: labels.map((label) => textOf(label).slice(0, 60)), values: values.slice(0, 4) };
+            return values.length === 1 ? values[0]! : null;
+          };
+          const periodText = (paintedText(card).match(/[A-Z][a-z]{2,8}\.? \d{1,2}, \d{4}\s*[-–—]\s*[A-Z][a-z]{2,8}\.? \d{1,2}, \d{4}/) ?? [""])[0];
+          const values = { totalRevenue: read("totalRevenue"), totalAttributedRevenue: read("totalAttributedRevenue"), emailAttributedRevenue: read("emailAttributedRevenue"), smsAttributedRevenue: read("smsAttributedRevenue"), campaignRevenue: read("campaignRevenue"), flowRevenue: read("flowRevenue") };
+          const names: Record<string, string> = { totalRevenue: "Total Revenue", emailAttributedRevenue: "Email Attributed Revenue", campaignRevenue: "Revenue from Campaigns", flowRevenue: "Revenue from Flows" };
+          const issues = Object.keys(names).filter((key) => values[key as keyof typeof values] === null).map((key) => `${names[key]} was not found beside its label on the Business performance summary.`);
+          if (!periodText) issues.push("The Business performance summary did not show its period beside the values.");
+          if (issues.length) return { evidence: null, issues, readout };
+          return { readout, evidence: { totalRevenue: values.totalRevenue!, totalAttributedRevenue: values.totalAttributedRevenue, emailAttributedRevenue: values.emailAttributedRevenue!, smsAttributedRevenue: values.smsAttributedRevenue, campaignRevenue: values.campaignRevenue!, flowRevenue: values.flowRevenue!, visiblePeriodText: periodText }, issues: [] };
         };
         const findDashboardCard = () => { const found = structuralCard(); return found && hasExpectedPeriod(paintedText(found.card)) ? found : null; };
         const hasMeaningfulBounds = (card: { width: number; height: number }, heading: DOMRect) =>
@@ -507,14 +581,41 @@ export async function prepareDashboardCaptureDocument(
           : fail("TOP_FLOW_ROWS_NOT_FOUND", "The Top performing flows table header or visible flow rows were not found.");
         const initial = measureTarget(resolved);
         if (typeof initial === "string") return measurementFailure(initial);
-        let previous = initial.rect; let stable = 0;
-        for (let attempt = 0; attempt < 8; attempt += 1) {
+        // Klaviyo keeps re-laying out Overview after the one-off scroll above (cards above finish loading and grow), so
+        // the target is re-measured on every pass and, when it has left the visible area (viewport ∩ clipping
+        // ancestors), moved back by scrolling its real scroll container — never to a fixed coordinate. The old loop
+        // only waited, so a target pushed below the fold failed TARGET_NOT_VISIBLE until a lucky retry (run 67311d57).
+        const scrollerOf = (element: Element): HTMLElement => {
+          for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) if (/^(?:auto|scroll|overlay)$/.test(getComputedStyle(node).overflowY)) return node;
+          return (document.scrollingElement ?? document.documentElement) as HTMLElement;
+        };
+        const visibleAreaOf = (element: Element) => {
+          const bounds = { top: 0, left: 0, right: window.innerWidth, bottom: window.innerHeight };
+          for (let node = element.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (/^(?:visible)?$/.test(style.overflowY) && /^(?:visible)?$/.test(style.overflowX)) continue;
+            const box = node.getBoundingClientRect(); if (box.width <= 0 || box.height <= 0) continue;
+            bounds.top = Math.max(bounds.top, box.top); bounds.left = Math.max(bounds.left, box.left); bounds.right = Math.min(bounds.right, box.right); bounds.bottom = Math.min(bounds.bottom, box.bottom);
+          }
+          return bounds;
+        };
+        const placeInVisibleArea = async (card: Element, rect: { top: number; bottom: number; height: number }) => {
+          const area = visibleAreaOf(card); const margin = 8; const fits = rect.height <= area.bottom - area.top - 2 * margin;
+          const delta = rect.top < area.top + 1 || !fits ? rect.top - (area.top + margin) : rect.bottom > area.bottom - 1 ? rect.bottom - (area.bottom - margin) : 0;
+          const scroller = scrollerOf(card); const before = scroller.scrollTop;
+          if (Math.abs(delta) >= 1) scroller.scrollTop = before + Math.round(delta);
+          positioning.push({ scroller: scroller === document.scrollingElement || scroller === document.documentElement ? "document" : `${scroller.tagName.toLowerCase()}${scroller.id ? `#${scroller.id}` : ""}`, scrollTopBefore: Math.round(before), scrollTopAfter: Math.round(scroller.scrollTop), delta: Math.round(delta), fits,
+            target: { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) }, visibleArea: { top: Math.round(area.top), bottom: Math.round(area.bottom) }, viewport: { width: window.innerWidth, height: window.innerHeight } });
+          if (scroller.scrollTop !== before) { await nextFrame(); await pause(200); }
+        };
+        let previous = initial.rect; let stable = 0; let placements = 0;
+        for (let attempt = 0; attempt < 14; attempt += 1) {
           await nextFrame(); resolved = findDashboardCard();
           if (!resolved) return fail(target.missingCode, `The ${target.heading} card was replaced without its required semantic evidence.`);
           const measurement = measureTarget(resolved);
           if (typeof measurement === "string") return measurementFailure(measurement);
           const rect = measurement.rect; const headingRect = resolved.heading.getBoundingClientRect(); const fullyVisible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
-          if (!fullyVisible) { previous = rect; continue; }
+          if (!fullyVisible) { previous = rect; stable = 0; if (placements < 6) { placements += 1; await placeInVisibleArea(resolved.card, rect); } else await pause(200); continue; }
           if (rect.x === previous.x && rect.y === previous.y && rect.width === previous.width && rect.height === previous.height) stable += 1; else stable = 0;
           previous = rect;
           if (stable >= 1) {
@@ -522,7 +623,9 @@ export async function prepareDashboardCaptureDocument(
             const visibleControls = Array.from(resolved.card.querySelectorAll("button,[role=tab],[role=button],[aria-selected],[aria-pressed],[data-state],[data-active]")).filter((element) => { const style = getComputedStyle(element); const controlRect = element.getBoundingClientRect(); return !element.closest("[hidden],[aria-hidden=true]") && style.display !== "none" && style.visibility !== "hidden" && controlRect.width > 0 && controlRect.height > 0; }).slice(0, 40).map((element) => ({ text: visible(element).slice(0, 180), tag: element.tagName.toLowerCase(), role: element.getAttribute("role"), ariaSelected: element.getAttribute("aria-selected"), ariaPressed: element.getAttribute("aria-pressed"), visible: true }));
             stageTimingsMs.contentReadyMs = Math.max(0, Math.round(performance.now() - contentReadyStartedAt));
             stageTimingsMs.totalMs = Math.max(0, Math.round(performance.now() - operationStartedAt));
-            return { ok: true, sourceUrl: window.location.href, targetRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls, stageTimingsMs: { ...stageTimingsMs }, layoutEvidence: layoutEvidence(resolved.card, resolved.heading), ...(measurement.availableRowCount === undefined ? {} : { availableRowCount: measurement.availableRowCount, includedRowCount: measurement.includedRowCount }) }, observedPeriod: { startDate: expected.startDate, endDate: expected.endDate } };
+            // Report cover values: DOM text of this verified card only (never OCR, never another card or period).
+            const performance_ = target.screenshotType === "overview" ? readBusinessPerformance(resolved.card) : null;
+            return { ...(performance_ ? { businessPerformance: performance_.evidence, businessPerformanceIssues: performance_.issues, businessPerformanceReadout: performance_.readout } : {}), ok: true, sourceUrl: window.location.href, targetRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls, stageTimingsMs: { ...stageTimingsMs }, layoutEvidence: layoutEvidence(resolved.card, resolved.heading), ...(measurement.availableRowCount === undefined ? {} : { availableRowCount: measurement.availableRowCount, includedRowCount: measurement.includedRowCount }) }, observedPeriod: { startDate: expected.startDate, endDate: expected.endDate } };
           }
         }
         const finalRect = previous;

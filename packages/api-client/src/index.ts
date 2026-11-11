@@ -1,6 +1,6 @@
 import {
   automaticCaptureTypesForSections, matchesReportCaptureSpec, reportDraftSchema, screenshotSourceProofSchema, reportGenerationResultSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, screenshotUploadAcknowledgementSchema, type ReportDraft, type ReportGenerationResult, type ReportLifecycleEvent, type ReportPdfArtifact, type ScreenshotUploadAcknowledgement,
-  clientReportTargetsInputSchema, clientReportTargetsSchema, reportReadinessSchema, type ClientReportTargets, type ClientReportTargetsInput, type ReportLifecycleEventType, type ReportReadiness, type ScreenshotType, type ScreenshotSourceProof, type SectionConfiguration,
+  clientReportTargetsInputSchema, clientReportTargetsSchema, clientSetupSummarySchema, reportReadinessSchema, type ClientReportTargets, type ClientSetupSummary, type ClientReportTargetsInput, type ReportLifecycleEventType, type ReportMonth, type ReportReadiness, type ScreenshotType, type ScreenshotSourceProof, type SectionConfiguration,
 } from "@tention/report-schema";
 import { z } from "zod";
 
@@ -16,7 +16,8 @@ export interface DevelopmentReviewPdfStatus {
 }
 export type ReportMutationEvent = Exclude<ReportLifecycleEventType, "REPORT_CREATED">;
 export interface CreateReportDraftRequest {
-  client: { id: string; name: string; timezone: string };
+  /** A set-up client is identified by id alone; the API freezes its saved configuration onto the report. */
+  client: { id: string; name?: string; timezone?: string };
   reportMonth: { year: number; month: number };
   sections: Record<string, "required" | "optional" | "disabled">;
 }
@@ -79,10 +80,28 @@ export function createApiClient(options: ApiClientOptions) {
       return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}`));
     },
     /** Local development: explicitly adds Section 10 (Subscriber Growth) to an existing draft. */
+    /** Applies the client's saved, verified profile currency to this report; only its currency may change. */
+    async applyClientProfileCurrency(id: string, before: ReportDraft): Promise<ReportDraft> {
+      const report = reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/client-currency`, jsonRequest("POST", { expectedVersion: before.version })));
+      const sameEvidence = JSON.stringify(report.screenshots) === JSON.stringify(before.screenshots) && JSON.stringify(report.reportMonth) === JSON.stringify(before.reportMonth) && report.status === before.status;
+      if (report.id !== id || !report.client.currency || !sameEvidence) throw new ApiError("CLIENT_CURRENCY_ACK_MISMATCH", "The backend did not confirm a currency-only update of this report.", 200);
+      return report;
+    },
     async enableSubscriberGrowthSection(id: string, expectedVersion: number): Promise<ReportDraft> {
       const report = reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/dev/report-drafts/${encodeURIComponent(id)}/sections/email_subscriber_growth/enable`, jsonRequest("POST", { expectedVersion })));
       if (report.id !== id || report.sections.email_subscriber_growth !== "required") throw new ApiError("SUBSCRIBER_GROWTH_ENABLE_ACK_MISMATCH", "The backend did not confirm Section 10 on this report.", 200);
       return report;
+    },
+    /** Every client with its server-computed setup status (READY / INCOMPLETE / ERROR) and exact missing items. */
+    async listClientSetups(): Promise<ClientSetupSummary[]> {
+      return z.array(clientSetupSummarySchema).parse(await requestJson(request, `${baseUrl}/api/v1/client-setups`)) as ClientSetupSummary[];
+    },
+    async getClientSetup(clientId: string): Promise<ClientSetupSummary> {
+      return clientSetupSummarySchema.parse(await requestJson(request, `${baseUrl}/api/v1/clients/${encodeURIComponent(clientId)}/setup`)) as ClientSetupSummary;
+    },
+    /** Onboarding step 1: one permanent client profile from its name. */
+    async createClient(name: string): Promise<ClientSetupSummary> {
+      return clientSetupSummarySchema.parse(await requestJson(request, `${baseUrl}/api/v1/clients`, jsonRequest("POST", { name }))) as ClientSetupSummary;
     },
     /** Clients with a saved one-time profile (name, timezone, account, sources). */
     async listClientConfigurations(): Promise<ClientReportTargets[]> {
@@ -100,6 +119,13 @@ export function createApiClient(options: ApiClientOptions) {
     },
     async deleteReportDraft(id: string, expectedVersion: number): Promise<void> {
       await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}`, jsonRequest("DELETE", { expectedVersion }));
+    },
+    /** Deletes one monthly report of this client (never the client, its setup, or another month). Drive files are never deleted. */
+    async deleteClientReport(clientId: string, reportId: string): Promise<{ reportId: string; driveFilesRetained: number }> {
+      const body = await requestJson(request, `${baseUrl}/api/v1/clients/${encodeURIComponent(clientId)}/reports/${encodeURIComponent(reportId)}`, { method: "DELETE" });
+      const parsed = z.object({ deleted: z.literal(true), reportId: z.string(), clientId: z.string(), driveFilesDeleted: z.literal(false), driveFilesRetained: z.number().int().min(0) }).safeParse(body);
+      if (!parsed.success || parsed.data.reportId !== reportId || parsed.data.clientId !== clientId) throw new ApiError("REPORT_DELETE_ACK_MISMATCH", "The backend did not confirm deletion of this report.", 200, body);
+      return { reportId: parsed.data.reportId, driveFilesRetained: parsed.data.driveFilesRetained };
     },
     async listReportDrafts(filters: ReportDraftFilters = {}): Promise<ReportDraft[]> {
       const query = new URLSearchParams();
@@ -215,7 +241,7 @@ export function createApiClient(options: ApiClientOptions) {
     async getLocalAutomaticCaptureRun(runId: string): Promise<unknown> {
       return await requestJson(request, `${baseUrl}/api/v1/dev/automatic-capture-runs/${encodeURIComponent(runId)}`);
     },
-    async importLocalAutomaticCaptureRun(runId: string, report: Pick<ReportDraft, "id" | "client" | "reportMonth" | "sections">, importedTypes?: readonly ScreenshotType[]): Promise<ReportDraft> {
+    async importLocalAutomaticCaptureRun(runId: string, report: Pick<ReportDraft, "id" | "client" | "reportMonth" | "sections"> & { screenshots?: ReportDraft["screenshots"] }, importedTypes?: readonly ScreenshotType[]): Promise<ReportDraft> {
       const raw = asRecord(await requestJson(request, `${baseUrl}/api/v1/dev/automatic-capture-runs/${encodeURIComponent(runId)}/import`, jsonRequest("POST", {})));
       const captures = z.array(z.object({ type: z.string(), screenshotRecordId: z.string().uuid(), sha256: z.string().regex(/^[a-f0-9]{64}$/), reviewStatus: z.enum(["approved", "pending_review"]), captureOrigin: z.literal("live_acceptance_import") })).parse(raw.captures);
       // The nine core sections, plus Section 10 only when this report includes it.
@@ -230,6 +256,14 @@ export function createApiClient(options: ApiClientOptions) {
         const persisted = canonical.screenshots.find((item) => item.type === capture.type);
         if (!expected.has(capture.type) || !persisted || persisted.id !== capture.screenshotRecordId || persisted.sha256 !== capture.sha256 || persisted.captureOrigin !== "live_acceptance_import" || persisted.approved !== (capture.reviewStatus === "approved")) throw new ApiError("AUTOMATIC_RUN_IMPORT_RELOAD_MISMATCH", "The canonical report reload did not contain the imported capture acknowledgement.", 200);
         expected.delete(capture.type);
+      }
+      // A resume (e.g. a single-section retake) must leave every section it did not plan exactly as it was: same
+      // record, same bytes, same review state. Only the planned sections may change.
+      if (importedTypes && report.screenshots) {
+        for (const type of automaticTypes.filter((item) => !importedTypes.includes(item))) {
+          const before = report.screenshots.find((item) => item.type === type); const after = canonical.screenshots.find((item) => item.type === type);
+          if (before && (!after || after.id !== before.id || after.sha256 !== before.sha256 || after.approved !== before.approved || after.storageKey !== before.storageKey)) throw new ApiError("AUTOMATIC_RUN_IMPORT_RELOAD_MISMATCH", `The ${type} capture changed although this run did not retake it.`, 200);
+        }
       }
       // Review counts cover every automatic capture on the reloaded report (a resume imports only some of them).
       const automaticRecords = canonical.screenshots.filter((item) => automaticTypes.includes(item.type));
@@ -261,11 +295,35 @@ export function createApiClient(options: ApiClientOptions) {
     async applyEvent(id: string, event: ReportMutationEvent, expectedVersion: number): Promise<ReportDraft> {
       return reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/events`, jsonRequest("POST", { expectedVersion, event })));
     },
-    async generatePdf(id: string, expectedVersion: number): Promise<ReportGenerationResult> {
-      return reportGenerationResultSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/generate`, jsonRequest("POST", { expectedVersion })));
+    /** The month the user is looking at travels with the request; the backend refuses a mismatch (REPORT_MONTH_MISMATCH). */
+    async generatePdf(id: string, expectedVersion: number, expectedReportMonth?: ReportMonth): Promise<ReportGenerationResult> {
+      return reportGenerationResultSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/generate`, jsonRequest("POST", expectedReportMonth ? { expectedVersion, expectedReportMonth } : { expectedVersion })));
+    },
+    /**
+     * Automatic capture → final report with no human approval: the backend re-verifies every automatic capture's stored
+     * bytes, records machine validation (never an approval), then generates the PDF, Drive PDF and Google Doc. Returns
+     * the existing artifact when the same captures were already generated.
+     */
+    async autoGenerateFinalReport(id: string, expectedVersion: number, expectedReportMonth: ReportMonth): Promise<ReportGenerationResult> {
+      return reportGenerationResultSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/auto-generate`, jsonRequest("POST", { expectedVersion, expectedReportMonth })));
     },
     async getCurrentPdfArtifact(id: string): Promise<ReportPdfArtifact> {
       return reportPdfArtifactSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${id}/pdf-artifact`));
+    },
+    /** Retries only the Drive copy of the already-generated canonical PDF; nothing is re-rendered or recaptured. */
+    async retryDriveDelivery(id: string): Promise<ReportPdfArtifact> {
+      return reportPdfArtifactSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/pdf-artifact/drive-delivery`, jsonRequest("POST", {})));
+    },
+    /** Retries only the editable Google Doc for the current canonical PDF; the PDF and Drive PDF are untouched. */
+    async retryGoogleDoc(id: string): Promise<ReportPdfArtifact> {
+      return reportPdfArtifactSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/pdf-artifact/google-doc`, jsonRequest("POST", {})));
+    },
+    /**
+     * Explicitly adopts the existing same-named Doc Tention found in the month folder (only that exact Doc): the backend
+     * re-verifies it, writes this report into it and marks it as Tention's. The PDF is never re-rendered.
+     */
+    async adoptGoogleDoc(id: string, docId: string): Promise<ReportPdfArtifact> {
+      return reportPdfArtifactSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/pdf-artifact/google-doc/adopt`, jsonRequest("POST", { docId })));
     },
     async generateDevelopmentReviewPdf(id: string, expectedReportVersion?: number): Promise<DevelopmentReviewPdfStatus> {
       const data = await requestJson(request, `${baseUrl}/api/v1/dev/report-drafts/${encodeURIComponent(id)}/partial-review`, jsonRequest("POST", {}));

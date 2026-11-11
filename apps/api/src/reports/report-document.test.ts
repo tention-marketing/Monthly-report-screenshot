@@ -51,15 +51,20 @@ describe("REPORT_LAYOUT_V1", () => {
 
 describe("ReportDocumentModel", () => {
   it.each([
-    [{ year: 2026, month: 8 }, "Performance Report - August 1 - August 31, 2026", "Jul 1, 2026 - Jul 31, 2026"],
-    [{ year: 2026, month: 7 }, "Performance Report - July 1 - July 31, 2026", "Jun 1, 2026 - Jun 30, 2026"],
-    [{ year: 2025, month: 9 }, "Performance Report - September 1 - September 30, 2025", "Aug 1, 2025 - Aug 31, 2025"],
-    [{ year: 2024, month: 2 }, "Performance Report - February 1 - February 29, 2024", "Jan 1, 2024 - Jan 31, 2024"],
-  ])("renders the exact period title for %j without comparison copy", async (month, title, previousPeriod) => {
+    [{ year: 2025, month: 9 }, "Reporting Period: September 2025", "Aug 1, 2025 - Aug 31, 2025"],
+    [{ year: 2025, month: 10 }, "Reporting Period: October 2025", "Sep 1, 2025 - Sep 30, 2025"],
+    [{ year: 2025, month: 11 }, "Reporting Period: November 2025", "Oct 1, 2025 - Oct 31, 2025"],
+    [{ year: 2026, month: 8 }, "Reporting Period: August 2026", "Jul 1, 2026 - Jul 31, 2026"],
+    [{ year: 2024, month: 2 }, "Reporting Period: February 2024", "Jan 1, 2024 - Jan 31, 2024"],
+  ])("renders only the report month as the client-facing period for %j, with no comparison copy", async (month, title, previousPeriod) => {
     const { report, storage } = await fixture(["overview"], "AutoLEDTech.com", { executive_summary: "required" }, month);
-    const html = renderReportHtml(await buildReportDocumentModel(report, storage, now));
+    const model = await buildReportDocumentModel(report, storage, now);
+    // The previous calendar month stays in the model (and in Month Comparison's proof); it is only not displayed.
+    expect(model.previousComparisonPeriodLabel).toBe(previousPeriod);
+    const html = renderReportHtml(model);
     const header = html.match(/<header>(.*?)<\/header>/s)?.[1] ?? "";
-    expect(header).toContain(`<h1>${title}</h1>`);
+    expect(header).toContain(`<h1>Performance Report</h1><p class="reporting-period">${title}</p>`);
+    expect(header).not.toMatch(/ - [A-Z][a-z]+ \d|\d{1,2}, \d{4}/); // no day-level date range
     expect(header).toContain("AutoLEDTech.com");
     expect(header).not.toContain("REPORTING PERIOD");
     expect(header).not.toContain("COMPARED WITH");

@@ -79,6 +79,10 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 .actions button.primary:disabled { color: #fff; background: #1e6148; }
 .danger { padding: 8px 10px; border: 1px solid #c53a32; border-radius: 8px; color: #a62b21; background: #fff; font-weight: 800; }
 .danger:disabled { color: #a62b21; background: #fff; }
+.actions button.danger-solid { border-color: #a62b21; color: #fff; background: #a62b21; }
+.actions button.danger-solid:disabled { opacity: 0.6; }
+.delete-confirmation { margin-top: 12px; }
+.delete-confirmation .actions { justify-content: end; }
 .capture-workflow { padding-bottom: 24px; }
 .progress-copy { margin: 14px 0; color: #315d4d; font-size: 13px; font-weight: 800; }
 .runner-checklist .current-step { margin: 0 -8px; padding: 11px 8px; border-radius: 9px; background: #edf7f1; }
@@ -115,3 +119,17 @@ legend { padding: 0 5px; font-size: 13px; font-weight: 800; }
 details { margin: 8px 0 12px; color: #68706c; font-size: 12px; }
 details p { margin: 7px 0; }
 @media (max-width: 400px) { body { min-width: 320px; } .period-preview { grid-template-columns: 1fr; } .checklist li { grid-template-columns: 25px 1fr; } .checklist button { grid-column: 2; justify-self: start; } .checklist .recapture-row-button { grid-column: 1 / -1; grid-template-columns: 25px minmax(0, 1fr) auto; } .recent-list li { grid-template-columns: 1fr; } .recent-actions { justify-content: start; } }
+/* Clients (onboarding) */
+.client-list { display: grid; gap: 8px; margin: 0 0 14px; padding: 0; list-style: none; }
+.client-row { display: flex; width: 100%; justify-content: space-between; gap: 10px; align-items: center; padding: 12px; border: 1px solid #deddd7; border-radius: 10px; color: inherit; background: #fff; text-align: left; }
+.client-row:hover { border-color: #9ba6a0; background: #f8faf8; }
+.setup-status { padding: 4px 8px; border-radius: 999px; font-size: 10px; font-weight: 800; letter-spacing: .06em; white-space: nowrap; }
+.setup-status.ready { color: #17633f; background: #e5f4ea; }
+.setup-status.incomplete { color: #835b0c; background: #fff0c7; }
+.setup-status.verifying { color: #2c5a85; background: #e6f0fa; }
+.setup-status.error { color: #8f2119; background: #fde8e5; }
+.setup-status-line { display: flex; justify-content: space-between; align-items: center; margin: 12px 0 0; font-weight: 800; }
+.client-facts { grid-template-columns: 1fr 1fr; margin: 12px 0; }
+.notice ul { margin: 0 0 6px; padding-left: 18px; }
+.method-divider { margin: 10px 0; color: #68706c; font-size: 11px; font-weight: 800; text-align: center; letter-spacing: .1em; }
+.metric-confirmation { margin: 12px 0 0; border: 1px solid #b9dbc9; background: #f5fbf7; }

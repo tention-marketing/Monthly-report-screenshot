@@ -8,6 +8,7 @@ import { localDevelopmentRoutes } from "./routes/local-development.js";
 import { InMemoryScreenshotStorage, MAX_SCREENSHOT_BYTE_SIZE, type ScreenshotStorage } from "./storage/screenshot-storage.js";
 import { InMemoryPdfArtifactStorage, type PdfArtifactStorage } from "./storage/pdf-artifact-storage.js";
 import { PlaywrightPdfRenderer, type PdfRenderer } from "./reports/pdf-renderer.js";
+import type { PdfDriveDelivery, ReportGoogleDocSync } from "./delivery/google-drive-delivery.js";
 
 export interface AppOptions {
   logger?: boolean;
@@ -18,9 +19,18 @@ export interface AppOptions {
   screenshotStorage?: ScreenshotStorage;
   pdfArtifactStorage?: PdfArtifactStorage;
   pdfRenderer?: PdfRenderer;
+  /** Optional Google Drive archive copy of each generated PDF; absent means Drive delivery is not configured. */
+  pdfDriveDelivery?: PdfDriveDelivery | null;
+  /** Optional editable Google Doc copy of each generated report; absent means it is not configured. */
+  googleDocSync?: ReportGoogleDocSync | null;
   enableLocalDevelopmentImports?: boolean;
   localImportRequiresPersistentStorage?: boolean;
   repositoryRoot?: string;
+  /**
+   * Reports, final PDFs, Drive and Doc delivery require a READY client setup. Defaults to true; only test fixtures that
+   * exercise pre-onboarding report behaviour pass false.
+   */
+  requireClientSetupReady?: boolean;
 }
 
 export function buildApp(options: AppOptions = {}) {
@@ -56,7 +66,10 @@ export function buildApp(options: AppOptions = {}) {
     screenshotStorage,
     pdfArtifactStorage,
     pdfRenderer,
+    pdfDriveDelivery: options.pdfDriveDelivery ?? null,
+    googleDocSync: options.googleDocSync ?? null,
     now: options.now ?? (() => new Date()),
+    requireClientSetupReady: options.requireClientSetupReady ?? true,
   });
   app.register(clientReportTargetRoutes, {
     prefix: "/api/v1",

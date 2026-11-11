@@ -45,6 +45,11 @@ const BY_CODE: Record<string, FailureCategory> = {
   SUBSCRIBER_GROWTH_METRIC_NOT_EXACT: "CARD_NOT_READY", SUBSCRIBER_GROWTH_NOT_STABLE: "LAYOUT_UNSTABLE", SUBSCRIBER_GROWTH_ROUTE_CHANGED: "PAGE_NOT_READY", SUBSCRIBER_GROWTH_SOURCE_SETUP_BUSY: "PAGE_NOT_READY",
   // Views the extension selects itself are retryable; only a wrong page or account cannot be fixed by retrying.
   SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_FOUND: "VIEW_NOT_SELECTED", SUBSCRIBER_GROWTH_VIEW_NOT_FOUND: "VIEW_NOT_SELECTED", SUBSCRIBER_GROWTH_SOURCE_WRONG_PAGE: "CONFIGURATION",
+  // A capture taken narrower than the safe width is retried after the viewport is normalized again; only a window
+  // too narrow even at the lowest zoom cannot be fixed by retrying.
+  KLAVIYO_VIEWPORT_TOO_NARROW: "LAYOUT_UNSTABLE", KLAVIYO_VIEWPORT_UNAVAILABLE: "PAGE_NOT_READY", KLAVIYO_VIEWPORT_CANNOT_BE_NORMALIZED: "CONFIGURATION",
+  // The cover values render with the card; a late or partial render is retried like any card that is not ready.
+  EXECUTIVE_SUMMARY_METRICS_UNVERIFIED: "CARD_NOT_READY",
   AUTOMATIC_PERIOD_PROOF_MISMATCH: "PERIOD_NOT_CONFIRMED", TOP_CAMPAIGNS_NO_DATA: "NO_DATA", TOP_FLOWS_NO_DATA: "NO_DATA",
 };
 
@@ -90,6 +95,14 @@ export interface KnownFailure {
   matches(code: string, message: string): boolean;
 }
 export const KNOWN_FAILURES: readonly KnownFailure[] = [
+  {
+    id: "BUSINESS_REVIEW_TITLE_CLIPPED", discovered: "2026-11-03 (September Campaign/Flow Metrics live run, accepted as PASS before the fix)", category: "TARGET_OBSCURED",
+    subsystem: "Business Review capture adapter (scroll + crop)",
+    rootCause: "Clearing the last Metrics row of the Composer bar scrolled the card until its top met viewport 0, but Klaviyo's dashboard scrolls inside a container below a non-scrolling page header, so the card title went under the header and the crop showed 'Dashboards / Business review' instead.",
+    recovery: "Scrolling is bounded by the card's clip region (viewport ∩ overflow-clipping ancestors); a card scrolled under the header is scrolled back; otherwise the overlay is hidden. A crop whose own card title is not visible fails with BUSINESS_REVIEW_TARGET_OCCLUDED and is retried with extended-readiness.",
+    regressionTest: "never scrolls its title under a non-scrolling page header; it hides the Composer instead",
+    matches: (code, message) => code === "BUSINESS_REVIEW_TARGET_OCCLUDED" && /title is not visible/i.test(message),
+  },
   {
     id: "SESSION_STORAGE_QUOTA", discovered: "2026-10-28 (June b4732590/b149eee7, September 07809233); recurred 2026-10-29 at the Subscriber Growth toolbar click", category: "CAPTURE_STATE_STORAGE_FULL",
     subsystem: "capture state store + every chrome.storage.session writer",

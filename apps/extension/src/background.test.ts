@@ -45,12 +45,32 @@ describe("Tention toolbar activeTab setup", () => {
     const remove = vi.fn().mockResolvedValue(undefined);
     registerBackgroundAutomation({
       action: { onClicked: { addListener: actionListener } },
-      storage: { session: { get: vi.fn(), set: vi.fn(), remove } },
+      storage: { session: { get: vi.fn().mockResolvedValue({}), set: vi.fn().mockResolvedValue(undefined), remove } },
       sidePanel: { open: vi.fn().mockResolvedValue(undefined), setPanelBehavior: vi.fn().mockResolvedValue(undefined) },
     });
     const listener = actionListener.mock.calls[0]![0] as (tab: { id?: number; windowId?: number; url?: string }) => void;
     listener({ id: 8, windowId: 4, url: "https://example.com/" });
     await vi.waitFor(() => expect(remove).toHaveBeenCalledWith(KLAVIYO_ACTIVE_TAB_GRANT_KEY));
+  });
+
+  it("reads the conversion metric at a toolbar click on a metric page, and hands it to the panel instead of running Subscriber Growth setup", async () => {
+    const values: Record<string, unknown> = {};
+    const actionListener = vi.fn(); const messageListener = vi.fn();
+    const executeScript = vi.fn().mockResolvedValue([{ frameId: 0, result: { metricId: "SDmet1", headings: ["Placed Order"], title: "Placed Order", accountLabels: ["Steven Dann"], sourceUrl: "https://www.klaviyo.com/metric/SDmet1/placed-order" } }]);
+    registerBackgroundAutomation({
+      action: { onClicked: { addListener: actionListener } }, runtime: { onMessage: { addListener: messageListener } },
+      storage: { session: { get: vi.fn(async (key: string | null) => key === null ? { ...values } : ({ [key]: values[key] })), set: vi.fn(async (next: Record<string, unknown>) => { Object.assign(values, next); }), remove: vi.fn(async (key: string) => { delete values[key]; }) } },
+      sidePanel: { open: vi.fn().mockResolvedValue(undefined), setPanelBehavior: vi.fn().mockResolvedValue(undefined) },
+      scripting: { executeScript } as never,
+    });
+    const listener = actionListener.mock.calls[0]![0] as (tab: { id?: number; windowId?: number; url?: string }) => void;
+    listener({ id: 7, windowId: 4, url: "https://www.klaviyo.com/metric/SDmet1/placed-order" });
+    await vi.waitFor(() => expect(values["tention.conversion-metric-source:verified"]).toMatchObject({ metricId: "SDmet1" }));
+    expect(executeScript).toHaveBeenCalledOnce();
+    expect(values["tention.subscriber-growth-source:last"]).toBeUndefined();
+    const onMessage = messageListener.mock.calls[0]![0] as (message: unknown, sender: unknown, respond: (value: unknown) => void) => boolean;
+    const response = await new Promise((resolve) => onMessage({ type: "TAKE_CONVERSION_METRIC_SOURCE" }, {}, resolve));
+    expect(response).toMatchObject({ ok: true, metricId: "SDmet1", accountLabels: ["Steven Dann"] });
   });
 
   it("records /dashboard as the authoritative tab for the two home-dashboard captures", async () => {
@@ -162,7 +182,9 @@ describe("Tention toolbar activeTab setup", () => {
       const period = { startDate: "2026-07-01", endDate: "2026-07-31", previousStartDate: "2026-06-01", previousEndDate: "2026-06-30" };
       const response = vi.fn();
       expect(listener({ type: "START_KLAVIYO_AUTO_CAPTURE", request: { reportId: "report-1", screenshotType, accountUrl: "https://www.klaviyo.com/dashboard", period } }, {}, response)).toBe(true);
-      await vi.waitFor(() => expect(executeScript).toHaveBeenCalledOnce());
+      // The shared period helper is loaded first, then exactly one adapter run.
+      await vi.waitFor(() => expect(executeScript.mock.calls.filter(([details]) => (details as { func?: unknown }).func)).toHaveLength(1));
+      expect(executeScript.mock.calls[0]![0]).toMatchObject({ target: { tabId: 7, frameIds: [0] }, files: ["injected/period-entry.js"] });
       expect(executeScript).toHaveBeenCalledWith(expect.objectContaining({ target: { tabId: 7, frameIds: [0] }, func: prepareDashboardCaptureDocument, args: [expect.objectContaining({ sectionKey: screenshotType === "overview" ? "executive_summary" : "top_flows" }), period] }));
       expect(executeScript).not.toHaveBeenCalledWith(expect.objectContaining({ func: prepareBusinessReviewCaptureDocument }));
       // Every attempt reloads the Home dashboard fresh, even when the tab already shows it.
@@ -225,5 +247,39 @@ describe("shared capture state store", () => {
     session.data["tention.active-tab-grant"] = { keep: true };
     await new ChromeSessionAutoCaptureStore(session).clearAll();
     expect(Object.keys(session.data)).toEqual(["tention.active-tab-grant"]);
+  });
+
+  it("restores the user's Klaviyo zoom when the panel running a capture closes (cancellation), touching only the authorized tab", async () => {
+    const values: Record<string, unknown> = {
+      [KLAVIYO_ACTIVE_TAB_GRANT_KEY]: { grantedTabId: 7, grantedWindowId: 4, grantedOrigin: "https://www.klaviyo.com", grantedUrl: "https://www.klaviyo.com/dashboard", grantedAt: 10 },
+    };
+    const zooms = new Map([[7, 1.25], [9, 1]]);
+    const connectListener = vi.fn(); const messageListener = vi.fn();
+    const tabs = {
+      get: vi.fn(), query: vi.fn().mockResolvedValue([]), update: vi.fn(), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+      getZoom: vi.fn(async (tabId: number) => zooms.get(tabId)!), setZoom: vi.fn(async (tabId: number, factor: number) => { zooms.set(tabId, factor); }),
+    };
+    registerBackgroundAutomation({
+      action: { onClicked: { addListener: vi.fn() } },
+      runtime: { onMessage: { addListener: messageListener }, onConnect: { addListener: connectListener } },
+      storage: { session: {
+        get: vi.fn(async (key: string) => ({ [key]: values[key] })),
+        set: vi.fn(async (next: Record<string, unknown>) => { Object.assign(values, next); }),
+        remove: vi.fn(async (key: string) => { delete values[key]; }),
+      } },
+      tabs: tabs as never,
+      scripting: { executeScript: vi.fn(async () => [{ result: { width: Math.round(1100 / zooms.get(7)!), height: 1000, devicePixelRatio: 2 } }]) },
+    });
+    const onMessage = messageListener.mock.calls[0]![0] as (message: unknown, sender: unknown, respond: (value: unknown) => void) => boolean | void;
+    const normalized = await new Promise((resolve) => { onMessage({ type: "NORMALIZE_KLAVIYO_VIEWPORT" }, {}, resolve); });
+    expect(normalized).toMatchObject({ ok: true, originalZoom: 1.25, captureZoom: 0.75 });
+    expect(zooms.get(7)).toBe(0.75);
+
+    let disconnect: () => void = () => undefined;
+    (connectListener.mock.calls[0]![0] as (port: unknown) => void)({ name: "tention-automatic-capture-run", onDisconnect: { addListener: (listener: () => void) => { disconnect = listener; } } });
+    disconnect(); // the side panel closed mid-run
+    await vi.waitFor(() => expect(zooms.get(7)).toBe(1.25));
+    expect(zooms.get(9)).toBe(1);
+    expect(new Set(tabs.setZoom.mock.calls.map(([tabId]) => tabId))).toEqual(new Set([7]));
   });
 });

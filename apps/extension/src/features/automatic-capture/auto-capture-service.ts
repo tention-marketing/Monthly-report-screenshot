@@ -1,4 +1,6 @@
-import type { ReportPeriod, ScreenshotType, SubscriberGrowthEvidence } from "@tention/report-schema";
+import type { BusinessPerformanceEvidence, ReportPeriod, ScreenshotType, SubscriberGrowthEvidence } from "@tention/report-schema";
+import type { ConversionMetricSourceResult, DeliverabilitySourceRequest, DeliverabilitySourceResult } from "../klaviyo-navigation/client-setup-sources.js";
+import { KLAVIYO_CAPTURE_RUN_PORT, type KlaviyoViewportNormalization, type KlaviyoZoomRestore } from "./klaviyo-viewport.js";
 import type { CaptureFailureCode, CapturedImage } from "../screenshot-capture/capture-service.js";
 import type { ExecutiveSummaryTargetBounds, KlaviyoAutomationFailureCode } from "../klaviyo-navigation/executive-summary-adapter.js";
 import type { ToolbarInvocationDiagnostics } from "../klaviyo-navigation/active-tab-grant.js";
@@ -43,6 +45,10 @@ export interface AutoCaptureReviewState {
   campaignsEvidence?: CampaignsEvidence;
   /** Section 10's structured read of the Email → Growth card (exact counts, chart proof, visible period). */
   subscriberGrowthEvidence?: SubscriberGrowthEvidence;
+  /** Executive Summary's rendered Business performance values (report cover), or null with the reasons they were not read. */
+  businessPerformanceEvidence?: BusinessPerformanceEvidence | null;
+  businessPerformanceIssues?: string[];
+  businessPerformanceReadout?: Record<string, unknown>;
   captured: CapturedImage;
 }
 
@@ -74,7 +80,11 @@ export type AutoCaptureMessage =
   | { type: "GET_KLAVIYO_TOOLBAR_DIAGNOSTICS" }
   | { type: "INSPECT_KLAVIYO_CAMPAIGNS_SOURCE" }
   | { type: "GET_EXTENSION_BUILD" }
-  | { type: "GET_SESSION_STORAGE_USAGE" };
+  | { type: "NORMALIZE_KLAVIYO_VIEWPORT" }
+  | { type: "RESTORE_KLAVIYO_ZOOM" }
+  | { type: "GET_SESSION_STORAGE_USAGE" }
+  | { type: "TAKE_CONVERSION_METRIC_SOURCE" }
+  | { type: "VERIFY_DELIVERABILITY_SOURCE"; request: DeliverabilitySourceRequest };
 
 export type { BusinessReviewDiscoveryFailure, BusinessReviewDiscoveryResult };
 
@@ -112,6 +122,29 @@ export async function discoverSubscriberGrowthSource(): Promise<SubscriberGrowth
   return response && typeof response === "object" && typeof response.ok === "boolean" ? response : { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "The extension could not read the Subscriber growth page." };
 }
 
+/** Client setup: the metric read from the Klaviyo metric page at the latest toolbar click (consumed once). */
+export async function takeConversionMetricSource(): Promise<ConversionMetricSourceResult> {
+  const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
+  if (!chromeApi?.runtime) return { ok: false, code: "CONVERSION_METRIC_PAGE_NOT_READ", message: "Metric verification requires the Tention Chrome extension." };
+  const response = await chromeApi.runtime.sendMessage({ type: "TAKE_CONVERSION_METRIC_SOURCE" }).catch(() => null) as ConversionMetricSourceResult | null;
+  return response && typeof response === "object" && typeof response.ok === "boolean" ? response : { ok: false, code: "CONVERSION_METRIC_PAGE_NOT_READ", message: "The extension could not read the metric page." };
+}
+/** Client setup: re-proves the saved account and verifies Analytics → Deliverability → Email → Score on the authorized tab. */
+export async function verifyDeliverabilitySource(request: DeliverabilitySourceRequest): Promise<DeliverabilitySourceResult> {
+  const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
+  if (!chromeApi?.runtime) return { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "Deliverability verification requires the Tention Chrome extension." };
+  const response = await chromeApi.runtime.sendMessage({ type: "VERIFY_DELIVERABILITY_SOURCE", request }).catch(() => null) as DeliverabilitySourceResult | null;
+  return response && typeof response === "object" && typeof response.ok === "boolean" ? response : { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "The extension could not verify the Deliverability page." };
+}
+/** Calls back when a metric page was read at a toolbar click. */
+export function watchVerifiedConversionMetricSource(callback: () => void): () => void {
+  const storage = (globalThis as typeof globalThis & { chrome?: { storage?: { onChanged?: { addListener(listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void): void; removeListener(listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void): void } } } }).chrome?.storage?.onChanged;
+  if (!storage) return () => undefined;
+  const listener = (changes: Record<string, { newValue?: unknown }>, area: string) => { if (area === "session" && changes["tention.conversion-metric-source:verified"]?.newValue) callback(); };
+  storage.addListener(listener);
+  return () => storage.removeListener(listener);
+}
+
 export async function discoverBusinessReview(input: BusinessReviewDiscoveryRequest): Promise<BusinessReviewDiscoveryResult> {
   const chromeApi = (globalThis as typeof globalThis & { chrome?: { runtime?: { sendMessage(message: AutoCaptureMessage): Promise<unknown> } } }).chrome;
   if (!chromeApi?.runtime) return { ok: false, code: "SCRIPT_INJECTION_FAILED", message: "Business Review discovery requires the Tention Chrome extension." };
@@ -128,17 +161,23 @@ export interface AutoCaptureService {
   inspectCampaignsSource?(): Promise<CampaignsSourceInspectionResult | null>;
   /** The build the service worker is actually executing; null when it cannot say. */
   getExtensionBuild?(): Promise<string | null>;
+  /** Zooms the toolbar-authorized Klaviyo tab out just enough for complete evidence; the user's zoom is kept for restore. */
+  normalizeKlaviyoViewport?(): Promise<KlaviyoViewportNormalization>;
+  /** Restores the zoom the user had before the run; safe to call more than once. */
+  restoreKlaviyoZoom?(): Promise<KlaviyoZoomRestore | null>;
   clearAll?(): Promise<void>;
 }
 
 interface ChromeRuntimeApi {
   sendMessage(message: AutoCaptureMessage): Promise<unknown>;
+  connect?(info: { name: string }): { disconnect(): void };
 }
 
 interface ChromeApi { runtime?: ChromeRuntimeApi }
 
 /** UI client only sends messages; the service worker owns the Chrome automation. */
 export class ChromeAutoCaptureService implements AutoCaptureService {
+  private runPort: { disconnect(): void } | null = null;
   constructor(private readonly chromeApi: ChromeApi | undefined = (globalThis as typeof globalThis & { chrome?: ChromeApi }).chrome) {}
 
   async start(request: ExecutiveSummaryAutoCaptureRequest): Promise<AutoCaptureState> {
@@ -173,6 +212,19 @@ export class ChromeAutoCaptureService implements AutoCaptureService {
   async getExtensionBuild(): Promise<string | null> {
     const response = await this.send({ type: "GET_EXTENSION_BUILD" });
     return typeof response === "string" ? response : null;
+  }
+
+  async normalizeKlaviyoViewport(): Promise<KlaviyoViewportNormalization> {
+    // The run port stays open until restore: if the panel closes mid-run, the worker restores the zoom itself.
+    this.runPort ??= this.chromeApi?.runtime?.connect?.({ name: KLAVIYO_CAPTURE_RUN_PORT }) ?? null;
+    const response = await this.send({ type: "NORMALIZE_KLAVIYO_VIEWPORT" }) as KlaviyoViewportNormalization | null;
+    return response && typeof response === "object" && typeof response.ok === "boolean"
+      ? response : { ok: false, code: "KLAVIYO_VIEWPORT_UNAVAILABLE", message: "The extension could not check how wide Klaviyo is displayed.", originalZoom: null, viewport: null };
+  }
+
+  async restoreKlaviyoZoom(): Promise<KlaviyoZoomRestore | null> {
+    try { return await this.send({ type: "RESTORE_KLAVIYO_ZOOM" }) as KlaviyoZoomRestore | null; }
+    finally { this.runPort?.disconnect(); this.runPort = null; }
   }
 
   private async send(message: AutoCaptureMessage): Promise<unknown> {

@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChromeBusinessReviewDiscovery, clickVisibleViewDashboardControl, inspectBusinessReviewDiscoveryDocument } from "./business-review-discovery.js";
 import type { KlaviyoActiveTabGrantStore } from "./active-tab-grant.js";
+import { DeliverabilitySourceVerifier } from "./client-setup-sources.js";
+import { prepareDeliverabilityScoreDocument } from "./deliverability-score-capture.js";
 
 const reviewUrl = "https://www.klaviyo.com/analytics/dashboards/discovered-existing-id";
 function makeGrantStore(): KlaviyoActiveTabGrantStore {
@@ -330,6 +332,38 @@ describe("Saved Business Review target preflight (account only)", () => {
     await expect(discovery.discover({ clientName: "Acme Home", configuredUrl: savedUrl, configuredAccountLabel: "AC Acme Home", verifySavedAccountOnly: true }))
       .resolves.toEqual({ ok: true, verification: "saved_target_account", dashboardUrl: savedUrl, accountLabel: "AC Acme Home", accountMatchesClient: true });
     expect(fixture.tabs.update).not.toHaveBeenCalled();
+  });
+
+  describe("Steven Dann: saved label vs the label Klaviyo renders", () => {
+    const deliverabilityUrl = "https://www.klaviyo.com/analytics/deliverability/email/score";
+    it.each([
+      ["saved ST Steven Dann, page Steven Dann", "ST Steven Dann", "Steven Dann"],
+      ["saved Steven Dann, page ST Steven Dann", "Steven Dann", "ST Steven Dann"],
+      ["saved Steven Dann, page Steven Dann", "Steven Dann", "Steven Dann"],
+    ])("accepts %s on Deliverability", async (_case, saved, shown) => {
+      const fixture = chromeFor({ [deliverabilityUrl]: discoveryPage(deliverabilityUrl, { account: shown, clientName: "Steven Dann" }) }, deliverabilityUrl);
+      const discovery = new ChromeBusinessReviewDiscovery(fixture.chromeApi as never, 100, makeGrantStore());
+      await expect(discovery.discover({ clientName: "Steven Dann", configuredUrl: savedUrl, configuredAccountLabel: saved, verifySavedAccountOnly: true })).resolves.toMatchObject({ ok: true, verification: "saved_target_account" });
+    });
+    it.each([["CL Club Furniture"], ["Club Furniture"]])("rejects a page showing %s for Steven Dann", async (shown) => {
+      const fixture = chromeFor({ [deliverabilityUrl]: discoveryPage(deliverabilityUrl, { account: shown }) }, deliverabilityUrl);
+      const discovery = new ChromeBusinessReviewDiscovery(fixture.chromeApi as never, 100, makeGrantStore());
+      await expect(discovery.discover({ clientName: "Steven Dann", configuredUrl: savedUrl, configuredAccountLabel: "Steven Dann", verifySavedAccountOnly: true })).resolves.toMatchObject({ ok: false, code: "ACCOUNT_CONTEXT_MISMATCH" });
+    });
+    it("the Deliverability source verifier, run on the real discovery, accepts Steven Dann's page and refuses Club Furniture's", async () => {
+      const verify = async (shown: string) => {
+        const fixture = chromeFor({ [deliverabilityUrl]: discoveryPage(deliverabilityUrl, { account: shown, clientName: "Steven Dann" }) }, deliverabilityUrl);
+        const discoveryScript = fixture.scripting.executeScript;
+        const scripting = { executeScript: vi.fn(async (details: { func: unknown }) => details.func === prepareDeliverabilityScoreDocument
+          ? [{ frameId: 0, result: { ok: true, sourceUrl: deliverabilityUrl, targetRect: {}, diagnostics: {} } }]
+          : discoveryScript()) };
+        const discovery = new ChromeBusinessReviewDiscovery({ tabs: fixture.tabs, scripting } as never, 100, makeGrantStore());
+        return new DeliverabilitySourceVerifier(fixture.tabs, scripting as never, makeGrantStore(), (input) => discovery.discover(input))
+          .verify({ clientName: "Steven Dann", configuredUrl: savedUrl, configuredAccountLabel: "ST Steven Dann", configuredProviderAccountId: null });
+      };
+      await expect(verify("Steven Dann")).resolves.toEqual({ ok: true, deliverabilityUrl, accountLabel: "Steven Dann" });
+      await expect(verify("CL Club Furniture")).resolves.toMatchObject({ ok: false, code: "ACCOUNT_CONTEXT_MISMATCH" });
+    });
   });
 
   it("fails closed when the authorized tab shows a different account", async () => {

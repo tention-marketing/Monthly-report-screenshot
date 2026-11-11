@@ -13,6 +13,7 @@ describe("shared recovery policy", () => {
     ["GRANTED_TAB_NOT_ACTIVE", "TAB_NOT_ACTIVE", false],
     ["ACCOUNT_CONTEXT_MISMATCH", "WRONG_ACCOUNT", true], ["ACTION_NOT_INVOKED", "TOOLBAR_GRANT_LOST", true],
     ["CAMPAIGNS_ROUTE_REQUIRED", "LOGIN_REQUIRED", true], ["BUSINESS_REVIEW_URL_REQUIRED", "CONFIGURATION", true], ["SOURCE_PROOF_SCHEMA_INVALID", "SOURCE_PROOF_FAILED", true],
+    ["KLAVIYO_VIEWPORT_TOO_NARROW", "LAYOUT_UNSTABLE", false], ["KLAVIYO_VIEWPORT_CANNOT_BE_NORMALIZED", "CONFIGURATION", true],
   ] as const)("classifies %s as %s (permanent: %s)", (code, category, permanent) => {
     expect(classifyFailure(code)).toMatchObject({ category, permanent });
   });

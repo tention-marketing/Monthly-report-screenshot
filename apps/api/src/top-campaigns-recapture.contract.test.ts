@@ -34,7 +34,7 @@ let client: ReturnType<typeof createApiClient>;
 
 beforeEach(async () => {
   repository = new InMemoryReportDraftRepository(); screenshotStorage = new InMemoryScreenshotStorage();
-  app = buildApp({ now: () => new Date(NOW), repository, screenshotStorage, pdfArtifactStorage: new InMemoryPdfArtifactStorage(), pdfRenderer: { render: vi.fn(), close: async () => undefined } });
+  app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), repository, screenshotStorage, pdfArtifactStorage: new InMemoryPdfArtifactStorage(), pdfRenderer: { render: vi.fn(), close: async () => undefined } });
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   fetchSpy = vi.fn<typeof globalThis.fetch>((input, init) => globalThis.fetch(input, init));
   client = createApiClient({ baseUrl: address, fetch: fetchSpy });

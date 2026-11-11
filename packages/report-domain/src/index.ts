@@ -4,11 +4,11 @@ export * from "./persistence-error.js";
 export * from "./client-report-targets.js";
 export * from "./client-id.js";
 import {
-  isValidIanaTimeZone, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, reportCaptureSpecByScreenshotType, TOP_CAMPAIGNS_LIMIT, reportSectionKeySchema, screenshotSectionMapping,
+  isAcceptedCapture, isValidIanaTimeZone, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, reportCaptureSpecByScreenshotType, TOP_CAMPAIGNS_LIMIT, reportSectionKeySchema, screenshotSectionMapping,
   type ClientSummary, type ReportDraft, type ReportMonth, type ReportSectionKey,
   type ReportStatus, type ReportValidationIssue, type ReportValidationState,
   reportDraftSchema, reportLifecycleEventSchema, type ReportLifecycleEvent,
-  type ScreenshotRecord, type ScreenshotType, type SectionConfiguration, type ReportPdfArtifact, type ReportCaptureSpec, type CapturePeriodProof,
+  type ScreenshotRecord, type ScreenshotType, type SectionConfiguration, type ReportPdfArtifact, type ReportPdfDriveDelivery, type ReportGoogleDoc, type ReportCaptureSpec, type CapturePeriodProof,
 } from "@tention/report-schema";
 
 export type ValidationIssueCode =
@@ -23,7 +23,7 @@ export type ReportEvent =
   | "START_DATA_FETCH" | "DATA_FETCH_SUCCEEDED" | "DATA_FETCH_FAILED"
   | "MARK_CAPTURES_INCOMPLETE" | "SUBMIT_FOR_REVIEW" | "APPROVE"
   | "START_GENERATION" | "GENERATION_SUCCEEDED" | "GENERATION_FAILED" | "RESET_TO_DRAFT"
-  | "MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW";
+  | "MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW" | "AUTO_VALIDATE";
 
 export interface DomainContext { now: Date }
 export interface CreateReportDraftInput {
@@ -75,6 +75,21 @@ export function enableEmailSubscriberGrowth(draft: ReportDraft, context: DomainC
   if (draft.status === "generated") throw new ReportDomainError("REPORT_VALIDATION_FAILED", "A generated report cannot gain a new section.");
   if (draft.sections.email_subscriber_growth === "required") return draft;
   const next = { ...draft, sections: { ...draft.sections, email_subscriber_growth: "required" as const }, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
+  return { ...next, validation: validateReportDraft(next, context) };
+}
+
+/**
+ * Explicit data-definition update: fills a report's frozen currency from the client's verified profile currency. Only
+ * `client.currency` (plus version, updatedAt and recomputed validation) changes — never the report ID, month, period,
+ * sections, screenshots, hashes, approvals, sources or capture proofs. A currency already frozen on the report is never
+ * replaced by a different one, and a report that is generating or generated is never changed.
+ */
+export function applyClientProfileCurrency(draft: ReportDraft, profileCurrency: string | null | undefined, context: DomainContext): ReportDraft {
+  if (draft.status === "generating" || draft.status === "generated") throw new ReportDomainError("REPORT_VALIDATION_FAILED", "A generating or generated report's currency cannot change.");
+  if (!profileCurrency || !/^[A-Z]{3}$/.test(profileCurrency)) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "The client profile has no verified ISO currency code to apply.");
+  if (draft.client.currency === profileCurrency) return draft;
+  if (draft.client.currency !== null) throw new ReportDomainError("REPORT_VALIDATION_FAILED", `This report is already frozen in ${draft.client.currency}; it is not changed to ${profileCurrency}.`);
+  const next = { ...draft, client: { ...draft.client, currency: profileCurrency }, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
   return { ...next, validation: validateReportDraft(next, context) };
 }
 
@@ -136,9 +151,9 @@ export function validateReportDraft(draft: ReportDraft, context: DomainContext):
       screenshot.clientId === draft.client.id && sameMonth(screenshot.reportMonth, draft.reportMonth));
     if (candidates.length === 0) {
       issue("REQUIRED_SCREENSHOT_MISSING", "error", "A required section is missing screenshot metadata.", { section, screenshotType: type });
-    } else if (!candidates.some(({ approved }) => approved)) {
-      issue("REQUIRED_SCREENSHOT_UNAPPROVED", "error", "A required screenshot has not been approved.", { section, screenshotType: type });
-    } else if (!candidates.some(({ approved, periodConfirmed }) => approved && periodConfirmed)) {
+    } else if (!candidates.some(isAcceptedCapture)) {
+      issue("REQUIRED_SCREENSHOT_UNAPPROVED", "error", "A required screenshot has not been approved or machine-validated.", { section, screenshotType: type });
+    } else if (!candidates.some((candidate) => isAcceptedCapture(candidate) && candidate.periodConfirmed)) {
       issue("REQUIRED_SCREENSHOT_PERIOD_UNCONFIRMED", "error", "A required screenshot needs human report-period confirmation.", { section, screenshotType: type });
     } else if (!candidates.some(hasStoredApprovedAsset)) {
       issue("REQUIRED_SCREENSHOT_ASSET_MISSING", "error", "A required screenshot is missing its stored PNG asset metadata.", { section, screenshotType: type });
@@ -202,26 +217,44 @@ function expectedPeriod(spec: ReportCaptureSpec, draft: ReportDraft): CapturePer
 function captureTitle(key: string): string { return key.split("_").map((value) => value[0]!.toUpperCase() + value.slice(1)).join(" "); }
 
 const transitions: Partial<Record<ReportStatus, Partial<Record<ReportEvent, ReportStatus>>>> = {
-  draft: { START_DATA_FETCH: "data_fetching", SUBMIT_FOR_REVIEW: "ready_for_review" },
+  draft: { START_DATA_FETCH: "data_fetching", SUBMIT_FOR_REVIEW: "ready_for_review", AUTO_VALIDATE: "auto_validated" },
   data_fetching: { DATA_FETCH_SUCCEEDED: "data_ready", DATA_FETCH_FAILED: "failed" },
-  data_ready: { MARK_CAPTURES_INCOMPLETE: "captures_incomplete", SUBMIT_FOR_REVIEW: "ready_for_review" },
-  captures_incomplete: { SUBMIT_FOR_REVIEW: "ready_for_review" },
+  data_ready: { MARK_CAPTURES_INCOMPLETE: "captures_incomplete", SUBMIT_FOR_REVIEW: "ready_for_review", AUTO_VALIDATE: "auto_validated" },
+  captures_incomplete: { SUBMIT_FOR_REVIEW: "ready_for_review", AUTO_VALIDATE: "auto_validated" },
   ready_for_review: { MARK_CAPTURES_INCOMPLETE: "captures_incomplete", START_GENERATION: "generating" },
   approved: { START_GENERATION: "generating" },
+  // Machine-validated automatic captures generate without a human approval step; a retake re-validates.
+  auto_validated: { AUTO_VALIDATE: "auto_validated", MARK_CAPTURES_INCOMPLETE: "captures_incomplete", START_GENERATION: "generating" },
   generating: { GENERATION_SUCCEEDED: "generated", GENERATION_FAILED: "failed" },
-  generated: { MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW: "ready_for_review", MARK_CAPTURES_INCOMPLETE: "captures_incomplete" },
-  failed: { RESET_TO_DRAFT: "draft", START_GENERATION: "generating" },
+  generated: { MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW: "ready_for_review", MARK_CAPTURES_INCOMPLETE: "captures_incomplete", AUTO_VALIDATE: "auto_validated" },
+  failed: { RESET_TO_DRAFT: "draft", START_GENERATION: "generating", AUTO_VALIDATE: "auto_validated" },
 };
+
+// Shared with the extension (which does not depend on this package) so both enforce the same final-generation rule.
+export { finalGenerationDataBlockers, type FinalGenerationBlocker, type FinalGenerationBlockerCode, type FinalGenerationClientProfile } from "@tention/report-schema";
 
 export function applyReportEvent(draft: ReportDraft, event: ReportEvent, context: DomainContext): ReportDraft {
   const nextStatus = transitions[draft.status]?.[event];
   if (!nextStatus) throw new ReportDomainError("ILLEGAL_REPORT_TRANSITION", `Event ${event} is not allowed from ${draft.status}.`);
-  const requiresCaptureReviewValidation = event === "SUBMIT_FOR_REVIEW" || event === "MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW";
+  const requiresCaptureReviewValidation = event === "SUBMIT_FOR_REVIEW" || event === "MIGRATE_LEGACY_GENERATED_CAPTURE_REVIEW" || event === "AUTO_VALIDATE";
   const validation = requiresCaptureReviewValidation ? validateReportDraft(draft, context) : draft.validation;
   if (requiresCaptureReviewValidation && validation.errors.length > 0) {
     throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Report validation blocks review submission.", validation);
   }
   return { ...draft, status: nextStatus, validation, version: draft.version + 1, updatedAt: validInstant(context.now).toISOString() };
+}
+
+/**
+ * Records backend machine validation on the listed automatic captures and moves the report to auto_validated. The
+ * caller must already have re-verified each capture's stored bytes. Never sets `approved`: human approval stays a
+ * separate fact. Throws (nothing changes) unless the whole report then validates with zero errors.
+ */
+export function applyAutomatedValidation(draft: ReportDraft, verifiedTypes: readonly ScreenshotType[], context: DomainContext): ReportDraft {
+  const at = validInstant(context.now).toISOString();
+  const verified = new Set(verifiedTypes);
+  const screenshots = draft.screenshots.map((screenshot) => !screenshot.approved && screenshot.captureOrigin === "live_acceptance_import" && verified.has(screenshot.type)
+    ? { ...screenshot, automatedValidatedAt: at } : screenshot);
+  return applyReportEvent({ ...draft, screenshots }, "AUTO_VALIDATE", context);
 }
 
 export function upsertScreenshotMetadata(
@@ -254,7 +287,7 @@ export function upsertScreenshotMetadataBatch(
 
 /** A replacement invalidates a completed capture review only for a required screenshot. */
 export function replacementInvalidatesCaptureReview(draft: ReportDraft, routeType: ScreenshotType): boolean {
-  return (draft.status === "ready_for_review" || draft.status === "generated") && draft.sections[screenshotSectionMapping[routeType]] === "required";
+  return (draft.status === "ready_for_review" || draft.status === "generated" || draft.status === "auto_validated") && draft.sections[screenshotSectionMapping[routeType]] === "required";
 }
 
 export function replaceScreenshotAndInvalidateCaptureReview(
@@ -288,6 +321,10 @@ export interface ReportDraftRepository {
   saveGeneratedArtifact(draft: ReportDraft, expectedVersion: number, artifact: ReportPdfArtifact): Promise<ReportDraft>;
   getArtifactForFingerprint(reportId: string, sourceFingerprint: string): Promise<ReportPdfArtifact | null>;
   listArtifacts(reportId: string): Promise<ReportPdfArtifact[]>;
+  /** Records the Drive delivery outcome on an existing artifact; the artifact's canonical fields never change. */
+  saveArtifactDriveDelivery(reportId: string, artifactId: string, delivery: ReportPdfDriveDelivery): Promise<ReportPdfArtifact>;
+  /** Records the editable Google Doc copy outcome on an existing artifact; the artifact's canonical fields never change. */
+  saveArtifactGoogleDoc(reportId: string, artifactId: string, googleDoc: ReportGoogleDoc): Promise<ReportPdfArtifact>;
   /** Local-development identity repair; implementations preserve draft history and artifacts. */
   rekeyLocalDraft(fromId: string, toId: string, expectedVersion: number): Promise<ReportDraft>;
 }
@@ -346,6 +383,18 @@ export class InMemoryReportDraftRepository implements ReportDraftRepository {
     return structuredClone((this.artifacts.get(reportId) ?? []).find((artifact) => artifact.sourceFingerprint === sourceFingerprint) ?? null);
   }
   async listArtifacts(reportId: string): Promise<ReportPdfArtifact[]> { return structuredClone(this.artifacts.get(reportId) ?? []); }
+  async saveArtifactDriveDelivery(reportId: string, artifactId: string, delivery: ReportPdfDriveDelivery): Promise<ReportPdfArtifact> {
+    const artifact = (this.artifacts.get(reportId) ?? []).find(({ id }) => id === artifactId);
+    if (!artifact) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "The PDF artifact does not exist for this report.");
+    artifact.driveDelivery = structuredClone(delivery);
+    return structuredClone(artifact);
+  }
+  async saveArtifactGoogleDoc(reportId: string, artifactId: string, googleDoc: ReportGoogleDoc): Promise<ReportPdfArtifact> {
+    const artifact = (this.artifacts.get(reportId) ?? []).find(({ id }) => id === artifactId);
+    if (!artifact) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "The PDF artifact does not exist for this report.");
+    artifact.googleDoc = structuredClone(googleDoc);
+    return structuredClone(artifact);
+  }
   async rekeyLocalDraft(fromId: string, toId: string, expectedVersion: number): Promise<ReportDraft> {
     const current = this.requireCurrent(fromId, expectedVersion);
     if (this.drafts.has(toId)) throw new ReportPersistenceError("REPORT_DRAFT_ALREADY_EXISTS", "The target report ID is already assigned.");
@@ -382,9 +431,9 @@ export class InMemoryReportDraftRepository implements ReportDraftRepository {
 
 function sameMonth(left: ReportMonth, right: ReportMonth): boolean { return left.year === right.year && left.month === right.month; }
 function hasStoredApprovedAsset(screenshot: ScreenshotRecord): boolean {
-  return screenshot.approved && screenshot.periodConfirmed && screenshot.storageKey !== null &&
+  return isAcceptedCapture(screenshot) && screenshot.periodConfirmed && screenshot.storageKey !== null &&
     screenshot.mimeType === "image/png" && screenshot.byteSize !== null && screenshot.sha256 !== null &&
-    screenshot.approvedAt !== null && screenshot.width > 0 && screenshot.height > 0;
+    (screenshot.approved ? screenshot.approvedAt !== null : Boolean(screenshot.automatedValidatedAt)) && screenshot.width > 0 && screenshot.height > 0;
 }
 function validInstant(value: Date): Date {
   if (Number.isNaN(value.getTime())) throw new Error("now must be a valid Date");

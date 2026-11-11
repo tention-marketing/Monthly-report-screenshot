@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { installRangeCalendar } from "./test-support/range-calendar.js";
 import { getReportPeriod } from "@tention/report-core";
 import { automaticBusinessReviewScreenshotTypes, BUSINESS_REVIEW_TARGETS, businessReviewScreenshotTypes, isAutomaticBusinessReviewScreenshotType, isBusinessReviewScreenshotType, prepareBusinessReviewCaptureDocument } from "./business-review-capture.js";
 
@@ -111,6 +112,78 @@ describe("Business Review semantic capture adapter", () => {
       expect(card.querySelector<HTMLElement>("#campaign-panel")!.style.visibility).toBe("");
     } finally { delete (document as { elementFromPoint?: unknown }).elementFromPoint; }
   });
+
+  // Regression (Club Furniture Sep 2026, captured 2026-11-03): Klaviyo's AI prompt pill covered the bottom of the Flow
+  // Performance chart (x-axis dates, $0 baseline). Sampled every ~40 px, the hit-test grid fell above and below the
+  // 30 px pill, so it was never hidden. The geometric pass finds it wherever it is.
+  it.each(["flow_performance", "campaign_performance", "month_comparison"] as const)("%s hides an AI prompt pill that sits between sparse hit-test rows, so the chart bottom stays visible", async (type) => {
+    page();
+    document.body.insertAdjacentHTML("beforeend", `<div id="composer-root" style="position: fixed"><div id="composer">Which campaigns drove the most unsubscribes?</div></div>`);
+    const composer = document.getElementById("composer-root")!;
+    const card = document.getElementById(type === "month_comparison" ? "growth" : type === "flow_performance" ? "flow" : "campaign")!;
+    const original = HTMLElement.prototype.getBoundingClientRect;
+    // The card is 10..410 × 20..270; the pill covers 230..260, between the old grid rows at y≈226 and y≈266.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) { return this.closest("#composer-root") ? (composer.style.visibility === "hidden" ? rect(0, 0, 0, 0) : rect(200, 230, 300, 30)) : original.call(this); });
+    Object.defineProperty(document, "elementFromPoint", { configurable: true, value: (x: number, y: number) => composer.style.visibility !== "hidden" && x >= 200 && x <= 500 && y >= 230 && y <= 260 ? composer.firstElementChild : card.querySelector("svg") ?? card });
+    try {
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result.ok ? "ok" : `${result.code}: ${result.message}`).toBe("ok");
+      expect(result).toMatchObject({ targetRect: { hiddenOverlayCount: 1, height: 250 } });
+      expect(composer.style.visibility).toBe("hidden");
+    } finally { delete (document as { elementFromPoint?: unknown }).elementFromPoint; }
+  });
+
+  // Regression (run 08be2f58, 2026-11-04): 1648×1188 viewport, a sticky "Dashboards / Business review" header plus a
+  // feedback banner, and the dashboard scrolling inside its own container. Cards above finished loading after the
+  // one-off scroll and pushed the target below the fold; the stability loop only waited, so all five attempts failed
+  // TARGET_NOT_VISIBLE. The card must be moved back into the visible area by scrolling the real container.
+  it.each([["campaign_performance", "campaign"], ["flow_performance", "flow"]] as const)("%s re-positions a card that relayout pushed below the fold of an internal scroll container", async (type, kind) => {
+    page();
+    const main = document.querySelector("main")!;
+    const scroller = document.createElement("div"); scroller.id = "scroller"; scroller.style.overflowY = "auto";
+    main.replaceWith(scroller); scroller.append(main);
+    const header = document.createElement("header"); header.id = "page-header"; header.textContent = "Your total revenue increased! Dashboards / Business review";
+    scroller.before(header);
+    const headerBottom = 150; let scrollTop = 0; const cardTop = 900; const cardHeight = 460;
+    Object.defineProperty(scroller, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = Math.max(0, Math.min(value, 3_000)); } });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.id === "scroller") return rect(0, headerBottom, window.innerWidth, window.innerHeight - headerBottom);
+      if (this.id === "page-header") return rect(0, 0, window.innerWidth, headerBottom);
+      const section = this.closest("section");
+      if (section?.id === kind) {
+        const row = this.closest("tbody tr");
+        if (row) return rect(20, cardTop - scrollTop + 100 + Array.from(row.parentElement!.children).indexOf(row) * 30, 880, 30);
+        return rect(10, cardTop - scrollTop, 900, cardHeight);
+      }
+      return section ? rect(10, 3_000, 900, 300) : rect(0, 0, 8, 8);
+    });
+    vi.spyOn(SVGElement.prototype, "getBoundingClientRect").mockImplementation(function (this: SVGElement) { return this.closest("section")?.id === kind ? rect(20, cardTop - scrollTop + 60, 200, 120) : rect(0, 0, 0, 0); });
+    const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+    expect(result.ok ? "ok" : `${result.code}: ${result.message} ${JSON.stringify((result as { diagnostics?: Record<string, unknown> }).diagnostics?.positioning)}`).toBe("ok");
+    if (!result.ok) return;
+    // Wholly inside the container's visible area, below the sticky header, never at a fixed coordinate.
+    expect(scrollTop).toBeGreaterThan(0);
+    expect(result.targetRect.y).toBeGreaterThanOrEqual(headerBottom);
+    expect(result.targetRect.y + result.targetRect.height).toBeLessThanOrEqual(window.innerHeight);
+  }, 20_000);
+
+  it("records the scroller and geometry when a card taller than the visible area cannot be shown whole", async () => {
+    page();
+    const main = document.querySelector("main")!;
+    const scroller = document.createElement("div"); scroller.id = "scroller"; scroller.style.overflowY = "auto";
+    main.replaceWith(scroller); scroller.append(main);
+    let scrollTop = 0;
+    Object.defineProperty(scroller, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = Math.max(0, Math.min(value, 3_000)); } });
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      if (this.id === "scroller") return rect(0, 150, window.innerWidth, window.innerHeight - 150);
+      const section = this.closest("section");
+      if (section?.id === "campaign") return rect(10, 900 - scrollTop, 900, window.innerHeight);
+      return section ? rect(10, 3_000, 900, 300) : rect(0, 0, 8, 8);
+    });
+    vi.spyOn(SVGElement.prototype, "getBoundingClientRect").mockImplementation(function (this: SVGElement) { return this.closest("section")?.id === "campaign" ? rect(20, 960 - scrollTop, 200, 120) : rect(0, 0, 0, 0); });
+    const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.campaign_performance, period);
+    expect(result).toMatchObject({ ok: false, code: "TARGET_NOT_VISIBLE", diagnostics: { positioning: expect.arrayContaining([expect.objectContaining({ scroller: "div#scroller", fits: false, visibleArea: { top: 150, bottom: window.innerHeight } })]) } });
+  }, 20_000);
 
   it("does not capture Month Comparison while its metrics are rendered but the Campaigns/Flows chart is still empty", async () => {
     page("Jul 1, 2026 – Jul 31, 2026 compared to previous period Jun 1, 2026 – Jun 30, 2026");
@@ -229,12 +302,19 @@ describe("Business Review semantic capture adapter", () => {
      * The card scrolls inside an overflow container; a fixed Composer bar covers the viewport's bottom (top at 690 px).
      * Unscrolled, the card starts at `cardTop` and its 10th row ends at cardTop + 400, under the bar.
      */
-    function metricsUnderComposer(kind: "campaign" | "flow", cardTop: number, options: { reasserts?: boolean; contentsRows?: boolean } = {}) {
+    /**
+     * `scrollerTop` models Klaviyo's live layout: a page header ("Dashboards / Business review") that does not scroll,
+     * with the dashboard's scroll container starting below it. `initialScroll` starts the container already scrolled.
+     */
+    function metricsUnderComposer(kind: "campaign" | "flow", cardTop: number, options: { reasserts?: boolean; contentsRows?: boolean; scrollerTop?: number; initialScroll?: number } = {}) {
       page();
       const main = document.querySelector("main")!;
       const scroller = document.createElement("div"); scroller.id = "scroller"; scroller.style.overflowY = "auto";
       main.replaceWith(scroller); scroller.append(main);
-      let scrollTop = 0;
+      const header = document.createElement("header"); header.id = "page-header"; header.textContent = "Dashboards / Business review";
+      scroller.before(header);
+      const scrollerTop = options.scrollerTop ?? 0;
+      let scrollTop = options.initialScroll ?? 0;
       Object.defineProperty(scroller, "scrollTop", { configurable: true, get: () => scrollTop, set: (value: number) => { scrollTop = Math.max(0, Math.min(value, 400)); } });
       document.body.insertAdjacentHTML("beforeend", `<div id="composer-root" style="position: fixed"><div id="composer">Which segments am I over-sending to?</div></div>`);
       const composer = document.getElementById("composer-root")!;
@@ -243,6 +323,8 @@ describe("Business Review semantic capture adapter", () => {
       const cardY = () => cardTop - scrollTop;
       vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
         if (this.closest("#composer-root")) return rect(400, 690, 400, 48);
+        if (this.id === "scroller") return rect(0, scrollerTop, window.innerWidth, window.innerHeight - scrollerTop);
+        if (this.id === "page-header") return rect(0, 0, window.innerWidth, scrollerTop);
         const section = this.closest("section");
         if (section?.id === kind) {
           const row = this.closest("tbody tr");
@@ -253,8 +335,46 @@ describe("Business Review semantic capture adapter", () => {
         }
         return section ? rect(10, 1_200, 900, 300) : rect(0, 0, 8, 8);
       });
-      return { scrolled: () => scrollTop, composer };
+      return { scrolled: () => scrollTop, composer, header };
     }
+
+    // Regression (Club Furniture Sep 2026, captured 2026-11-03): scrolling the last row clear of the Composer pushed the
+    // card title above the dashboard's scroll container, and the crop showed the page header in its place, so the
+    // Campaign and Flow Metrics screenshots could not be told apart.
+    it.each([["campaign_metrics", "campaign", "Campaign Performance Summary"], ["flow_metrics", "flow", "Flow Performance Summary"]] as const)("%s never scrolls its title under a non-scrolling page header; it hides the Composer instead", async (type, kind, title) => {
+      const live = metricsUnderComposer(kind, 300, { scrollerTop: 290 });
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result.ok ? "ok" : `${result.code}: ${result.message}`).toBe("ok");
+      if (!result.ok) return;
+      // Scrolling the 18 px the row needed would have put the card top at 282, under the header ending at 290.
+      expect(live.scrolled()).toBe(0);
+      expect(result.targetRect.y).toBeGreaterThanOrEqual(290);
+      expect(result.targetRect.cardTitle).toBe(title);
+      expect(result.targetRect.lastRowProof).toMatchObject({ lastMetric: "average order value", visible: true, hiddenOverlays: 1, visibleTop: 290 });
+      expect(live.composer.style.visibility).toBe("hidden");
+      expect(live.header.style.visibility).toBe("");
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s scrolls a card already partly under the page header back down until its title shows", async (type, kind) => {
+      const live = metricsUnderComposer(kind, 300, { scrollerTop: 290, initialScroll: 30 });
+      const result = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period);
+      expect(result.ok ? "ok" : `${result.code}: ${result.message}`).toBe("ok");
+      if (!result.ok) return;
+      // The card started at 270 (20 px under the header); it is scrolled back to start inside the visible area.
+      expect(live.scrolled()).toBeLessThan(30);
+      expect(result.targetRect.y).toBeGreaterThanOrEqual(290);
+      expect(result.targetRect.y + result.targetRect.height).toBeGreaterThanOrEqual(Number(result.targetRect.lastRowProof!.lastRowBottom));
+    });
+
+    it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s refuses a crop whose title is painted over by page chrome outside the card", async (type, kind) => {
+      const live = metricsUnderComposer(kind, 300);
+      const card = document.getElementById(kind)!;
+      // The header paints over the top 24 px of the card, which is where its title is.
+      Object.defineProperty(document, "elementFromPoint", { configurable: true, value: (_x: number, y: number) => y < 324 ? live.header : card.querySelector("table") });
+      try {
+        await expect(prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS[type], period)).resolves.toMatchObject({ ok: false, code: "BUSINESS_REVIEW_TARGET_OCCLUDED", message: expect.stringContaining("title is not visible") });
+      } finally { delete (document as { elementFromPoint?: unknown }).elementFromPoint; }
+    });
 
     it.each([["campaign_metrics", "campaign"], ["flow_metrics", "flow"]] as const)("%s scrolls the obstructed Average Order Value row above the bar, then crops above it", async (type, kind) => {
       const live = metricsUnderComposer(kind, 300);
@@ -818,26 +938,32 @@ describe("Business Review Time period picker as Klaviyo renders it live", () => 
    * select ("Previous period" | "Custom") whose own Start/End fields stay hidden until Custom. Left on "Previous period",
    * Apply keeps the dashboard's stored comparison (`storedComparison`), exactly as live: Sep 1–30 compared to Jul 1–31.
    */
-  function livePickerPage(applyWorks: boolean, options: { storedComparison?: [string, string]; comparisonIgnored?: boolean } = {}): { committed: () => string[]; comparison: () => string[] } {
-    siblingRangePage("Sep 27, 2026 - Oct 27, 2026 compared to previous period Aug 28, 2026 - Sep 26, 2026");
+  function livePickerPage(applyWorks: boolean, options: { storedComparison?: [string, string]; comparisonIgnored?: boolean; initialRange?: string; comparisonDefault?: string; comparisonItems?: string[]; plainOptions?: boolean; selectOnMouseDown?: boolean; sidebar?: boolean } = {}): { committed: () => string[]; comparison: () => string[] } {
+    siblingRangePage(options.initialRange ?? "Sep 27, 2026 - Oct 27, 2026 compared to previous period Aug 28, 2026 - Sep 26, 2026");
+    // Klaviyo's Analytics sidebar is painted beside the dashboard: "Custom reports" must never be taken for the option.
+    if (options.sidebar) { const nav = document.createElement("nav"); nav.innerHTML = `<ul><li>Dashboards</li><li>Metrics</li><li id="custom-reports">Custom reports</li><li>Custom</li></ul>`; document.body.prepend(nav); }
     let committed: string[] = []; let comparison: string[] = [];
     const stored = options.storedComparison ?? ["Jul 01, 2026", "Jul 31, 2026"];
     const picker = document.createElement("div"); picker.setAttribute("role", "dialog"); picker.style.display = "none";
     // Stale hidden fields deliberately hold the expected month: they must never count as proof.
     picker.innerHTML = `<label>Time period</label><button id="tp" aria-haspopup="listbox">Last 30 days</button>
       <div id="range" style="display:none"><span>Date range Aug 01, 2026 - Aug 31, 2026 compared to previous period Jul 01, 2026 - Jul 31, 2026</span><input placeholder="Start Date" value="Aug 01, 2026" /><input placeholder="End Date" value="Aug 31, 2026" /></div>
-      <label>Comparison period</label><button id="cp" aria-haspopup="listbox">Previous period</button>
+      <label>Comparison period</label><button id="cp" aria-haspopup="listbox">${options.comparisonDefault ?? "Previous period"}</button>
       <div id="cmp-range" style="display:none"><input placeholder="Start Date" value="Aug 29, 2026" /><input placeholder="End Date" value="Sep 28, 2026" /></div>
       <button id="apply">Apply</button><button>Cancel</button>`;
     document.querySelector("#date-region [aria-label='Time period']")!.after(picker);
     document.querySelector("#date-region [aria-label='Time period']")!.addEventListener("click", () => { picker.style.display = ""; });
     const menu = (button: string, items: string[], onCustom: () => void) => picker.querySelector(button)!.addEventListener("click", () => {
-      const list = document.createElement("ul"); list.setAttribute("role", "listbox"); list.innerHTML = items.map((item) => `<li role="option">${item}</li>`).join("");
-      list.lastElementChild!.addEventListener("click", () => { onCustom(); picker.querySelector(button)!.textContent = "Custom"; list.remove(); });
+      document.querySelectorAll(`[data-menu-for="${button}"]`).forEach((stale) => stale.remove());
+      const list = document.createElement(options.plainOptions ? "div" : "ul"); list.dataset.menuFor = button;
+      if (!options.plainOptions) list.setAttribute("role", "listbox");
+      list.innerHTML = items.map((item) => options.plainOptions ? `<div class="opt"><span>${item}</span></div>` : `<li role="option">${item}</li>`).join("");
+      const custom = Array.from(list.children).find((child) => child.textContent === "Custom");
+      custom?.addEventListener(options.selectOnMouseDown ? "mousedown" : "click", () => { onCustom(); picker.querySelector(button)!.textContent = "Custom"; list.remove(); });
       document.body.append(list);
     });
     menu("#tp", ["Last 30 days", "Custom"], () => { (picker.querySelector("#range") as HTMLElement).style.display = ""; });
-    menu("#cp", ["Previous period", "Custom"], () => { (picker.querySelector("#cmp-range") as HTMLElement).style.display = ""; });
+    menu("#cp", options.comparisonItems ?? ["Previous period", "Custom"], () => { (picker.querySelector("#cmp-range") as HTMLElement).style.display = ""; });
     for (const input of Array.from(picker.querySelectorAll<HTMLInputElement>("#range input"))) input.addEventListener("focusout", () => { committed = Array.from(picker.querySelectorAll<HTMLInputElement>("#range input")).map((field) => field.value); });
     for (const input of Array.from(picker.querySelectorAll<HTMLInputElement>("#cmp-range input"))) input.addEventListener("focusout", () => { comparison = Array.from(picker.querySelectorAll<HTMLInputElement>("#cmp-range input")).map((field) => field.value); });
     picker.querySelector("#apply")!.addEventListener("click", () => {
@@ -872,10 +998,132 @@ describe("Business Review Time period picker as Klaviyo renders it live", () => 
     expect(live.comparison()).toEqual(previous);
   }, 15_000);
 
+  // Run c80dcbab (Steven Dann, October 2026): Time period "Last 30 days" and Comparison period already Custom on
+  // Oct 1–31, so the only visible date fields were the comparison's. The page read "Oct 7 – Nov 6 compared to Oct 1 – 31".
+  it("from Last 30 days with a Custom comparison, sets Time period to Oct 1–31 and the comparison to Sep 1–30, verifying both", async () => {
+    const live = livePickerPage(true, { initialRange: "Oct 7, 2026 - Nov 6, 2026 compared to Oct 1, 2026 - Oct 31, 2026", comparisonDefault: "Custom" });
+    const comparisonRange = document.querySelector<HTMLElement>("#cmp-range")!; comparisonRange.style.display = "";
+    for (const [index, input] of Array.from(comparisonRange.querySelectorAll("input")).entries()) input.value = index === 0 ? "Oct 01, 2026" : "Oct 31, 2026";
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 10 }));
+    expect(outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify((outcome as { diagnostics?: Record<string, unknown> }).diagnostics?.periodSetting)}`).toBe("ok");
+    expect(outcome).toMatchObject({ ok: true, observedPeriod: { startDate: "2026-10-01", endDate: "2026-10-31", comparisonStartDate: "2026-09-01", comparisonEndDate: "2026-09-30" } });
+    expect(live.committed()).toEqual(["Oct 01, 2026", "Oct 31, 2026"]);
+    expect(live.comparison()).toEqual(["Sep 01, 2026", "Sep 30, 2026"]);
+    expect(document.querySelector("#date-region p")!.textContent).toBe("Oct 1, 2026 - Oct 31, 2026 compared to Sep 1, 2026 - Sep 30, 2026");
+  }, 15_000);
+
+  it("never accepts 'Oct 7 – Nov 6 compared to Oct 1 – 31' as October, or as October compared to September", async () => {
+    livePickerPage(false, { initialRange: "Oct 7, 2026 - Nov 6, 2026 compared to Oct 1, 2026 - Oct 31, 2026" });
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 10 }));
+    expect(outcome).toMatchObject({ ok: false });
+    expect((outcome as { diagnostics?: { periodSetting?: Record<string, unknown> } }).diagnostics?.periodSetting).toMatchObject({ dialogFound: true, pickerMode: "Last 30 days" });
+  }, 30_000);
+
+  /**
+   * Run c3d31628: Klaviyo kept the September report's dates in its picker and its fields reverted programmatic writes.
+   * Every picker field becomes a controlled field that only typing (insertText) changes; the shared period helper
+   * must still replace both ranges with the report's own month and its previous calendar month.
+   */
+  function controlledFields(): () => void {
+    const original = document.execCommand;
+    const setNative = (input: HTMLInputElement, value: string) => Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("[role=dialog] input"));
+    const state = new Map(inputs.map((input) => [input, input.value]));
+    for (const input of inputs) input.addEventListener("input", (event) => {
+      if (event instanceof InputEvent && (event.inputType === "insertText" || event.inputType === "deleteContentBackward")) state.set(input, input.value); else setNative(input, state.get(input)!);
+    }, true);
+    document.execCommand = ((command: string, _ui?: boolean, value?: string) => {
+      const input = document.activeElement as HTMLInputElement | null;
+      if (!input || !state.has(input)) return false;
+      const from = input.selectionStart ?? input.value.length; const to = input.selectionEnd ?? input.value.length;
+      const next = command === "insertText" ? input.value.slice(0, from) + (value ?? "") + input.value.slice(to) : command === "delete" ? input.value.slice(0, from) + input.value.slice(to) : null;
+      if (next === null) return false;
+      setNative(input, next); input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: command === "insertText" ? "insertText" : "deleteContentBackward", data: value ?? null }));
+      return true;
+    }) as typeof document.execCommand;
+    return () => { document.execCommand = original; };
+  }
+
+  it.each([
+    ["April 2026 from a page left on September compared to the previous year", { year: 2026, month: 4 }, ["Apr 01, 2026", "Apr 30, 2026"], ["Mar 01, 2026", "Mar 31, 2026"]],
+    ["March 2026 (previous month February 1–28)", { year: 2026, month: 3 }, ["Mar 01, 2026", "Mar 31, 2026"], ["Feb 01, 2026", "Feb 28, 2026"]],
+    ["January 2026 (previous month December 2025)", { year: 2026, month: 1 }, ["Jan 01, 2026", "Jan 31, 2026"], ["Dec 01, 2025", "Dec 31, 2025"]],
+  ] as const)("Month Comparison: %s, with fields that revert programmatic writes", async (_case, month, current, previous) => {
+    const live = livePickerPage(true, { initialRange: "Sep 1, 2026 - Sep 30, 2026 compared to previous year", comparisonDefault: "Previous year", comparisonItems: ["Previous period", "Previous year", "Custom"], storedComparison: ["Sep 01, 2025", "Sep 30, 2025"] });
+    const restore = controlledFields();
+    try {
+      const report = getReportPeriod(month);
+      const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, report);
+      expect(outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify((outcome as { diagnostics?: Record<string, unknown> }).diagnostics?.periodSetting)}`).toBe("ok");
+      // The previous calendar month comes from the report's stored period, never from the page or browser date math.
+      expect(live.committed()).toEqual(current);
+      expect(live.comparison()).toEqual(previous);
+      expect(document.querySelector("#date-region p")!.textContent).toBe(`${display(current[0])} - ${display(current[1])} compared to ${display(previous[0])} - ${display(previous[1])}`);
+    } finally { restore(); }
+  }, 20_000);
+
+  // Live run dfedae86: each range is one combined control whose values only its calendar changes.
+  it.each([
+    ["April 2026 vs March 2026, from September compared to the previous year", { year: 2026, month: 4 }, ["Apr 01, 2026", "Apr 30, 2026"], ["Mar 01, 2026", "Mar 31, 2026"]],
+    ["January 2026 vs December 2025", { year: 2026, month: 1 }, ["Jan 01, 2026", "Jan 31, 2026"], ["Dec 01, 2025", "Dec 31, 2025"]],
+    ["March 2028 vs leap-year February 2028", { year: 2028, month: 3 }, ["Mar 01, 2028", "Mar 31, 2028"], ["Feb 01, 2028", "Feb 29, 2028"]],
+  ] as const)("Month Comparison through both range calendars: %s", async (_case, month, current, previous) => {
+    const live = livePickerPage(true, { initialRange: "Sep 1, 2026 - Sep 30, 2026 compared to previous year", comparisonDefault: "Previous year", comparisonItems: ["Previous period", "Previous year", "Custom"], storedComparison: ["Sep 01, 2025", "Sep 30, 2025"] });
+    const commitOn = (input: HTMLInputElement) => () => input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    const [rangeStart, rangeEnd] = Array.from(document.querySelectorAll<HTMLInputElement>("#range input"));
+    const [comparisonStart, comparisonEnd] = Array.from(document.querySelectorAll<HTMLInputElement>("#cmp-range input"));
+    const current_ = installRangeCalendar(rangeStart!, rangeEnd!, { startDate: "2026-09-01", endDate: "2026-09-30" }, { outsideDays: "labelled", onChange: commitOn(rangeStart!) });
+    const comparison_ = installRangeCalendar(comparisonStart!, comparisonEnd!, { startDate: "2025-09-01", endDate: "2025-09-30" }, { onChange: commitOn(comparisonStart!) });
+    const report = getReportPeriod(month);
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, report);
+    expect(outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify((outcome as { diagnostics?: Record<string, unknown> }).diagnostics?.periodSetting).slice(0, 2500)}`).toBe("ok");
+    expect(current_.clicked()).toEqual([`start:${report.startDate}`, `end:${report.endDate}`]);
+    // The previous calendar month comes from the report's stored period, never from "Previous period" or browser math.
+    expect(comparison_.clicked()).toEqual([`start:${report.previousStartDate}`, `end:${report.previousEndDate}`]);
+    expect(live.committed()).toEqual(current); expect(live.comparison()).toEqual(previous);
+    expect(document.querySelector("#date-region p")!.textContent).toBe(`${display(current[0])} - ${display(current[1])} compared to ${display(previous[0])} - ${display(previous[1])}`);
+  }, 40_000);
+
   it("fails closed with COMPARISON_PERIOD_NOT_CONFIRMED when Klaviyo still shows Sep 1–30 compared to Jul 1–31", async () => {
     livePickerPage(true, { comparisonIgnored: true });
     const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 9 }), 6_000, 3_000);
     expect(outcome).toMatchObject({ ok: false, code: "COMPARISON_PERIOD_NOT_CONFIRMED", diagnostics: { periodSetting: { regionAfter: expect.stringContaining("Sep 1, 2026 - Sep 30, 2026 compared to Jul 1, 2026 - Jul 31, 2026") } } });
+  }, 25_000);
+
+  // Live 2026-11-04 (runs bec0e780, 95661f3d): the dashboard reset to "Oct 4 – Nov 3, 2026 compared to previous year",
+  // the Comparison period menu gained "Previous year" and renders unroled options, and "Custom reports" is painted in
+  // the Analytics sidebar. The old prefix match clicked the sidebar and the comparison stayed on "Previous year".
+  const previousYearShape = { initialRange: "Oct 4, 2026 - Nov 3, 2026 compared to previous year", comparisonDefault: "Previous year", comparisonItems: ["Previous period", "Previous year", "Custom"], plainOptions: true, sidebar: true };
+
+  it("switches a 'Previous year' comparison to Custom Aug 1–31 for September, never clicking the sidebar's Custom reports", async () => {
+    const live = livePickerPage(true, previousYearShape);
+    const sidebarClicked = vi.fn(); document.querySelector("#custom-reports")!.addEventListener("click", sidebarClicked);
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 9 }));
+    expect(outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify((outcome as { diagnostics?: Record<string, unknown> }).diagnostics?.periodSetting)}`).toBe("ok");
+    expect(live.committed()).toEqual(["Sep 01, 2026", "Sep 30, 2026"]);
+    expect(live.comparison()).toEqual(["Aug 01, 2026", "Aug 31, 2026"]);
+    expect(sidebarClicked).not.toHaveBeenCalled();
+    expect(document.querySelector("#date-region p")!.textContent).toBe("Sep 1, 2026 - Sep 30, 2026 compared to Aug 1, 2026 - Aug 31, 2026");
+  }, 15_000);
+
+  it("selects a Custom option that only responds to a full mouse press", async () => {
+    const live = livePickerPage(true, { ...previousYearShape, selectOnMouseDown: true });
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 9 }));
+    expect(outcome.ok ? "ok" : `${outcome.code}: ${JSON.stringify((outcome as { diagnostics?: Record<string, unknown> }).diagnostics?.periodSetting)}`).toBe("ok");
+    expect(live.comparison()).toEqual(["Aug 01, 2026", "Aug 31, 2026"]);
+  }, 15_000);
+
+  it("fails closed, listing the offered options, when the Comparison period menu has no Custom option", async () => {
+    livePickerPage(true, { ...previousYearShape, comparisonItems: ["Previous period", "Previous year"] });
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 9 }));
+    expect(outcome).toMatchObject({ ok: false, code: "COMPARISON_PERIOD_NOT_CONFIRMED", diagnostics: { periodSetting: { comparisonCustomChosen: false, comparisonPickerAfter: "Previous year", comparisonChoice: { attempts: [{ strategy: "click", options: ["Previous period", "Previous year"], clicked: null }, { strategy: "press", clicked: null }] } } } });
+    expect(document.querySelector("#date-region p")!.textContent).toBe("Oct 4, 2026 - Nov 3, 2026 compared to previous year");
+  }, 20_000);
+
+  it("fails closed when Apply leaves the comparison on previous year", async () => {
+    livePickerPage(true, { ...previousYearShape, comparisonIgnored: true, storedComparison: ["previous year", ""] as unknown as [string, string] });
+    const outcome = await prepareBusinessReviewCaptureDocument(BUSINESS_REVIEW_TARGETS.month_comparison, getReportPeriod({ year: 2026, month: 9 }), 6_000, 3_000);
+    expect(outcome).toMatchObject({ ok: false, code: "COMPARISON_PERIOD_NOT_CONFIRMED" });
   }, 25_000);
 
   it("accepts Sep 1–30 compared to Aug 1–31 as already set, without opening the picker", async () => {

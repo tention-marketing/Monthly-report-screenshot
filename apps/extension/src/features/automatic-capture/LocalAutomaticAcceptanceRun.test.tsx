@@ -24,12 +24,17 @@ function importedReport() {
 
 afterEach(() => { vi.restoreAllMocks(); });
 
+/** Business performance summary DOM text (values as Klaviyo renders them). */
+const COVER_VALUES = { totalRevenue: "$584,032.35", totalAttributedRevenue: "$173,849.26", emailAttributedRevenue: "$156,674.44", smsAttributedRevenue: "$17,174.82", campaignRevenue: "$56,527.51", flowRevenue: "$117,321.75", visiblePeriodText: "Aug 1, 2026 - Aug 31, 2026" };
+
 function readyState(request: ExecutiveSummaryAutoCaptureRequest) {
   return {
     request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Aug 1, 2026 - Aug 31, 2026",
     periodEvidence: { startDate: "2026-08-01", endDate: "2026-08-31", ...(request.screenshotType === "month_comparison" ? { comparisonStartDate: "2026-07-01", comparisonEndDate: "2026-07-31" } : {}) },
-    target: { x: 0, y: 0, width: 5, height: 5, viewportWidth: 10, viewportHeight: 10, availableRowCount: request.screenshotType === "top_campaigns" ? 3 : request.screenshotType === "top_flows" ? 5 : undefined, visibleControls: [], stageTimingsMs: { navigationMs: 3, pageReadyMs: 4, periodSetMs: 5, cardResolveMs: 6, viewSwitchMs: 7, contentReadyMs: 8 } },
+    target: { x: 0, y: 0, width: 720, height: 450, viewportWidth: 1440, viewportHeight: 900, availableRowCount: request.screenshotType === "top_campaigns" ? 3 : request.screenshotType === "top_flows" ? 5 : undefined, visibleControls: [], stageTimingsMs: { navigationMs: 3, pageReadyMs: 4, periodSetMs: 5, cardResolveMs: 6, viewSwitchMs: 7, contentReadyMs: 8 } },
     captured: { sourceUrl: request.accountUrl, isKlaviyo: true, tabId: 7, dataUrl: "data:image/png;base64,AA==" },
+    // The Executive Summary capture carries the report cover values read from the period-verified card.
+    ...(request.screenshotType === "overview" ? { businessPerformanceEvidence: COVER_VALUES } : {}),
     ...(request.screenshotType === "top_campaigns" ? { campaignsEvidence: {
       accountIdentity: request.clientName ?? "", clientTimezone: request.clientTimezone ?? "", visibleMetricLabel: "Placed Order", rankingMethod: "klaviyo-native-sort" as const, eligibleRowCount: 3, includedRowCount: 3,
       rows: [3, 2, 1].map((placedOrderValue) => ({ name: `Campaign ${placedOrderValue}`, type: "Email", status: "Sent" as const, sendDate: "2026-08-10", openRate: null, clickRate: null, placedOrderValue })),
@@ -78,6 +83,29 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     expect(report.screenshots).toHaveLength(0);
   }, 15_000);
 
+  it("never uploads an Executive Summary whose cover values were not read; it names the missing metric and retries", async () => {
+    mockCropEnvironment();
+    const api = {
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn().mockResolvedValue({ sha256: "a".repeat(64), byteSize: 3 }), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+      importLocalAutomaticCaptureRun: vi.fn(),
+    } as unknown as ApiClient;
+    const service: AutoCaptureService = {
+      start: vi.fn().mockImplementation(async (request) => request.screenshotType === "overview"
+        ? { ...readyState(request), businessPerformanceEvidence: null, businessPerformanceIssues: ["Revenue from Flows was not found beside its label on the Business performance summary."] }
+        : readyState(request)),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+    };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 20_000 });
+    const sectionSaves = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map((call) => JSON.stringify(call));
+    expect(sectionSaves.some((call) => call.includes("EXECUTIVE_SUMMARY_METRICS_UNVERIFIED") && call.includes("Revenue from Flows was not found"))).toBe(true);
+    // Retried (a card that is not ready), and no section ever passed or was imported.
+    expect(vi.mocked(service.start).mock.calls.filter(([request]) => request.screenshotType === "overview").length).toBeGreaterThan(1);
+    expect(sectionSaves.some((call) => call.includes('"status":"pass"'))).toBe(false);
+    expect(api.importLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+  }, 30_000);
+
   it("fails a schema-invalid source proof on its first attempt with the exact field instead of retrying", async () => {
     mockCropEnvironment();
     const api = {
@@ -115,6 +143,49 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     expect(service.start).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/FAIL after 1 attempt/)).toBeInTheDocument();
   });
+
+  it("never uploads a capture taken narrower than the safe width; it retries and finally pauses with the exact code", async () => {
+    mockCropEnvironment();
+    const api = {
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn().mockResolvedValue({ sha256: "a".repeat(64) }), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+    const narrow = (request: ExecutiveSummaryAutoCaptureRequest) => { const state = readyState(request); return { ...state, target: { ...state.target, x: 0, y: 0, width: 487, height: 440, viewportWidth: 974, viewportHeight: 881 } }; };
+    const service: AutoCaptureService = {
+      start: vi.fn().mockImplementation(async (request) => narrow(request)),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+    };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 });
+    expect(service.start).toHaveBeenCalledTimes(5);
+    expect(screen.getByText(/KLAVIYO_VIEWPORT_TOO_NARROW/)).toBeInTheDocument();
+    const uploads = vi.mocked(api.saveLocalAutomaticCaptureEvidence).mock.calls;
+    expect(uploads.filter(([, , kind]) => kind === "capture")).toHaveLength(0);
+    const failed = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.find(([, , result]) => result.status === "fail");
+    expect(failed?.[2]).toEqual(expect.objectContaining({ errorCode: "KLAVIYO_VIEWPORT_TOO_NARROW" }));
+  }, 15_000);
+
+  it("caps an oversized observed-period region so the failure is recorded and the section retries instead of pausing", async () => {
+    const regionText = `Time period Oct 4, 2026 - Nov 3, 2026 compared to previous year ${"Growth overview Campaign performance summary ".repeat(30)}`;
+    const api = {
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+    } as unknown as ApiClient;
+    const service: AutoCaptureService = {
+      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "REPORT_PERIOD_NOT_CONFIRMED" as const, message: "The requested report period could not be selected safely.", diagnostics: { observedPeriod: regionText, dateControlState: { regionText } } })),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+    };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 });
+    const failures = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map(([, , result]) => result).filter((result) => result.status === "fail");
+    expect(failures.length).toBeGreaterThan(1); // retried rather than paused on a rejected diagnostic write
+    for (const failure of failures) {
+      expect(failure.observedPeriod!.length).toBeLessThanOrEqual(500);
+      expect(failure.observedPeriod!.startsWith("Time period Oct 4, 2026 - Nov 3, 2026")).toBe(true);
+      expect((failure.diagnostics as { dateControlState: { regionText: string } }).dateControlState.regionText).toBe(regionText);
+    }
+    expect(screen.queryByText(/Backend did not acknowledge attempt diagnostics/)).not.toBeInTheDocument();
+  }, 15_000);
 
   it("names a rows failure as a content failure with its exact code, never as a view failure", async () => {
     const api = {
@@ -225,6 +296,82 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/service worker is running build 2000-01-01T00:00:00.000Z.*Reload the extension/));
     expect(api.startLocalAutomaticCaptureRun).not.toHaveBeenCalled();
     expect(service.start).not.toHaveBeenCalled();
+  });
+
+  const normalized = { ok: true as const, tabId: 7, originalZoom: 1.25, captureZoom: 0.75, changed: true, viewport: { width: 1467, height: 1733, devicePixelRatio: 1.5 } };
+  const restored = { restored: true, tabId: 7, originalZoom: 1.25, zoomAfter: 1.25 };
+
+  it("creates no capture run when the viewport cannot be normalized, and restores the user's zoom", async () => {
+    const api = { startLocalAutomaticCaptureRun: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn() } as unknown as ApiClient;
+    const service: AutoCaptureService = { start: vi.fn(), get: vi.fn(), clear: vi.fn(),
+      normalizeKlaviyoViewport: vi.fn().mockResolvedValue({ ok: false, code: "KLAVIYO_VIEWPORT_CANNOT_BE_NORMALIZED", message: "Even at 50% zoom Klaviyo is only 1200 px wide (at least 1390 px is needed). The Chrome window itself is too narrow: make the window wider, then start again.", originalZoom: 1, viewport: { width: 1200, height: 900, devicePixelRatio: 1 } }),
+      restoreKlaviyoZoom: vi.fn().mockResolvedValue({ restored: false, tabId: null, originalZoom: null, zoomAfter: null }) };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/Chrome window itself is too narrow/));
+    expect(api.startLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+    expect(service.start).not.toHaveBeenCalled();
+    await waitFor(() => expect(service.restoreKlaviyoZoom).toHaveBeenCalledTimes(1));
+  });
+
+  it("normalizes the viewport before the run and before each capture, captures only afterwards, and restores the zoom on success", async () => {
+    mockCropEnvironment();
+    const order: string[] = [];
+    const plan = getAutomaticCapturePlan(report).slice(0, 1);
+    const api = {
+      startLocalAutomaticCaptureRun: vi.fn(async () => { order.push("run-created"); }), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn().mockResolvedValue({ sha256: "a".repeat(64) }), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+      importLocalAutomaticCaptureRun: vi.fn(async () => importedReport()),
+    } as unknown as ApiClient;
+    const service: AutoCaptureService = {
+      start: vi.fn().mockImplementation(async (request: ExecutiveSummaryAutoCaptureRequest) => { order.push("capture"); return readyState(request); }), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+      normalizeKlaviyoViewport: vi.fn(async () => { order.push("normalize"); return normalized; }),
+      restoreKlaviyoZoom: vi.fn(async () => { order.push("restore"); return restored; }),
+    };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("Klaviyo zoom restored to 125%.")).toBeInTheDocument());
+    expect(order).toEqual(["normalize", "run-created", "normalize", "capture", "restore"]);
+    expect(screen.getByText(/Klaviyo zoom: 125% → 75% for capture · viewport 1467 px/)).toBeInTheDocument();
+    const pass = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.find(([, , result]) => result.status === "pass")![2];
+    expect(pass.diagnostics).toMatchObject({ viewportNormalization: { originalZoom: 1.25, captureZoom: 0.75 } });
+  });
+
+  it("re-normalizes and retries, never uploading the clipped capture, when the zoom changes mid-run", async () => {
+    mockCropEnvironment();
+    const plan = getAutomaticCapturePlan(report).slice(0, 1);
+    const api = {
+      startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined),
+      saveLocalAutomaticCaptureEvidence: vi.fn().mockResolvedValue({ sha256: "a".repeat(64) }), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined),
+      importLocalAutomaticCaptureRun: vi.fn(async () => importedReport()),
+    } as unknown as ApiClient;
+    let captures = 0;
+    const service: AutoCaptureService = {
+      // The user zooms back in after normalization: the first capture comes back 974 px wide.
+      start: vi.fn().mockImplementation(async (request: ExecutiveSummaryAutoCaptureRequest) => { captures += 1; const state = readyState(request); return captures === 1 ? { ...state, target: { ...state.target, width: 487, height: 440, viewportWidth: 974, viewportHeight: 881 } } : state; }),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+      normalizeKlaviyoViewport: vi.fn().mockResolvedValue(normalized), restoreKlaviyoZoom: vi.fn().mockResolvedValue(restored),
+    };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(service.restoreKlaviyoZoom).toHaveBeenCalledTimes(1));
+    expect(service.start).toHaveBeenCalledTimes(2);
+    expect(service.normalizeKlaviyoViewport).toHaveBeenCalledTimes(3); // preflight, then before each of the two attempts
+    const writes = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map(([, , result]) => [result.status, result.errorCode]);
+    expect(writes).toContainEqual(["fail", "KLAVIYO_VIEWPORT_TOO_NARROW"]);
+    expect(writes).toContainEqual(["pass", null]);
+    expect(vi.mocked(api.saveLocalAutomaticCaptureEvidence).mock.calls.filter(([, , kind]) => kind === "capture")).toHaveLength(1);
+  });
+
+  it("restores the user's zoom when the run fails", async () => {
+    const api = { startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined) } as unknown as ApiClient;
+    const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACCOUNT_CONTEXT_MISMATCH" as const, message: "Wrong account." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+      normalizeKlaviyoViewport: vi.fn().mockResolvedValue(normalized), restoreKlaviyoZoom: vi.fn().mockResolvedValue(restored) };
+    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByText("Klaviyo zoom restored to 125%.")).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument();
+    expect(service.restoreKlaviyoZoom).toHaveBeenCalledTimes(1);
   });
 
   it("does not start section two until section one capture and backend PASS acknowledgement complete; all nine stay ordered", async () => {

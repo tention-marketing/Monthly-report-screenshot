@@ -44,12 +44,13 @@ describe("Business Review capture navigation", () => {
       setTimeout(() => { order.push("complete"); listeners.forEach((listener) => listener(7, { status: "complete" }, tab)); }, 30);
       return tab;
     });
-    const executeScript = vi.fn().mockImplementation(async () => { order.push("inject"); return [{ frameId: 0, result: { ok: true, sourceUrl: targetUrl, targetRect: { x: 10, y: 20, width: 300, height: 200, viewportWidth: 1200, viewportHeight: 800 }, observedPeriod: { startDate: period.startDate, endDate: period.endDate } } }]; });
+    const executeScript = vi.fn().mockImplementation(async (details: { files?: string[] }) => { order.push(details.files ? "period-helper" : "inject"); return [{ frameId: 0, result: { ok: true, sourceUrl: targetUrl, targetRect: { x: 10, y: 20, width: 300, height: 200, viewportWidth: 1200, viewportHeight: 800 }, observedPeriod: { startDate: period.startDate, endDate: period.endDate } } }]; });
     const chromeApi = { tabs: { get: vi.fn().mockResolvedValue(tab), update, query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true }]), onUpdated: { addListener: (listener: typeof listeners[number]) => listeners.push(listener), removeListener: vi.fn() } }, scripting: { executeScript } };
     const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 1_000, grantStore);
     await expect(navigation.prepare("campaign_performance", period, targetUrl)).resolves.toMatchObject({ kind: "ready" });
     expect(update).toHaveBeenCalledWith(7, { url: targetUrl });
-    expect(order).toEqual(["update", "loading", "complete", "inject"]);
+    // The shared period helper is loaded into the freshly loaded page, then the adapter that uses it.
+    expect(order).toEqual(["update", "loading", "complete", "period-helper", "inject"]);
   });
 
   it("returns a tab left on Klaviyo's global Analytics → Metrics page to the saved Business Review URL and retries there", async () => {
@@ -61,7 +62,7 @@ describe("Business Review capture navigation", () => {
     const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 100, grantStore);
     await expect(navigation.prepare("campaign_metrics", period, targetUrl)).resolves.toMatchObject({ kind: "ready" });
     expect(update).toHaveBeenCalledWith(7, { url: targetUrl });
-    expect(executeScript).toHaveBeenCalledTimes(1);
+    expect(executeScript.mock.calls.filter(([details]) => details.func)).toHaveLength(1);
   });
 
   it("explains a null result from a replaced document, then loads the dashboard fresh again on the next attempt and passes", async () => {
@@ -105,10 +106,11 @@ describe("Business Review capture navigation", () => {
     const chromeApi = { tabs: { get, update: vi.fn().mockResolvedValue(tab), query: vi.fn().mockResolvedValue([{ id: 7, windowId: 3, active: true }]), onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } }, scripting: { executeScript } };
     const navigation = new ChromeBusinessReviewCaptureNavigation(chromeApi, 100, grantStore);
     await expect(navigation.prepare("campaign_metrics", period, targetUrl)).resolves.toMatchObject({ kind: "ready" });
-    expect(executeScript.mock.calls[0]![0].args).toHaveLength(2);
+    const adapterCalls = () => executeScript.mock.calls.filter(([details]) => details.func);
+    expect(adapterCalls()[0]![0].args).toHaveLength(2);
     const callsBefore = get.mock.calls.length;
     await expect(navigation.prepare("campaign_metrics", period, targetUrl, { actions: ["fresh-source", "settle-before-inject", "extended-readiness"] })).resolves.toMatchObject({ kind: "ready" });
-    expect(executeScript.mock.calls[1]![0].args).toEqual([expect.objectContaining({ sectionKey: "campaign_metrics" }), period, 6_000, 30_000]);
+    expect(adapterCalls()[1]![0].args).toEqual([expect.objectContaining({ sectionKey: "campaign_metrics" }), period, 6_000, 30_000]);
     expect(get.mock.calls.length - callsBefore).toBeGreaterThanOrEqual(6); // polled until loaded for 1.5 s
   }, 15_000);
 

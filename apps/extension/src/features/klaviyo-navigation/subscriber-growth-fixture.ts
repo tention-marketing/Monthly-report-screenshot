@@ -23,6 +23,15 @@ export interface SubscriberGrowthFixtureOptions {
   /** Natural page top of the reporting area; > viewport height puts it below the fold. */
   contentTop?: number; contentHeight?: number;
   composer?: boolean;
+  /**
+   * "email-only" reproduces Purely Nutrient (run 8fa3b760, 2026-11-11): no Overview | Email | Text message channel tabs,
+   * the page opens straight on the "Email subscribers" card, and its numbers are themselves headings.
+   */
+  layout?: "channel-tabs" | "email-only";
+  /** Extra markup rendered beside the date control, or inside the Email subscribers card. `data-rect="x,y,w,h"` sets its geometry (y relative to the reporting area). */
+  pageExtras?: string; cardExtras?: string;
+  /** "long" renders an applied range as Klaviyo does live ("October 1 – 31, 2026"). */
+  periodFormat?: "numeric" | "long";
 }
 
 export interface SubscriberGrowthFixture { clicks: string[]; state: Required<Pick<SubscriberGrowthFixtureOptions, "channel" | "view" | "period">>; composer: HTMLElement | null }
@@ -35,8 +44,9 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
   Object.defineProperty(window, "innerWidth", { configurable: true, value: viewport.width });
   Object.defineProperty(window, "innerHeight", { configurable: true, value: viewport.height });
   window.history.replaceState({}, "", `${options.path ?? "/people/subscribers"}?range=last_7_days#overview`);
-  const fixture: SubscriberGrowthFixture = { clicks: [], state: { channel: options.channel ?? "Overview", view: options.view ?? "Growth", period: options.period ?? "Last 7 days" }, composer: null };
-  const metrics = { "Email subscribers": "17,698", "New subscribers": "943", Exclusions: "499", ...options.metrics };
+  const emailOnly = options.layout === "email-only";
+  const fixture: SubscriberGrowthFixture = { clicks: [], state: { channel: emailOnly ? "Email" : options.channel ?? "Overview", view: options.view ?? "Growth", period: options.period ?? "Last 7 days" }, composer: null };
+  const metrics = { ...(emailOnly ? { "Email subscribers": "34,487", "New subscribers": "882", Exclusions: "44" } : { "Email subscribers": "17,698", "New subscribers": "943", Exclusions: "499" }), ...options.metrics };
   const delay = options.renderDelayMs ?? 0;
   let scrollShift = 0;
   const contentTop = options.contentTop ?? 80; const contentHeight = options.contentHeight ?? 900;
@@ -52,14 +62,35 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
     const showCharts = () => {
       container.querySelector("#charts")!.innerHTML = `${options.lineChart === false ? "" : `<svg id="line"><path class="line" d="M0 0 L10 10 L20 5 L30 8" stroke="#3355ff" fill="none"></path></svg>`}${options.barChart === "none" ? "" : `<svg id="bar">${bars}</svg>`}`;
     };
-    container.innerHTML = `<h2>Email subscribers</h2><div role="tablist" id="views">${(options.hasGrowthView === false ? ["Opt-in sources", "Exclusion sources"] : ["Growth", "Opt-in sources", "Exclusion sources"]).map((name) => tab(name, fixture.state.view === name, "view")).join("")}</div><div id="metrics"></div><div id="charts"></div>${options.spinner ? `<div role="progressbar">Loading</div>` : ""}`;
+    const views = `<div role="tablist" id="views">${(options.hasGrowthView === false ? ["Opt-in sources", "Exclusion sources"] : ["Growth", "Opt-in sources", "Exclusion sources"]).map((name) => tab(name, fixture.state.view === name, "view")).join("")}</div>`;
+    container.innerHTML = `<h2>Email subscribers</h2>${views}<div id="metrics"></div><div id="charts"></div>${options.spinner ? `<div role="progressbar">Loading</div>` : ""}${options.cardExtras ?? ""}`;
+    if (fixture.state.view !== "Growth") { container.querySelector("#metrics")!.innerHTML = `<p>${fixture.state.view} table</p>`; return; }
+    if (options.metricsDelayMs) setTimeout(showMetrics, options.metricsDelayMs); else showMetrics();
+    if (options.chartsDelayMs) setTimeout(showCharts, options.chartsDelayMs); else showCharts();
+  };
+  const renderEmailOnly = (container: HTMLElement) => {
+    const views = `<div role="tablist" id="views">${(options.hasGrowthView === false ? ["Opt-in sources", "Exclusion sources"] : ["Growth", "Opt-in sources", "Exclusion sources"]).map((name) => tab(name, fixture.state.view === name, "view")).join("")}</div>`;
+    const value = (name: keyof typeof metrics, change: string) => metrics[name] === null ? "" : `<div class="metric">${name === "Email subscribers" ? `<h2>${name}</h2>` : `<span>${name}</span>`}<h3>${metrics[name]}</h3><span>${change}</span></div>`;
+    const showMetrics = () => { container.querySelector("#head")!.innerHTML = value("Email subscribers", "+1.4%"); container.querySelector("#metrics")!.innerHTML = `${value("New subscribers", "+12%")}${value("Exclusions", "-8%")}`; };
+    const bars = options.barChart === "empty" ? "" : `<rect class="mark" fill="#3355ff" width="10" height="50"></rect><rect class="mark" fill="#ff5533" width="10" height="40"></rect>`;
+    const showCharts = () => {
+      container.querySelector("#growth-chart")!.innerHTML = `<h3>Subscriber growth</h3>${options.lineChart === false ? "" : `<svg id="line"><path class="line" d="M0 0 L10 10 L20 5 L30 8" stroke="#3355ff" fill="none"></path></svg>`}`;
+      container.querySelector("#charts")!.innerHTML = `<h3>Changes to subscribers</h3>${options.barChart === "none" ? "" : `<svg id="bar">${bars}</svg>`}`;
+    };
+    // Live order: Email subscribers 34,487 · Subscriber growth line chart · New subscribers 882 · Exclusions 44 · Changes to subscribers bar chart.
+    container.innerHTML = `<div id="head"><h2>Email subscribers</h2></div>${views}<div id="growth-chart"></div><div id="metrics"></div><div id="charts"></div>${options.spinner ? `<div role="progressbar">Loading</div>` : ""}${options.cardExtras ?? ""}`;
     if (fixture.state.view !== "Growth") { container.querySelector("#metrics")!.innerHTML = `<p>${fixture.state.view} table</p>`; return; }
     if (options.metricsDelayMs) setTimeout(showMetrics, options.metricsDelayMs); else showMetrics();
     if (options.chartsDelayMs) setTimeout(showCharts, options.chartsDelayMs); else showCharts();
   };
   const render = () => {
+    if (emailOnly) {
+      main.innerHTML = `<h1>${options.heading ?? "Subscriber growth"}</h1><button id="date">${fixture.state.period}</button>${options.pageExtras ?? ""}<section id="content"></section>`;
+      renderEmailOnly(main.querySelector<HTMLElement>("#content")!);
+      return;
+    }
     const channels = (["Overview", ...(options.hasEmailTab === false ? [] : ["Email"]), "Text message"] as Channel[]).map((name) => tab(name, fixture.state.channel === name, "channel")).join("");
-    main.innerHTML = `<h1>${options.heading ?? "Subscriber growth"}</h1><div role="tablist" id="channels">${channels}</div><button id="date">${fixture.state.period}</button><section id="content"></section>`;
+    main.innerHTML = `<h1>${options.heading ?? "Subscriber growth"}</h1><div role="tablist" id="channels">${channels}</div><button id="date">${fixture.state.period}</button>${options.pageExtras ?? ""}<section id="content"></section>`;
     const content = main.querySelector<HTMLElement>("#content")!;
     if (fixture.state.channel === "Overview") content.innerHTML = `<h2>Subscriber overview</h2><p>Email 17,698 · Text message 2,104</p><h2>Subscriber trends</h2><svg id="trend"><path d="M0 0 L5 5 L9 2" stroke="#000" fill="none"></path></svg>`;
     else if (fixture.state.channel === "Text message") content.innerHTML = `<h2>Text message subscribers</h2><p>2,104</p>`;
@@ -87,7 +118,9 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
       const [start, end] = Array.from(document.querySelectorAll<HTMLInputElement>("[role=dialog] input")).map((input) => input.value);
       document.querySelector("[role=dialog]")!.remove();
       fixture.clicks.push("Apply");
-      if (options.picker === "inputs") { fixture.state.period = `${start} – ${end}`; rerender(); }
+      const long = (value: string | undefined) => { const [month, day, year] = (value ?? "").split("/").map(Number); return { month: new Date(Date.UTC(year!, month! - 1, 1)).toLocaleString("en-US", { month: "long", timeZone: "UTC" }), day, year }; };
+      const label = () => { const a = long(start); const b = long(end); return a.month === b.month && a.year === b.year ? `${a.month} ${a.day} – ${b.day}, ${b.year}` : `${start} – ${end}`; };
+      if (options.picker === "inputs") { fixture.state.period = options.periodFormat === "long" ? label() : `${start} – ${end}`; rerender(); }
     }
   };
   document.addEventListener("click", activeClickHandler);
@@ -104,7 +137,11 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
   const pageWidth = () => Math.min(1400, window.innerWidth - 20);
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
     const top = contentTop - scrollShift; const width = pageWidth();
+    const explicit = this.getAttribute("data-rect");
+    if (explicit) { const [x, y, w, h] = explicit.split(",").map(Number); return rect(x!, top + y!, w!, h!); }
     if (this.id === "page") return rect(10, top, width, contentHeight);
+    // The bordered Email subscribers card inside the reporting area: Growth view, metrics, and both charts.
+    if (this.id === "content") return rect(30, top + 110, width - 40, 690);
     if (this.id === "composer") return (this as HTMLElement).style.visibility === "hidden" ? rect(0, 0, 0, 0) : rect(window.innerWidth - 360, window.innerHeight - 300, 340, 100);
     if (this.id === "line") return rect(40, top + 420, width - 60, 160);
     if (this.id === "bar") return rect(40, top + 620, width - 60, 160);

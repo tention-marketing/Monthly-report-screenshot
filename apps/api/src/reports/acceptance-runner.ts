@@ -43,7 +43,7 @@ async function main(): Promise<void> {
     welcomeFlowListing: { mode: "email_welcome_flows", flows: [{ id: "fixture-email-1", name: "Fixture Email Welcome 1", channel: "email" }, { id: "fixture-email-2", name: "Fixture Email Welcome 2", channel: "email" }] },
     customerSegment: null, nonCustomerSegment: null, signupForms: { mode: "all", ids: [], names: [] },
   }, NOW);
-  const app = buildApp({
+  const app = buildApp({ requireClientSetupReady: false,
     now: () => new Date(NOW),
     screenshotStorage: new LocalFilesystemScreenshotStorage(resolve(OUTPUT_DIRECTORY, "screenshots")),
     pdfArtifactStorage: new LocalFilesystemPdfArtifactStorage(resolve(OUTPUT_DIRECTORY, "artifacts")),

@@ -1,4 +1,5 @@
 import type { ReportPeriod, ScreenshotType, SubscriberGrowthEvidence } from "@tention/report-schema";
+import type { PeriodEntryApi } from "./injected/period-entry-contract.js";
 
 export interface SubscriberGrowthTargetBounds {
   x: number; y: number; width: number; height: number; viewportWidth: number; viewportHeight: number;
@@ -104,14 +105,118 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       const viewTabs = () => { const all = tabControls(); return all.filter((node) => viewPattern.test(text(node)) && all.some((other) => other !== node && viewPattern.test(text(other)) && near(node, other))); };
       const tabState = () => ({ channel: channelTabs().map((node) => ({ text: text(node), selected: isSelected(node) })), view: viewTabs().map((node) => ({ text: text(node), selected: isSelected(node) })) });
       const spinnerSelector = "[aria-busy=true],[role=progressbar],[data-loading=true],[data-asc=Spinner],[class*=skeleton i],[class*=spinner i]";
+
+      // Page identity, by visible text only. Klaviyo renders two layouts of this page: accounts with SMS get the
+      // Overview | Email | Text message channel tabs (Faceables, Steven Dann); an email-only account (Purely Nutrient,
+      // run 8fa3b760, 2026-11-11) gets no channel tabs at all and opens directly on the "Email subscribers" card. Requiring
+      // the channel tabs made every Purely Nutrient attempt a false SUBSCRIBER_GROWTH_PAGE_NOT_READY.
+      const headingNodes = () => Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,[role=heading]")).filter(shown);
+      const headings = () => headingNodes().map(text);
+      const pageIdentityFound = () => headings().some((value) => /^subscriber(s| growth| overview| trends)?$/i.test(value));
+      const emailHeading = () => headingNodes().find((node) => /^email subscribers$/i.test(text(node)));
+      const otherChannelHeading = () => headings().some((value) => /^(?:text message|sms) subscribers$/i.test(value));
+      const emailTab = () => channelTabs().find((node) => /^email$/i.test(text(node)));
+      const growthTab = () => viewTabs().find((node) => /^growth$/i.test(text(node)));
+      // Email-only layout: no channel switcher exists, and the card shown is "Email subscribers" (never Text message).
+      const singleChannelEmail = () => channelTabs().length === 0 && !otherChannelHeading() ? emailHeading() ?? null : null;
+      const isSubscriberGrowthPage = () => pageIdentityFound() && Boolean(emailTab() || singleChannelEmail());
+
+      // Date control nearest the Growth view.
+      const controls = () => Array.from(document.querySelectorAll("button,[role=button],[role=combobox],input,select")).filter(shown);
+      const rollingRange = /^(?:last \d+ (?:days?|weeks?|months?)|(?:this|last) (?:week|month|quarter|year)|all time|today|yesterday|custom(?: range)?)$/i;
+      const depth = (node: Element | null) => { let count = 0; for (let current = node; current; current = current.parentElement) count += 1; return count; };
+      const sharedDepth = (node: Element, other: Element) => { const chain = new Set<Element>(); for (let current: Element | null = node; current; current = current.parentElement) chain.add(current); for (let current: Element | null = other; current; current = current.parentElement) if (chain.has(current)) return depth(current); return 0; };
+      const controlValue = (node: Element) => node instanceof HTMLInputElement ? normalize(node.value) : text(node);
+      const dateFilter = () => { const anchor = growthTab(); return controls().map((node) => ({ node, value: controlValue(node) })).filter(({ value }) => value.length <= 60 && (rollingRange.test(value) || parsePeriod(value) !== null)).map((candidate) => ({ ...candidate, proximity: anchor ? sharedDepth(candidate.node, anchor) : 0 })).sort((a, b) => b.proximity - a.proximity)[0]?.node ?? null; };
+
+      // Metrics: exact whole numbers beside their own labels, outside the charts.
+      const metricLabels = { emailSubscribers: "email subscribers", newSubscribers: "new subscribers", exclusions: "exclusions" } as const;
+      const inChart = (node: Element) => Boolean(node.closest("svg,canvas"));
+      const readMetric = (wanted: string) => {
+        const labels = Array.from(document.querySelectorAll("body *")).filter((node) => node.children.length === 0 || Array.from(node.children).every((child) => !text(child)))
+          .filter((node) => key(text(node)) === wanted && shown(node) && !inChart(node));
+        for (const labelNode of labels) {
+          for (let container: Element | null = labelNode.parentElement, level = 0; container && level < 4; container = container.parentElement, level += 1) {
+            if (container.querySelector("svg path,svg rect,canvas") && container.querySelector("svg")?.getBoundingClientRect().width! > 60) break;
+            if (Object.values(metricLabels).some((other) => other !== wanted && key(text(container!)).includes(other))) break;
+            const rest = key(text(container)).replace(wanted, " ");
+            const changeText = rest.match(/[+\-−–]?\s?\d+(?:[.,]\d+)?\s?%/)?.[0]?.replace(/\s+/g, "") ?? null;
+            const token = rest.replace(/[+\-−–]?\s?\d+(?:[.,]\d+)?\s?%/g, " ").match(/(?:^|\s)(\d[\d,.]*\s?[kmb]?)(?=\s|$)/)?.[1]?.trim();
+            if (!token) continue;
+            const exact = /^\d{1,3}(?:,\d{3})+$|^\d+$/.test(token);
+            return { node: container, token, value: exact ? Number(token.replace(/,/g, "")) : null, change: changeText };
+          }
+        }
+        return null;
+      };
+      const readMetrics = () => { const values = { emailSubscribers: readMetric(metricLabels.emailSubscribers), newSubscribers: readMetric(metricLabels.newSubscribers), exclusions: readMetric(metricLabels.exclusions) }; return values.emailSubscribers && values.newSubscribers && values.exclusions ? values as { [K in keyof typeof values]: NonNullable<typeof values[K]> } : null; };
+
+      // Charts: a plotted line chart and a separate plotted bar chart, never a blank or loading surface.
+      const paint = (node: Element, name: "fill" | "stroke") => key(node.getAttribute(name) ?? (getComputedStyle(node) as unknown as Record<string, string>)[name] ?? "");
+      const visiblePaint = (value: string) => Boolean(value) && !/^(none|transparent)$/.test(value) && !/rgba\(.*,\s*0\)$/.test(value);
+      const chartSurfaces = () => Array.from(document.querySelectorAll("svg")).filter((svg) => { const rect = svg.getBoundingClientRect(); return rect.width >= 200 && rect.height >= 80 && shown(svg) && !svg.closest("button,a"); });
+      const describe = (svg: SVGSVGElement) => {
+        const box = svg.getBoundingClientRect();
+        const marks = Array.from(svg.querySelectorAll("path,rect,polyline,line")).filter((node) => !node.closest("defs,clipPath,mask"));
+        const lines = marks.filter((node) => {
+          if (node.tagName.toLowerCase() === "polyline") return (node.getAttribute("points") ?? "").trim().split(/\s+/).length >= 2;
+          if (node.tagName.toLowerCase() !== "path" || !visiblePaint(paint(node, "stroke")) || visiblePaint(paint(node, "fill"))) return false;
+          const rect = node.getBoundingClientRect();
+          return (node.getAttribute("d") ?? "").replace(/^\s*[Mm][^A-Za-z]*/, "").match(/[LlCcHhVvSsQqTtAa]/g)?.length! >= 2 && rect.width >= box.width * 0.4;
+        });
+        const bars = marks.filter((node) => {
+          if (!["rect", "path"].includes(node.tagName.toLowerCase()) || !visiblePaint(paint(node, "fill"))) return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width >= 1 && rect.height >= 1 && rect.width <= box.width * 0.5;
+        });
+        return { svg, lines: lines.length, bars: bars.length, signature: `${Math.round(box.width)}x${Math.round(box.height)}:${marks.length}:${marks.map((node) => `${node.getAttribute("d")?.length ?? 0}/${Math.round(node.getBoundingClientRect().height)}`).join(",")}` };
+      };
+      const charts = () => {
+        const described = chartSurfaces().map(describe);
+        const line = described.find((chart) => chart.lines >= 1 && chart.bars < 2);
+        const bar = described.find((chart) => chart !== line && chart.bars >= 2);
+        return line && bar ? { line, bar, described } : null;
+      };
+
+      const describeNode = (node: Node) => node instanceof Element ? `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}${typeof node.className === "string" && node.className ? `.${node.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}`.slice(0, 80) : "node";
+      // Loading counts only when a visible loading element lies over the required evidence itself. Spinners left hidden
+      // in the DOM (display:none, visibility:hidden, aria-hidden, zero size, transparent), tooltips, and an unrelated
+      // refresh icon beside the date range never hold the page back.
+      const overlaps = (a: DOMRect, b: DOMRect) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+      const visibleLoading = (evidence: Element[]) => {
+        const boxes = evidence.map((node) => node.getBoundingClientRect()).filter((box) => box.width > 0 && box.height > 0);
+        return Array.from(document.querySelectorAll(spinnerSelector)).filter((node) => shown(node) && getComputedStyle(node).opacity !== "0" && !node.closest("[role=tooltip]")
+          && boxes.some((box) => overlaps(node.getBoundingClientRect(), box)));
+      };
+      // PAGE_READY is semantic evidence only; the report month is checked separately afterwards (an initial "Last 7
+      // days" is a ready page). Every field is recorded on every attempt so a failure names the condition that stayed false.
+      const readiness = () => {
+        const email = emailTab(); const single = singleChannelEmail(); const growth = growthTab();
+        const values = { emailSubscribers: readMetric(metricLabels.emailSubscribers), newSubscribers: readMetric(metricLabels.newSubscribers), exclusions: readMetric(metricLabels.exclusions) };
+        const surfaces = chartSurfaces();
+        const loadingNodes = visibleLoading([growth, single, values.emailSubscribers?.node, values.newSubscribers?.node, values.exclusions?.node, ...surfaces].filter((node): node is Element => Boolean(node)));
+        const date = dateFilter();
+        const channelLayout = channelTabs().length ? "channel-tabs" as const : "email-only" as const;
+        const record = {
+          pageIdentityFound: pageIdentityFound(), emailSubscribersHeadingFound: Boolean(emailHeading()), channelLayout,
+          emailTabFound: Boolean(email), emailTabSelected: email ? isSelected(email) : null,
+          growthTabFound: Boolean(growth), growthTabSelected: Boolean(growth && isSelected(growth)),
+          subscriberValueFound: Boolean(values.emailSubscribers), newSubscribersValueFound: Boolean(values.newSubscribers), exclusionsValueFound: Boolean(values.exclusions),
+          chartBounds: surfaces.map((svg) => { const box = svg.getBoundingClientRect(); return { width: Math.round(box.width), height: Math.round(box.height) }; }),
+          visibleLoadingElements: loadingNodes.slice(0, 6).map(describeNode),
+          periodShown: date ? controlValue(date).slice(0, 120) : null,
+        };
+        const emailReady = channelLayout === "channel-tabs" ? record.emailTabSelected === true : Boolean(single);
+        return { ...record, ready: record.pageIdentityFound && emailReady && record.growthTabSelected && record.subscriberValueFound && record.newSubscribersValueFound && record.exclusionsValueFound && surfaces.length > 0 && loadingNodes.length === 0 };
+      };
+
       let periodProof: Record<string, unknown> | null = null;
-      const failure = (code: SubscriberGrowthFailureCode, message: string, extra: Record<string, unknown> = {}): SubscriberGrowthAdapterResult => ({ ok: false, code, message, diagnostics: { currentUrl: sourceUrl, tabs: tabState(), ...(periodProof ? { periodProof: { ...periodProof } } : {}), stageTimingsMs: { ...timings }, ...extra } });
+      const readinessSnapshot = () => { try { return readiness(); } catch (error) { return { error: error instanceof Error ? error.message.slice(0, 200) : String(error) }; } };
+      const failure = (code: SubscriberGrowthFailureCode, message: string, extra: Record<string, unknown> = {}): SubscriberGrowthAdapterResult => ({ ok: false, code, message, diagnostics: { currentUrl: sourceUrl, tabs: tabState(), readiness: readinessSnapshot(), ...(periodProof ? { periodProof: { ...periodProof } } : {}), stageTimingsMs: { ...timings }, ...extra } });
 
       // 1. Source page: Klaviyo's Subscriber growth reporting area, whichever view it opened on (Overview, Email, …).
-      // It is identified before anything is clicked: a subscriber heading plus the Overview/Email/Text message tabs.
-      const headings = () => Array.from(document.querySelectorAll("h1,h2,h3,h4,[role=heading]")).filter(shown).map(text);
-      const isSubscriberGrowthPage = () => headings().some((value) => /^subscriber(s| growth| overview| trends)?$/i.test(value))
-        && channelTabs().some((node) => /^email$/i.test(text(node)));
+      // It is identified before anything is clicked: a subscriber heading plus either the Email channel tab or, on an
+      // email-only account, the Email subscribers card itself.
       if (!await waitUntil(isSubscriberGrowthPage, forSource ? 8_000 : 25_000)) {
         return forSource ? failure("SUBSCRIBER_GROWTH_SOURCE_WRONG_PAGE", "This tab is not Klaviyo's Subscriber growth page. Open Audience → Profiles → View subscriber growth, then click the Tention toolbar icon.", { headings: headings().slice(0, 8) })
           : failure("SUBSCRIBER_GROWTH_PAGE_NOT_READY", "The authorized tab did not render Klaviyo's Subscriber growth page.", { headings: headings().slice(0, 8) });
@@ -121,7 +226,10 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       // 2. Account: for capture, the visible Klaviyo account must be the report's client. Source setup returns the labels
       // and the panel, which knows the client, refuses to save another account's page.
       const expectedAccount = key(request.clientName);
-      const accountLabels = () => Array.from(document.querySelectorAll("header button,header [role=button],nav button,nav [role=button],[aria-label*=account i],[aria-label*=workspace i],[aria-label*=organization i]")).filter(shown).map(label);
+      // The same account candidates Business Review discovery reads: everything in the header/banner, navigation
+      // controls, and explicit account controls (each label already joins aria-label, title and text).
+      const accountLabels = () => Array.from(document.querySelectorAll("header *,[role=banner] *,nav button,nav [role=button],nav a,aside button,aside [role=button],[aria-label*=account i],[title*=account i],[data-testid*=account i],[aria-label*=workspace i],[aria-label*=organization i]"))
+        .filter(shown).map(label).filter((value) => value && value.length <= 160).filter((value, index, all) => all.indexOf(value) === index).slice(0, 60);
       const accountIdentity = forSource ? null : expectedAccount ? await waitUntil(() => accountLabels().find((value) => key(value).includes(expectedAccount)), 10_000) : null;
       if (!forSource && !accountIdentity) return failure("SUBSCRIBER_GROWTH_ACCOUNT_UNPROVEN", "The Klaviyo account shown could not be proven to be the selected report client.", { expectedClient: request.clientName, accountCandidates: accountLabels().slice(0, 10).map((value) => value.slice(0, 80)) });
 
@@ -135,17 +243,18 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
         if (!await waitUntil(() => { const current = find(); return current && isSelected(current); }, 10_000)) return failure(code, `Klaviyo did not show the ${name} tab as selected.`);
         return null;
       };
-      const emailTab = () => channelTabs().find((node) => /^email$/i.test(text(node)));
-      const growthTab = () => viewTabs().find((node) => /^growth$/i.test(text(node)));
-      const emailFailure = await select(emailTab, "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_FOUND", "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_SELECTED", "Email");
-      if (emailFailure) return emailFailure;
+      // The email-only layout has no Email tab to select: its Email subscribers card is the Email channel.
+      if (emailTab() || !singleChannelEmail()) {
+        const emailFailure = await select(emailTab, "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_FOUND", "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_SELECTED", "Email");
+        if (emailFailure) return emailFailure;
+      }
       const growthFailure = await select(growthTab, "SUBSCRIBER_GROWTH_VIEW_NOT_FOUND", "SUBSCRIBER_GROWTH_VIEW_NOT_SELECTED", "Growth");
       if (growthFailure) return growthFailure;
       // Overview, Text message, Opt-in sources and Exclusion sources are never accepted alongside the canonical view.
       const canonicalTabs = () => {
         const state = tabState();
-        return state.channel.filter(({ selected: on }) => on).map(({ text: value }) => value.toLocaleLowerCase()).join("|") === "email"
-          && state.view.filter(({ selected: on }) => on).map(({ text: value }) => value.toLocaleLowerCase()).join("|") === "growth";
+        const channelIsEmail = state.channel.length ? state.channel.filter(({ selected: on }) => on).map(({ text: value }) => value.toLocaleLowerCase()).join("|") === "email" : Boolean(singleChannelEmail());
+        return channelIsEmail && state.view.filter(({ selected: on }) => on).map(({ text: value }) => value.toLocaleLowerCase()).join("|") === "growth";
       };
       if (!canonicalTabs()) return failure(tabState().channel.some(({ text: value, selected: on }) => on && !/^email$/i.test(value)) ? "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_SELECTED" : "SUBSCRIBER_GROWTH_VIEW_NOT_SELECTED", "Subscriber growth is not showing exactly Email → Growth.");
       mark("viewSwitchMs");
@@ -161,13 +270,23 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       const period = request.period;
       if (!period) return failure("REPORT_PERIOD_NOT_CONFIRMED", "Section 10 capture requires the report month.");
 
-      // 4. Exact report period, read from the date control nearest the Growth view.
-      const controls = () => Array.from(document.querySelectorAll("button,[role=button],[role=combobox],input,select")).filter(shown);
-      const rollingRange = /^(?:last \d+ (?:days?|weeks?|months?)|(?:this|last) (?:week|month|quarter|year)|all time|today|yesterday|custom(?: range)?)$/i;
-      const depth = (node: Element | null) => { let count = 0; for (let current = node; current; current = current.parentElement) count += 1; return count; };
-      const sharedDepth = (node: Element, other: Element) => { const chain = new Set<Element>(); for (let current: Element | null = node; current; current = current.parentElement) chain.add(current); for (let current: Element | null = other; current; current = current.parentElement) if (chain.has(current)) return depth(current); return 0; };
-      const controlValue = (node: Element) => node instanceof HTMLInputElement ? normalize(node.value) : text(node);
-      const dateFilter = () => { const anchor = growthTab(); return controls().map((node) => ({ node, value: controlValue(node) })).filter(({ value }) => value.length <= 60 && (rollingRange.test(value) || parsePeriod(value) !== null)).map((candidate) => ({ ...candidate, proximity: anchor ? sharedDepth(candidate.node, anchor) : 0 })).sort((a, b) => b.proximity - a.proximity)[0]?.node ?? null; };
+      // 4. PAGE_READY: identity, Email channel, Growth selected, all three metrics, a chart with real bounds, and no
+      // visible loading state over that evidence. Whatever period is showing (e.g. "Last 7 days") is not part of it;
+      // the moment every marker holds, the run continues to the period without further waiting.
+      let lastReadiness = readiness();
+      const pageReady = await waitUntil(() => { lastReadiness = readiness(); return lastReadiness.ready ? lastReadiness : null; }, 20_000);
+      if (!pageReady) {
+        const state = lastReadiness;
+        const metricsMissing = ["subscriberValueFound", "newSubscribersValueFound", "exclusionsValueFound"].filter((name) => !state[name as keyof typeof state]);
+        if (state.visibleLoadingElements.length) return failure("SUBSCRIBER_GROWTH_PAGE_NOT_READY", "A visible loading state stayed over the Subscriber growth metrics or charts.", { failedCondition: "visibleLoadingElements" });
+        if (!canonicalTabs()) return failure(tabState().channel.some(({ text: value, selected: on }) => on && !/^email$/i.test(value)) ? "SUBSCRIBER_GROWTH_EMAIL_TAB_NOT_SELECTED" : "SUBSCRIBER_GROWTH_VIEW_NOT_SELECTED", "Subscriber growth stopped showing exactly Email → Growth.", { failedCondition: "tabs" });
+        if (metricsMissing.length) return failure("SUBSCRIBER_GROWTH_METRICS_NOT_RENDERED", "Email subscribers, New subscribers and Exclusions were not all rendered.", { failedCondition: metricsMissing.join(",") });
+        return failure("SUBSCRIBER_GROWTH_CHART_NOT_RENDERED", "No Subscriber growth chart area with visible bounds was rendered.", { failedCondition: "chartBounds" });
+      }
+      mark("readinessMs");
+      const periodBefore = pageReady.periodShown;
+
+      // 5. Exact report period, read from the date control nearest the Growth view.
       const proof = { expectedStart: period.startDate, expectedEnd: period.endDate, visiblePeriodText: null as string | null, parsedStart: null as string | null, parsedEnd: null as string | null, periodMatch: false };
       periodProof = proof;
       const provenPeriod = () => {
@@ -218,9 +337,13 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
         if (picker === "calendar") {
           if (!await pickDay(period.startDate) || !await pickDay(period.endDate)) return failure("SUBSCRIBER_GROWTH_DATE_CONTROL_NOT_FOUND", "The Subscriber growth calendar did not expose the report's first and last days.");
         } else {
-          // React tracks the native value setter: set through it, then dispatch the events React listens for.
-          const setValue = (input: HTMLInputElement, value: string) => { input.focus(); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value); for (const type of ["input", "change"]) input.dispatchEvent(new Event(type, { bubbles: true })); input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); input.dispatchEvent(new Event("blur", { bubbles: true })); };
-          setValue(picker.start, formatFor(period.startDate, picker.start)); setValue(picker.end, formatFor(period.endDate, picker.end));
+          // The shared period helper replaces any range kept from another report and proves the fields hold the
+          // report's exact dates; Apply is never clicked on any other values.
+          const periodEntry = (globalThis as unknown as { __tentionPeriodEntry?: PeriodEntryApi }).__tentionPeriodEntry;
+          if (!periodEntry) return failure("REPORT_PERIOD_NOT_CONFIRMED", "The shared period helper was not loaded, so the report month could not be set. Nothing was captured.");
+          const entry = await periodEntry.enterDateRange({ fields: dateInputs, startDate: period.startDate, endDate: period.endDate, format: (input, iso) => formatFor(iso, input),
+            reselectCustom: async () => { const custom = customOption(); if (!custom) return false; custom.click(); return Boolean(await waitUntil(() => dateInputs(), 3_000)); } });
+          if (!entry.ok) return failure("REPORT_PERIOD_NOT_CONFIRMED", `Klaviyo's Subscriber growth date fields did not accept ${period.startDate} – ${period.endDate}; Apply was not clicked and nothing was captured.`);
         }
         // Only the open picker's own confirm button: never a page-level "Save" or any other action outside the picker.
         const pickerControls = () => { const open = popovers(); return open.length ? controls().filter((node) => open.some((popover) => popover.contains(node))) : []; };
@@ -233,58 +356,13 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       }
       mark("periodSetMs");
 
-      // 5. Metrics: exact whole numbers beside their own labels, outside the charts.
-      const metricLabels = { emailSubscribers: "email subscribers", newSubscribers: "new subscribers", exclusions: "exclusions" } as const;
-      const inChart = (node: Element) => Boolean(node.closest("svg,canvas"));
-      const readMetric = (wanted: string) => {
-        const labels = Array.from(document.querySelectorAll("body *")).filter((node) => node.children.length === 0 || Array.from(node.children).every((child) => !text(child)))
-          .filter((node) => key(text(node)) === wanted && shown(node) && !inChart(node));
-        for (const labelNode of labels) {
-          for (let container: Element | null = labelNode.parentElement, level = 0; container && level < 4; container = container.parentElement, level += 1) {
-            if (container.querySelector("svg path,svg rect,canvas") && container.querySelector("svg")?.getBoundingClientRect().width! > 60) break;
-            if (Object.values(metricLabels).some((other) => other !== wanted && key(text(container!)).includes(other))) break;
-            const rest = key(text(container)).replace(wanted, " ");
-            const changeText = rest.match(/[+\-−–]?\s?\d+(?:[.,]\d+)?\s?%/)?.[0]?.replace(/\s+/g, "") ?? null;
-            const token = rest.replace(/[+\-−–]?\s?\d+(?:[.,]\d+)?\s?%/g, " ").match(/(?:^|\s)(\d[\d,.]*\s?[kmb]?)(?=\s|$)/)?.[1]?.trim();
-            if (!token) continue;
-            const exact = /^\d{1,3}(?:,\d{3})+$|^\d+$/.test(token);
-            return { node: container, token, value: exact ? Number(token.replace(/,/g, "")) : null, change: changeText };
-          }
-        }
-        return null;
-      };
-      const readMetrics = () => { const values = { emailSubscribers: readMetric(metricLabels.emailSubscribers), newSubscribers: readMetric(metricLabels.newSubscribers), exclusions: readMetric(metricLabels.exclusions) }; return values.emailSubscribers && values.newSubscribers && values.exclusions ? values as { [K in keyof typeof values]: NonNullable<typeof values[K]> } : null; };
+      // 6. Metrics for the report month (Klaviyo re-renders them after the date change).
       const metrics = await waitUntil(readMetrics, 20_000);
       if (!metrics) return failure("SUBSCRIBER_GROWTH_METRICS_NOT_RENDERED", "Email subscribers, New subscribers and Exclusions were not all rendered.");
       const notExact = Object.entries(metrics).filter(([, metric]) => metric.value === null).map(([name, metric]) => ({ name, token: metric.token }));
       if (notExact.length) return failure("SUBSCRIBER_GROWTH_METRIC_NOT_EXACT", "Klaviyo showed a compact or non-integer subscriber count; exact counts are required.", { notExact });
 
-      // 6. Charts: a plotted line chart and a separate plotted bar chart, never a blank or loading surface.
-      const paint = (node: Element, name: "fill" | "stroke") => key(node.getAttribute(name) ?? (getComputedStyle(node) as unknown as Record<string, string>)[name] ?? "");
-      const visiblePaint = (value: string) => Boolean(value) && !/^(none|transparent)$/.test(value) && !/rgba\(.*,\s*0\)$/.test(value);
-      const chartSurfaces = () => Array.from(document.querySelectorAll("svg")).filter((svg) => { const rect = svg.getBoundingClientRect(); return rect.width >= 200 && rect.height >= 80 && shown(svg) && !svg.closest("button,a"); });
-      const describe = (svg: SVGSVGElement) => {
-        const box = svg.getBoundingClientRect();
-        const marks = Array.from(svg.querySelectorAll("path,rect,polyline,line")).filter((node) => !node.closest("defs,clipPath,mask"));
-        const lines = marks.filter((node) => {
-          if (node.tagName.toLowerCase() === "polyline") return (node.getAttribute("points") ?? "").trim().split(/\s+/).length >= 2;
-          if (node.tagName.toLowerCase() !== "path" || !visiblePaint(paint(node, "stroke")) || visiblePaint(paint(node, "fill"))) return false;
-          const rect = node.getBoundingClientRect();
-          return (node.getAttribute("d") ?? "").replace(/^\s*[Mm][^A-Za-z]*/, "").match(/[LlCcHhVvSsQqTtAa]/g)?.length! >= 2 && rect.width >= box.width * 0.4;
-        });
-        const bars = marks.filter((node) => {
-          if (!["rect", "path"].includes(node.tagName.toLowerCase()) || !visiblePaint(paint(node, "fill"))) return false;
-          const rect = node.getBoundingClientRect();
-          return rect.width >= 1 && rect.height >= 1 && rect.width <= box.width * 0.5;
-        });
-        return { svg, lines: lines.length, bars: bars.length, signature: `${Math.round(box.width)}x${Math.round(box.height)}:${marks.length}:${marks.map((node) => `${node.getAttribute("d")?.length ?? 0}/${Math.round(node.getBoundingClientRect().height)}`).join(",")}` };
-      };
-      const charts = () => {
-        const described = chartSurfaces().map(describe);
-        const line = described.find((chart) => chart.lines >= 1 && chart.bars < 2);
-        const bar = described.find((chart) => chart !== line && chart.bars >= 2);
-        return line && bar ? { line, bar, described } : null;
-      };
+      // 7. Charts: a plotted line chart and a separate plotted bar chart, never a blank or loading surface.
       const chartPair = await waitUntil(charts, 25_000);
       if (!chartPair) return failure("SUBSCRIBER_GROWTH_CHART_NOT_RENDERED", "The Subscriber growth line chart and the New subscribers / Exclusions bar chart were not both rendered.", { surfaces: chartSurfaces().map(describe).map(({ lines, bars, signature }) => ({ lines, bars, signature: signature.slice(0, 200) })) });
       mark("contentReadyMs");
@@ -292,17 +370,20 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       // 7. Crop: the smallest container holding the date selector, the selected Email tab and Growth view, all three
       // metrics, and both charts — so the screenshot itself shows which view and period it is.
       const resolveCard = () => {
-        const pair = charts(); const values = readMetrics(); const growth = growthTab(); const email = emailTab(); const date = dateFilter();
+        const pair = charts(); const values = readMetrics(); const growth = growthTab(); const email = emailTab() ?? singleChannelEmail(); const date = dateFilter();
         if (!pair || !values || !growth || !email || !date) return null;
         const required = [email, growth, date, values.emailSubscribers.node, values.newSubscribers.node, values.exclusions.node, pair.line.svg, pair.bar.svg];
-        for (let node: Element | null = pair.line.svg.parentElement; node && node !== document.body; node = node.parentElement) if (required.every((item) => node!.contains(item))) return { card: node as HTMLElement, pair, values };
+        // The Email subscribers card itself: the smallest container of its Growth view, three metrics and both charts.
+        const cardParts = [growth, values.emailSubscribers.node, values.newSubscribers.node, values.exclusions.node, pair.line.svg, pair.bar.svg];
+        let data: Element | null = pair.line.svg.parentElement;
+        while (data && data !== document.body && !cardParts.every((item) => data!.contains(item))) data = data.parentElement;
+        for (let node: Element | null = pair.line.svg.parentElement; node && node !== document.body; node = node.parentElement) if (required.every((item) => node!.contains(item))) return { card: node as HTMLElement, data: data && data !== document.body ? data : node, parts: cardParts, pair, values };
         return null;
       };
-      const loading = (card: Element) => Array.from(card.querySelectorAll(spinnerSelector)).some(shown);
+      const loading = (current: NonNullable<ReturnType<typeof resolveCard>>) => visibleLoading(current.parts).length > 0;
       // Only animations that will end hold the capture back (e.g. a chart drawing in). Looping ones — a "Last updated"
       // refresh icon, a live pulse — never end, so they cannot be waited for; loading is caught by the spinner check,
       // and the numbers, period, tabs and chart geometry must still repeat exactly.
-      const describeNode = (node: Node) => node instanceof Element ? `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ""}${typeof node.className === "string" && node.className ? `.${node.className.trim().split(/\s+/).slice(0, 2).join(".")}` : ""}`.slice(0, 80) : "node";
       const endingAnimations = (card: Element) => typeof document.getAnimations !== "function" ? [] : document.getAnimations().filter((animation) => {
         const target = (animation.effect as KeyframeEffect | null)?.target;
         const iterations = (animation.effect as KeyframeEffect | null)?.getTiming?.().iterations;
@@ -323,7 +404,7 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
         if (resolved && !positioned) { resolved.card.scrollIntoView?.({ block: "start", inline: "nearest", behavior: "auto" }); positioned = true; }
         let current: ReturnType<typeof parts> | null = null;
         if (!resolved) note("cardNotResolved");
-        else if (loading(resolved.card)) note("spinnerOrSkeleton");
+        else if (loading(resolved)) note("spinnerOrSkeleton");
         else if (!provenPeriod()) note("periodNotShown");
         else if (!canonicalTabs()) note("tabsNotEmailGrowth");
         else {
@@ -337,9 +418,16 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
         if (stableSamples + 1 >= request.stability.requiredStableSamples) break;
         await pause(request.stability.sampleIntervalMs);
       }
-      if (!resolved || stableSamples + 1 < request.stability.requiredStableSamples) return failure("SUBSCRIBER_GROWTH_NOT_STABLE", "The Subscriber growth card did not hold still with its period, tabs, numbers and charts loaded.", { stableSamples: stableSamples + 1, cardResolved: Boolean(resolved), loading: resolved ? loading(resolved.card) : null, unstableReasons: reasons, animationTargets: [...animationTargets].slice(0, 6) });
+      if (!resolved || stableSamples + 1 < request.stability.requiredStableSamples) return failure("SUBSCRIBER_GROWTH_NOT_STABLE", "The Subscriber growth card did not hold still with its period, tabs, numbers and charts loaded.", { stableSamples: stableSamples + 1, cardResolved: Boolean(resolved), loading: resolved ? loading(resolved) : null, visibleLoadingElements: resolved ? visibleLoading(resolved.parts).slice(0, 6).map(describeNode) : [], unstableReasons: reasons, animationTargets: [...animationTargets].slice(0, 6) });
       mark("stableMs");
-      const rect = resolved.card.getBoundingClientRect();
+      // The crop runs from the top of the reporting area (title, Email tab, date range) to the bottom of the Email
+      // subscribers card. Klaviyo's reporting area can stretch to the bottom of the window, and on 2026-11-03 that left
+      // ~800 px of blank page and the floating AI prompt in the Section 10 screenshot; nothing below the card is evidence.
+      const area = resolved.card.getBoundingClientRect();
+      const contentBottom = Math.max(resolved.data.getBoundingClientRect().bottom, ...resolved.parts.map((node) => node.getBoundingClientRect().bottom));
+      const cropBottom = Math.min(area.bottom, Math.ceil(contentBottom) + 12);
+      const rect = { left: area.left, top: area.top, right: area.right, bottom: cropBottom, width: area.width, height: cropBottom - area.top };
+      const trimmedBelowCard = Math.max(0, Math.round(area.bottom - cropBottom));
       if (rect.width < 300 || rect.height < 200) return failure("TARGET_BOUNDS_INVALID", "No clean Subscriber growth card bounds were available.", { cardWidth: Math.round(rect.width), cardHeight: Math.round(rect.height) });
       if (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight) return failure("TARGET_BOUNDS_INVALID", "The Email → Growth card does not fit inside the visible tab; enlarge the browser window so both charts and all three metrics are visible.", { cardHeight: Math.round(rect.height), viewportHeight: window.innerHeight });
       // Floating page chrome (Klaviyo's composer/assistant prompt, toasts, a sticky header) can be painted over the crop.
@@ -349,9 +437,11 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       const occluders = () => {
         if (typeof document.elementFromPoint !== "function") return [];
         const found = new Set<HTMLElement>();
-        for (let column = 0; column <= 8; column += 1) for (let row = 0; row <= 6; row += 1) {
-          const x = Math.min(window.innerWidth - 1, rect.left + 4 + (rect.width - 8) * column / 8);
-          const y = Math.min(window.innerHeight - 1, rect.top + 4 + (rect.height - 8) * row / 6);
+        // Dense enough (about every 16 px down, 48 px across) that a short floating bar cannot fall between samples.
+        const columns = Math.max(8, Math.ceil(rect.width / 48)); const rows = Math.max(6, Math.ceil(rect.height / 16));
+        for (let column = 0; column <= columns; column += 1) for (let row = 0; row <= rows; row += 1) {
+          const x = Math.min(window.innerWidth - 1, rect.left + 4 + (rect.width - 8) * column / columns);
+          const y = Math.min(window.innerHeight - 1, rect.top + 4 + (rect.height - 8) * row / rows);
           const hit = document.elementFromPoint(x, y);
           if (!hit || card.contains(hit) || hit.contains(card)) continue;
           let root: Element = hit; let positioned = false;
@@ -376,8 +466,8 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       mark("totalMs");
       return {
         ok: true, sourceUrl, detectedPeriod: periodText!, periodEvidence: { startDate: period.startDate, endDate: period.endDate }, evidence,
-        targetRect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls: [...tabState().channel, ...tabState().view].map(({ text: value, selected: on }) => ({ text: value, selected: on })), stageTimingsMs: { ...timings } },
-        diagnostics: { accountIdentity: (accountIdentity ?? "").slice(0, 80), hiddenOverlays: hideable.length, stableSamples: stableSamples + 1, periodProof: { ...proof }, charts: { lineMarks: resolved.pair.line.lines, barMarks: resolved.pair.bar.bars } },
+        targetRect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls: [...(tabState().channel.length ? tabState().channel : [{ text: "Email subscribers", selected: true, kind: "email-only-card" }]), ...tabState().view].map(({ text: value, selected: on, ...rest }) => ({ text: value, selected: on, ...rest })), stageTimingsMs: { ...timings } },
+        diagnostics: { accountIdentity: (accountIdentity ?? "").slice(0, 80), hiddenOverlays: hideable.length, trimmedBelowCard, stableSamples: stableSamples + 1, periodProof: { ...proof }, readiness: pageReady, periodBefore, periodAfter: periodText, charts: { lineMarks: resolved.pair.line.lines, barMarks: resolved.pair.bar.bars } },
       };
     })();
     return JSON.parse(JSON.stringify(result)) as SubscriberGrowthAdapterResult;

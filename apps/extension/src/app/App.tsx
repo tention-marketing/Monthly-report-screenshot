@@ -2,10 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, type ApiClient, type DevelopmentReviewPdfStatus, type ReportMutationEvent } from "@tention/api-client";
 import { extensionApiBaseUrl } from "../lib/api/client.js";
 import {
-  automaticCaptureTypesForSections, isValidIanaTimeZone, reportSectionKeySchema,
-  type ClientReportTargets, type ClientReportTargetsInput, type ClientSourceUrls, type ReportDraft, type ReportMonth, type ReportPdfArtifact, type ReportReadiness, type ReportValidationState, type SectionConfiguration,
+  automaticCaptureTypesForSections, finalGenerationDataBlockers, isAcceptedCapture, isValidIanaTimeZone, klaviyoAccountDisplayName, reportCover,
+  type ClientReportTargets, type ClientSetupSummary, type FinalGenerationBlocker, type ClientReportTargetsInput, type ReportDraft, type ReportPdfArtifact, type ReportReadiness, type ReportValidationState,
 } from "@tention/report-schema";
-import { DEFAULT_DRAFT_SECTION_CONFIGURATION } from "../features/create-report/defaults.js";
 import { buildReportChecklist } from "../features/report-checklist/checklist.js";
 import type { ChecklistItem } from "../features/report-checklist/checklist.js";
 import { CaptureWorkflow, type CaptureUploadStatus } from "../features/screenshot-capture/CaptureWorkflow.js";
@@ -14,14 +13,16 @@ import { getAutomaticCapturePlan, getReportRunnerState } from "../features/repor
 import { unavailableKlaviyoNavigationService, type KlaviyoNavigationService } from "../features/klaviyo-navigation/navigation-service.js";
 import { unavailableAutoCaptureService, type AutoCaptureService } from "../features/automatic-capture/auto-capture-service.js";
 import { LocalAutomaticAcceptanceRun } from "../features/automatic-capture/LocalAutomaticAcceptanceRun.js";
+import { approveAllAndFinalize, approveAllBlockers, autoGenerationBlockers, FinalizeError, type FinalizeProgress } from "../features/final-report/approve-and-finalize.js";
 import type { ToolbarInvocationDiagnostics } from "../features/klaviyo-navigation/active-tab-grant.js";
 import type { CampaignsSourceInspectionResult } from "../features/klaviyo-navigation/campaigns-source-inspector.js";
 import {
-  formatCalendarRange, formatReportMonth, getCompletedMonthOptions, normalizeSelectedMonth,
-  parseMonthValue, toMonthValue,
+  formatCalendarRange, formatReportMonth, toMonthValue,
 } from "../lib/dates/month-options.js";
-import { deriveNewClientId } from "../lib/client-id.js";
-import { discoverBusinessReview, discoverSubscriberGrowthSource, getSessionStorageUsage, reportSubscriberGrowthSourcePersisted, watchVerifiedSubscriberGrowthSource } from "../features/automatic-capture/auto-capture-service.js";
+import { ClientTargetEditor, supportedTimeZones, targetInput } from "../features/clients/client-targets.js";
+import { ClientsWorkspace, missingItemLabel, type ClientSetupDiscovery, type ReportSync } from "../features/clients/ClientsWorkspace.js";
+import type { ConversionMetricSourceResult, DeliverabilitySourceRequest, DeliverabilitySourceResult } from "../features/klaviyo-navigation/client-setup-sources.js";
+import { discoverBusinessReview, discoverSubscriberGrowthSource, getSessionStorageUsage, reportSubscriberGrowthSourcePersisted, takeConversionMetricSource, verifyDeliverabilitySource, watchVerifiedConversionMetricSource, watchVerifiedSubscriberGrowthSource } from "../features/automatic-capture/auto-capture-service.js";
 import type { SubscriberGrowthDiscoveryResult } from "../features/klaviyo-navigation/subscriber-growth-source-setup.js";
 
 /** One-time Subscriber Growth source setup hooks (service-worker transaction); injectable for tests. */
@@ -32,16 +33,9 @@ export interface SubscriberGrowthSourceHooks {
 }
 const chromeSubscriberGrowthSourceHooks: SubscriberGrowthSourceHooks = { take: discoverSubscriberGrowthSource, persisted: reportSubscriberGrowthSourcePersisted, watch: watchVerifiedSubscriberGrowthSource };
 import type { BusinessReviewDiscoveryRequest, BusinessReviewDiscoveryResult } from "../features/klaviyo-navigation/business-review-discovery.js";
+import { classifyPreflightFailure, watchToolbarInvocation, type PreflightBlocker } from "../features/automatic-capture/preflight-blocker.js";
 
 type ConnectionState = "checking" | "connected" | "unavailable";
-const sectionLabels: Record<string, string> = {
-  executive_summary: "Executive Summary", top_campaigns: "Top 5 Campaigns", top_flows: "Top 5 Flows",
-  month_comparison: "Month Comparison", campaign_performance: "Campaign Performance", flow_performance: "Flow Performance",
-  signup_form: "Signup Form Performance", welcome_flow: "Welcome Flow Performance", customer_split: "Customer Split",
-  deliverability: "Deliverability Score", campaign_metrics: "Campaign Metrics", flow_metrics: "Flow Metrics",
-  list_growth: "Historical List Growth", analysis: "Analysis", next_month_plan: "Next Month Plan",
-  email_subscriber_growth: "Subscriber Growth",
-};
 const ACTIVE_REPORT_STORAGE_KEY = "tention.active-report-id";
 const pendingCaptureStorageKey = (reportId: string) => `tention.pending-capture.${reportId}`;
 
@@ -52,7 +46,17 @@ function writeSessionValue(key: string, value: string | null): void {
   try { if (value) window.sessionStorage.setItem(key, value); else window.sessionStorage.removeItem(key); } catch { /* session restore is best effort only */ }
 }
 
-export interface AppProps { api: ApiClient; captureService?: CaptureService; navigationService?: KlaviyoNavigationService; automaticCaptureService?: AutoCaptureService; discoverBusinessReviewSource?: (input: BusinessReviewDiscoveryRequest) => Promise<BusinessReviewDiscoveryResult>; subscriberGrowthSource?: SubscriberGrowthSourceHooks; now?: () => Date }
+export interface AppProps { api: ApiClient; captureService?: CaptureService; navigationService?: KlaviyoNavigationService; automaticCaptureService?: AutoCaptureService; discoverBusinessReviewSource?: (input: BusinessReviewDiscoveryRequest) => Promise<BusinessReviewDiscoveryResult>; subscriberGrowthSource?: SubscriberGrowthSourceHooks;
+  /** Subscribes to Tention Reports toolbar clicks (the activeTab grant); injectable for tests. */
+  watchToolbarClick?: (callback: () => void) => () => void; now?: () => Date;
+  /** Client-setup verifiers for the metric page and Deliverability; injectable for tests. */
+  clientSetupSources?: ClientSetupSources }
+export interface ClientSetupSources {
+  verifyDeliverability(request: DeliverabilitySourceRequest): Promise<DeliverabilitySourceResult>;
+  takeConversionMetric(): Promise<ConversionMetricSourceResult>;
+  watchConversionMetric(callback: () => void): () => void;
+}
+const chromeClientSetupSources: ClientSetupSources = { verifyDeliverability: verifyDeliverabilitySource, takeConversionMetric: takeConversionMetricSource, watchConversionMetric: watchVerifiedConversionMetricSource };
 function safeApiDisplayUrl(value: string): string {
   try { const url = new URL(value); return `${url.protocol}//${url.host}${url.pathname.replace(/\/$/, "")}`; }
   catch { return "Configured API"; }
@@ -90,8 +94,11 @@ function businessReviewDiscoveryDebug(result: BusinessReviewDiscoveryResult): Re
   };
 }
 
-export function App({ api, captureService = unavailableCaptureService, navigationService = unavailableKlaviyoNavigationService, automaticCaptureService = unavailableAutoCaptureService, discoverBusinessReviewSource = discoverBusinessReview, subscriberGrowthSource = chromeSubscriberGrowthSourceHooks, now = () => new Date() }: AppProps) {
+export function App({ api, captureService = unavailableCaptureService, navigationService = unavailableKlaviyoNavigationService, automaticCaptureService = unavailableAutoCaptureService, discoverBusinessReviewSource = discoverBusinessReview, subscriberGrowthSource = chromeSubscriberGrowthSourceHooks, watchToolbarClick = watchToolbarInvocation, now = () => new Date(), clientSetupSources = chromeClientSetupSources }: AppProps) {
   const [connection, setConnection] = useState<ConnectionState>("checking");
+  const discovery = useMemo<ClientSetupDiscovery>(() => ({ ...clientSetupSources, verifyAccount: discoverBusinessReviewSource, subscriberGrowth: subscriberGrowthSource, watchToolbarClick }), [clientSetupSources, discoverBusinessReviewSource, subscriberGrowthSource, watchToolbarClick]);
+  /** A report just created from "Create & Start Automatic Capture": its screen starts the capture once. */
+  const [autoStartReportId, setAutoStartReportId] = useState<string | null>(null);
   const [recent, setRecent] = useState<ReportDraft[]>([]);
   const [report, setReport] = useState<ReportDraft | null>(null);
   const [loadingReport, setLoadingReport] = useState(false);
@@ -101,6 +108,24 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Every report list on screen (Recent Reports, a client's Reports) is reconciled through one step after a report is
+  // deleted or found missing: `reportSync` tells the client page which IDs are gone and to refetch from the API.
+  const [reportSync, setReportSync] = useState<ReportSync>({ revision: 0, removedIds: [] });
+  /** The client page to show when the screen returns from a report that no longer exists. */
+  const [returnToClientId, setReturnToClientId] = useState<string | null>(null);
+  const recentRef = useRef(recent); recentRef.current = recent;
+  const reportRef = useRef(report); reportRef.current = report;
+  const reloadRecent = useCallback(async () => {
+    try { const items = await api.listReportDrafts(); if (Array.isArray(items)) setRecent(items); } catch { /* the local removal stands; the next load is authoritative */ }
+  }, [api]);
+  const reconcileRemovedReport = useCallback(async (reportId: string, clientId: string | null) => {
+    setRecent((items) => items.filter((item) => item.id !== reportId));
+    setReportSync((current) => ({ revision: current.revision + 1, removedIds: current.removedIds.includes(reportId) ? current.removedIds : [...current.removedIds, reportId] }));
+    if (readSessionValue(ACTIVE_REPORT_STORAGE_KEY) === reportId) writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null);
+    if (reportRef.current?.id === reportId) { setReport(null); setReturnToClientId(clientId ?? reportRef.current.client.id); }
+    setError(null);
+    await reloadRecent();
+  }, [reloadRecent]);
 
   const connect = useCallback(async () => {
     setConnection("checking"); setError(null);
@@ -114,13 +139,19 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
 
   const openReport = useCallback(async (id: string) => {
     setLoadingReport(true); setError(null);
-    try { const loaded = await api.getReportDraft(id); setReport(loaded); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, loaded.id); }
+    try { const loaded = await api.getReportDraft(id); setReport(loaded); setReturnToClientId(null); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, loaded.id); }
     catch (caught) {
-      if (caught instanceof ApiError && caught.code === "REPORT_NOT_FOUND") writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null);
-      setError(caught instanceof ApiError && caught.code === "REPORT_NOT_FOUND" ? "Report not found." : "The report could not be loaded.");
+      if (caught instanceof ApiError && (caught.code === "REPORT_NOT_FOUND" || caught.status === 404)) {
+        // A stale link or a report deleted elsewhere: drop it everywhere and return to its client when known.
+        const clientId = recentRef.current.find((item) => item.id === id)?.client.id ?? null;
+        writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null);
+        setReturnToClientId(clientId);
+        setNotice("That report no longer exists.");
+        await reconcileRemovedReport(id, clientId);
+      } else setError("The report could not be loaded.");
     }
     finally { setLoadingReport(false); }
-  }, [api]);
+  }, [api, reconcileRemovedReport]);
   useEffect(() => {
     if (connection !== "connected" || report || loadingReport) return;
     const reportId = readSessionValue(ACTIVE_REPORT_STORAGE_KEY);
@@ -132,7 +163,7 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
     void (async () => { try { const items = await api.listReportDrafts(); if (active && Array.isArray(items)) setRecent(items); } catch { /* report remains loaded from its canonical endpoint */ } })();
     return () => { active = false; };
   }, [api, report?.id, report?.version]);
-  const startNewReport = useCallback(() => { writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null); setReport(null); }, []);
+  const startNewReport = useCallback(() => { writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null); setReturnToClientId(null); setReport(null); }, []);
   const requestReportDeletion = useCallback((target: ReportDraft) => {
     setDeleteTarget(target); setDeleteConfirmation(""); setDeleteError(null);
   }, []);
@@ -144,118 +175,40 @@ export function App({ api, captureService = unavailableCaptureService, navigatio
     setDeleteBusy(true); setDeleteError(null);
     try {
       await api.deleteReportDraft(deleteTarget.id, deleteTarget.version);
-      setRecent((items) => items.filter((item) => item.id !== deleteTarget.id));
-      if (report?.id === deleteTarget.id) { writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, null); setReport(null); }
-      setNotice("Report deleted."); setDeleteTarget(null); setDeleteConfirmation("");
-      void api.listReportDrafts().then(setRecent).catch(() => undefined);
+      setNotice(`${formatReportMonth(deleteTarget.reportMonth)} report deleted.`); setDeleteTarget(null); setDeleteConfirmation("");
+      await reconcileRemovedReport(deleteTarget.id, deleteTarget.client.id);
     } catch (caught) {
       setDeleteError(caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT"
         ? "This report was updated somewhere else. Reload recent reports before deleting it."
         : caught instanceof ApiError ? caught.message : "Report could not be deleted.");
     } finally { setDeleteBusy(false); }
-  }, [api, deleteConfirmation, deleteTarget, report?.id]);
+  }, [api, deleteConfirmation, deleteTarget, reconcileRemovedReport]);
 
   return <div className="app-shell">
     <header className="brand-row">
       <div><p className="eyebrow">Tention Reports</p><span className={`connection ${connection}`}>{connection === "checking" ? "Checking API…" : connection === "connected" ? "Connected" : "API unavailable"}</span></div>
-      {report && <button className="text-button" onClick={startNewReport}>Home</button>}
+      {report && <button className="text-button" onClick={startNewReport}>Clients</button>}
     </header>
     {connection === "unavailable" && <section className="notice error-notice"><p>The reporting API could not be reached.</p><button onClick={() => void connect()}>Retry connection</button></section>}
     {error && <p role="alert" className="notice error-notice">{error}</p>}
     {loadingReport ? <p className="loading">Loading report…</p> : report
-      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} automaticCaptureService={automaticCaptureService} discoverBusinessReviewSource={discoverBusinessReviewSource} subscriberGrowthSource={subscriberGrowthSource} report={report} onReport={(updated) => { setReport(updated); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, updated.id); }} onStartNew={startNewReport} onRequestDelete={requestReportDeletion} />
-      : <Home api={api} connected={connection === "connected"} recent={recent} notice={notice} now={now} onCreated={(created) => { setReport(created); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, created.id); setRecent((items) => [created, ...items]); }} onOpen={openReport} onRequestDelete={requestReportDeletion} />}
+      ? <ReportDetail api={api} captureService={captureService} navigationService={navigationService} automaticCaptureService={automaticCaptureService} discoverBusinessReviewSource={discoverBusinessReviewSource} subscriberGrowthSource={subscriberGrowthSource} watchToolbarClick={watchToolbarClick} report={report} autoStart={autoStartReportId === report.id} onAutoStarted={() => setAutoStartReportId(null)} onReport={(updated) => { setReport(updated); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, updated.id); }} onStartNew={startNewReport} onRequestDelete={requestReportDeletion} />
+      : <Home api={api} connected={connection === "connected"} recent={recent} notice={notice} now={now} discovery={discovery} reportSync={reportSync} returnToClientId={returnToClientId} onReportDeleted={(deleted) => { setNotice(null); void reconcileRemovedReport(deleted.id, deleted.client.id); }} onCreated={(created, options) => { if (options.autoStart) setAutoStartReportId(created.id); setReport(created); writeSessionValue(ACTIVE_REPORT_STORAGE_KEY, created.id); setRecent((items) => [created, ...items.filter((item) => item.id !== created.id)]); }} onOpen={openReport} onRequestDelete={requestReportDeletion} />}
     {deleteTarget && <ReportDeleteDialog report={deleteTarget} confirmation={deleteConfirmation} busy={deleteBusy} error={deleteError} onConfirmation={setDeleteConfirmation} onCancel={cancelReportDeletion} onDelete={() => void deleteReport()} />}
   </div>;
 }
 
 interface HomeProps {
-  api: ApiClient; connected: boolean; recent: ReportDraft[]; now: () => Date;
-  notice: string | null;
-  onCreated(report: ReportDraft): void; onOpen(id: string): void; onRequestDelete(report: ReportDraft): void;
+  api: ApiClient; connected: boolean; recent: ReportDraft[]; now: () => Date; discovery: ClientSetupDiscovery;
+  notice: string | null; reportSync: ReportSync; returnToClientId: string | null; onReportDeleted(report: ReportDraft): void;
+  onCreated(report: ReportDraft, options: { autoStart: boolean }): void; onOpen(id: string): void; onRequestDelete(report: ReportDraft): void;
 }
 
-function Home({ api, connected, recent, notice, now, onCreated, onOpen, onRequestDelete }: HomeProps) {
-  const [clientName, setClientName] = useState("");
-  const [timeZone, setTimeZone] = useState("");
-  const [reportMonth, setReportMonth] = useState<ReportMonth | null>(null);
-  const [sections, setSections] = useState<SectionConfiguration>({ ...DEFAULT_DRAFT_SECTION_CONFIGURATION });
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [duplicate, setDuplicate] = useState<ReportDraft | null>(null);
-  const [clients, setClients] = useState<ClientReportTargets[]>([]);
-  const timeZones = useMemo(() => supportedTimeZones(), []);
-  useEffect(() => {
-    if (!connected) return;
-    let current = true;
-    void Promise.resolve(api.listClientConfigurations?.()).then((list) => { if (current) setClients(list ?? []); }).catch(() => { if (current) setClients([]); });
-    return () => { current = false; };
-  }, [api, connected]);
-  // A configured client's one-time profile is the only source of its timezone; it is never re-entered per report.
-  const clientId = clientName.trim() ? deriveNewClientId(clientName.trim()) : "";
-  const profile = clients.find((client) => client.clientId === clientId)?.profile ?? null;
-  const effectiveTimeZone = profile?.timezone ?? timeZone;
-  useEffect(() => { if (profile) setSections({ ...DEFAULT_DRAFT_SECTION_CONFIGURATION, ...(profile.sections ?? {}) }); }, [profile]);
-  const monthOptions = useMemo(() => {
-    if (!isValidIanaTimeZone(effectiveTimeZone)) return [];
-    return getCompletedMonthOptions(now(), effectiveTimeZone, 24);
-  }, [now, effectiveTimeZone]);
-  useEffect(() => { setReportMonth((selected) => normalizeSelectedMonth(selected, monthOptions)); }, [monthOptions]);
-  const period = reportMonth ? monthOptions.find(({ month }) => toMonthValue(month) === toMonthValue(reportMonth))?.period : null;
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    if (!reportMonth || !clientId || !isValidIanaTimeZone(effectiveTimeZone)) return;
-    setCreating(true); setCreateError(null); setDuplicate(null);
-    try {
-      if (!profile) {
-        // One-time onboarding: save the client's profile, keeping any verified account/source configuration.
-        const existing = await api.getClientReportTargets(clientId);
-        const saved = await api.saveClientReportTargets(clientId, { ...targetInput(existing), profile: { name: clientName.trim(), timezone: effectiveTimeZone, currency: null, conversionMetric: { label: "Placed Order", providerMetricId: null }, sections } });
-        setClients((current) => [...current.filter((client) => client.clientId !== clientId), saved]);
-      }
-      onCreated(await api.createReportDraft({ client: { id: clientId, name: profile?.name ?? clientName.trim(), timezone: effectiveTimeZone }, reportMonth, sections }));
-    } catch (caught) {
-      if (caught instanceof ApiError && caught.code === "REPORT_DRAFT_ALREADY_EXISTS") {
-        setCreateError("A monthly report already exists for this client and month.");
-        const matches = await api.listReportDrafts({ clientId: deriveNewClientId(clientName.trim()), year: reportMonth.year, month: reportMonth.month }).catch(() => []);
-        setDuplicate(matches[0] ?? null);
-      } else setCreateError(caught instanceof ApiError ? caught.message : "The report could not be created.");
-    } finally { setCreating(false); }
-  }
-
+/** Phase 1 (client setup) and phase 2 (monthly reports) start from the client list; recent reports stay one click away. */
+function Home({ api, connected, recent, notice, now, discovery, reportSync, returnToClientId, onReportDeleted, onCreated, onOpen, onRequestDelete }: HomeProps) {
   return <main>
     {notice && <p role="status" className="notice success-notice">{notice}</p>}
-    <section className="card">
-      <div className="section-heading"><div><p className="kicker">Create monthly report</p><h1>Report setup</h1></div><button className="text-button" type="button" disabled={creating} onClick={() => { setClientName(""); setTimeZone(""); setReportMonth(null); setSections({ ...DEFAULT_DRAFT_SECTION_CONFIGURATION }); setCreateError(null); setDuplicate(null); }}>+ New Monthly Report</button></div>
-      <p className="support-copy">Client ID is generated internally from the client name for new reports. Existing reports retain their stored ID.</p>
-      <form onSubmit={(event) => void submit(event)}>
-        <label>Client Name<input list="configured-clients" value={clientName} onChange={(event) => setClientName(event.target.value)} required placeholder="Client name" /></label>
-        <datalist id="configured-clients">{clients.map((client) => <option key={client.clientId} value={client.profile?.name ?? ""} />)}</datalist>
-        {profile ? <p className="support-copy" aria-label="Client timezone">Timezone <strong>{profile.timezone}</strong> · saved client configuration</p> : <>
-          <label>Timezone<input list="timezones" value={timeZone} onChange={(event) => setTimeZone(event.target.value)} required placeholder="Select IANA timezone" /></label>
-          {clientName.trim() && <p className="support-copy">New client: this timezone is saved once and reused for every report.</p>}
-        </>}
-        <datalist id="timezones">{timeZones.map((zone) => <option key={zone} value={zone} />)}</datalist>
-        {!profile && timeZone && !isValidIanaTimeZone(timeZone) && <p role="alert" className="field-error">Enter a valid IANA timezone.</p>}
-        <label>Report Month<select aria-label="Report Month" value={reportMonth ? toMonthValue(reportMonth) : ""} onChange={(event) => setReportMonth(parseMonthValue(event.target.value))} disabled={!monthOptions.length} required>
-          {!monthOptions.length && <option value="">Select timezone first</option>}
-          {monthOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-        </select></label>
-        {period && <div className="period-preview" aria-label="Derived reporting periods">
-          <span>Reporting Period<strong>{formatCalendarRange(period.startDate, period.endDate)}</strong></span>
-          <span>Previous Comparison<strong>{formatCalendarRange(period.previousStartDate, period.previousEndDate)}</strong></span>
-        </div>}
-        <fieldset><legend>Report sections</legend><p className="support-copy">Defaults apply to new drafts only and can be changed per report.</p>
-          <div className="section-config">{reportSectionKeySchema.options.map((section) => <label key={section}>{sectionLabels[section]}
-            <select aria-label={`${sectionLabels[section]} requirement`} value={sections[section]} onChange={(event) => setSections((current) => ({ ...current, [section]: event.target.value as "required" | "optional" | "disabled" }))}>
-              <option value="required">Required</option><option value="optional">Optional</option><option value="disabled">Disabled</option>
-            </select></label>)}</div>
-        </fieldset>
-        {createError && <div role="alert" className="notice error-notice"><p>{createError}</p>{duplicate && <button type="button" onClick={() => onOpen(duplicate.id)}>Load existing report</button>}</div>}
-        <button className="primary" type="submit" disabled={!connected || creating || !reportMonth || !isValidIanaTimeZone(effectiveTimeZone)}>{creating ? "Creating…" : "Continue"}</button>
-      </form>
-    </section>
+    <ClientsWorkspace api={api} connected={connected} now={now} discovery={discovery} initialClientId={returnToClientId} reportSync={reportSync} onReportDeleted={onReportDeleted} onReportCreated={onCreated} onOpenReport={onOpen} />
     <RecentReports reports={recent} onOpen={onOpen} onRequestDelete={onRequestDelete} />
   </main>;
 }
@@ -264,7 +217,7 @@ function RecentReports({ reports, onOpen, onRequestDelete }: { reports: ReportDr
   return <section className="card"><h2>Recent Reports</h2>{reports.length === 0 ? <p className="empty">No reports yet.</p> : <ul className="recent-list">{reports.map((report) => <li key={report.id}><div className="recent-report"><strong>{report.client.name}</strong><span>{formatReportMonth(report.reportMonth)} · {humanize(report.status)}</span><small>Updated {new Date(report.updatedAt).toLocaleString()}</small></div><div className="recent-actions"><button onClick={() => onOpen(report.id)}>Open Report</button><button className="danger" onClick={() => onRequestDelete(report)}>Delete Report</button></div></li>)}</ul>}</section>;
 }
 
-function ReportDetail({ api, captureService, navigationService, automaticCaptureService, discoverBusinessReviewSource, subscriberGrowthSource, report, onReport, onStartNew, onRequestDelete }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; automaticCaptureService: AutoCaptureService; discoverBusinessReviewSource(input: BusinessReviewDiscoveryRequest): Promise<BusinessReviewDiscoveryResult>; subscriberGrowthSource: SubscriberGrowthSourceHooks; report: ReportDraft; onReport(report: ReportDraft): void; onStartNew(): void; onRequestDelete(report: ReportDraft): void }) {
+function ReportDetail({ api, captureService, navigationService, automaticCaptureService, discoverBusinessReviewSource, subscriberGrowthSource, watchToolbarClick, report, autoStart = false, onAutoStarted, onReport, onStartNew, onRequestDelete }: { api: ApiClient; captureService: CaptureService; navigationService: KlaviyoNavigationService; automaticCaptureService: AutoCaptureService; discoverBusinessReviewSource(input: BusinessReviewDiscoveryRequest): Promise<BusinessReviewDiscoveryResult>; subscriberGrowthSource: SubscriberGrowthSourceHooks; watchToolbarClick: (callback: () => void) => () => void; report: ReportDraft; autoStart?: boolean; onAutoStarted?(): void; onReport(report: ReportDraft): void; onStartNew(): void; onRequestDelete(report: ReportDraft): void }) {
   const [validation, setValidation] = useState<ReportValidationState>(report.validation);
   const [history, setHistory] = useState<Awaited<ReturnType<ApiClient["getReportHistory"]>>>([]);
   const [busy, setBusy] = useState(false);
@@ -278,6 +231,8 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
   const [automaticRunIndex, setAutomaticRunIndex] = useState(0);
   const [localAutomaticAcceptanceActive, setLocalAutomaticAcceptanceActive] = useState(false);
   const [localAutomaticRunMode, setLocalAutomaticRunMode] = useState<"full" | "resume">("full");
+  // A resume run's exact plan: the missing/stale sections, or the one pending section chosen for "Retake saved capture".
+  const [resumePlan, setResumePlan] = useState<ChecklistItem[] | null>(null);
   const [subscriberGrowthSetupDiagnostics, setSubscriberGrowthSetupDiagnostics] = useState<Record<string, unknown> | null>(null);
   const [sessionStorageUsage, setSessionStorageUsage] = useState<Awaited<ReturnType<typeof getSessionStorageUsage>> | "unavailable" | null>(null);
   const [reviewOpen, setReviewOpen] = useState(false);
@@ -287,11 +242,29 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
   const [campaignsSourceInspection, setCampaignsSourceInspection] = useState<CampaignsSourceInspectionResult | null>(null);
   const [businessReviewDiscoveryDiagnostics, setBusinessReviewDiscoveryDiagnostics] = useState<Record<string, string> | null>(null);
   const [pdfArtifact, setPdfArtifact] = useState<ReportPdfArtifact | null>(null);
+  // A fully validated automatic capture generates the final report on its own; "Approve All" is optional QA.
+  const [approveAllOpen, setApproveAllOpen] = useState(false);
+  const [autoGenerating, setAutoGenerating] = useState(false);
+  const [autoError, setAutoError] = useState<string | null>(null);
+  /** Capture sets (report + hashes) already sent for automatic generation in this panel; each is tried once. */
+  const autoAttempted = useRef(new Set<string>());
+  /** Why the last automatic-capture start stopped, phrased as the action needed; null when nothing blocks. */
+  const [preflightBlocker, setPreflightBlocker] = useState<PreflightBlocker | null>(null);
+  /** The start that waits for one Tention Reports toolbar click on the client's Klaviyo tab, then continues by itself. */
+  const pendingStart = useRef<{ mode: "full" | "resume"; only?: ChecklistItem } | null>(null);
+  const startAutomaticRunnerRef = useRef<(mode?: "full" | "resume", only?: ChecklistItem) => Promise<void>>(async () => undefined);
+  /** A generated report's current artifact is missing (its captures changed after generation): regenerate it. */
+  const [artifactStale, setArtifactStale] = useState(false);
+  const [finalizing, setFinalizing] = useState<FinalizeProgress | null>(null);
+  const [finalizeError, setFinalizeError] = useState<string | null>(null);
+  const [deliveryRetry, setDeliveryRetry] = useState<"drive" | "doc" | "adopt" | null>(null);
   const [developmentReviewPdf, setDevelopmentReviewPdf] = useState<DevelopmentReviewPdfStatus | null>(null);
   const [developmentReviewBusy, setDevelopmentReviewBusy] = useState(false);
   const [developmentPreviewOpen, setDevelopmentPreviewOpen] = useState(false);
   const [readiness, setReadiness] = useState<ReportReadiness | null>(null);
   const [targets, setTargets] = useState<ClientReportTargets | null>(null);
+  /** The client's server-computed setup status; capture and final generation run only for a READY client. */
+  const [clientSetup, setClientSetup] = useState<ClientSetupSummary | null>(null);
   const [automaticRunTargets, setAutomaticRunTargets] = useState<ClientReportTargets | null>(null);
   const [readinessLoading, setReadinessLoading] = useState(true);
   const [targetEditorOpen, setTargetEditorOpen] = useState(false);
@@ -304,6 +277,10 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
       : clientProfile.name !== report.client.name || clientProfile.timezone !== report.client.timezone
         ? `CLIENT_CONFIGURATION_MISMATCH: This report was created as ${report.client.name} (${report.client.timezone}), but the client is configured as ${clientProfile.name} (${clientProfile.timezone}). Create the report again from the saved client configuration.`
         : null;
+  // Server-computed client setup: capture, final PDF, Drive and the Doc need a READY client (the API enforces it too).
+  const clientSetupMissing = clientSetup && clientSetup.status !== "READY"
+    ? clientSetup.blockers.map((blocker) => missingItemLabel(blocker, clientSetup.setup.profile?.conversionMetric.label)) : null;
+  const clientSetupBlocker = clientSetupMissing ? `CLIENT_SETUP_INCOMPLETE: Client setup incomplete. Missing: ${clientSetupMissing.join(", ")}.` : null;
   const [targetError, setTargetError] = useState<string | null>(null);
   const [captureUploadStatus, setCaptureUploadStatus] = useState<CaptureUploadStatus | null>(null);
   const [klaviyoAccountUrl, setKlaviyoAccountUrl] = useState(() => loadKlaviyoAccountUrl(report.id));
@@ -322,6 +299,18 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
   const canResume = resumeQueue.length > 0 && resumeQueue.length < automaticItems.length;
   const hasAllAutomaticCaptures = automaticItems.length === expectedAutomaticCount
     && automaticItems.every((item) => item.screenshotType && report.screenshots.some((screenshot) => screenshot.type === item.screenshotType));
+  const automaticTypes = automaticItems.flatMap(({ screenshotType }) => screenshotType ? [screenshotType] : []);
+  const dataBlockers = finalGenerationDataBlockers(report, targets?.profile ?? null);
+  const approveBlockers = approveAllBlockers(report, automaticTypes, expectedAutomaticCount, dataBlockers.map(({ code }) => code));
+  const approvedAutomaticCount = automaticTypes.filter((type) => report.screenshots.some((shot) => shot.type === type && shot.approved)).length;
+  const awaitingApproval = localImportedReviewEnabled() && hasAllAutomaticCaptures && resumeQueue.length === 0 && approvedAutomaticCount < automaticTypes.length;
+  // Machine validation, never human approval, gates the automatic final report.
+  const autoBlockers = autoGenerationBlockers(report, automaticTypes, expectedAutomaticCount, dataBlockers.map(({ code }) => code));
+  const automaticComplete = hasAllAutomaticCaptures && resumeQueue.length === 0;
+  const automaticValidated = automaticComplete && automaticTypes.every((type) => report.screenshots.some((shot) => shot.type === type && isAcceptedCapture(shot)));
+  const automaticCaptureKey = `${report.id}:${automaticTypes.map((type) => report.screenshots.find((shot) => shot.type === type)?.sha256 ?? "-").join(",")}`;
+  const autoReady = automaticComplete && targets !== null && !clientSetupBlocker && autoBlockers.length === 0 && report.status !== "generating"
+    && (report.status !== "generated" || (artifactStale && !pdfArtifact)) && !captureItem && !runnerStarted && !automaticRunnerStarted && !busy && !finalizing && !approveAllOpen;
 
   useEffect(() => { setValidation(report.validation); }, [report]);
   // One toolbar click on Subscriber growth → Email → Growth is enough: the service worker verifies that exact tab at the
@@ -340,6 +329,14 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
     // The save reads the latest targets through the ref; it re-subscribes only when setup state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [includesSubscriberGrowth, subscriberGrowthSaved, targetsLoaded]);
+  // One toolbar click on the client's Klaviyo tab continues a start that was waiting for tab access; the start
+  // re-verifies the open account before anything is captured. No second Start click is needed.
+  useEffect(() => watchToolbarClick(() => {
+    const pending = pendingStart.current;
+    if (!pending) return;
+    pendingStart.current = null;
+    void startAutomaticRunnerRef.current(pending.mode, pending.only);
+  }), [watchToolbarClick]);
   useEffect(() => {
     if (captureResumeRestored.current) return;
     const section = readSessionValue(pendingCaptureStorageKey(report.id));
@@ -360,10 +357,10 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
   useEffect(() => {
     let active = true;
     setReadinessLoading(true); setReadiness(null); setTargetError(null);
-    void Promise.all([api.getReportReadiness(report.client.id, report.sections), api.getClientReportTargets(report.client.id)])
-      .then(([nextReadiness, nextTargets]) => {
+    void Promise.all([api.getReportReadiness(report.client.id, report.sections), api.getClientReportTargets(report.client.id), api.getClientSetup(report.client.id).catch(() => null)])
+      .then(([nextReadiness, nextTargets, nextSetup]) => {
         if (!active) return;
-        setReadiness(nextReadiness); setTargets(nextTargets);
+        setReadiness(nextReadiness); setTargets(nextTargets); setClientSetup(nextSetup);
       })
       .catch(() => { if (active) setTargetError("Client target configuration could not be loaded."); })
       .finally(() => { if (active) setReadinessLoading(false); });
@@ -371,9 +368,12 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
   }, [api, report.client.id, report.sections]);
   useEffect(() => { saveKlaviyoAccountUrl(report.id, klaviyoAccountUrl); }, [report.id, klaviyoAccountUrl]);
   useEffect(() => {
-    let active = true; setPdfArtifact(null);
+    let active = true;
+    // Keep the artifact a generation just returned for this report; anything else is reloaded from the backend.
+    setPdfArtifact((current) => current?.reportId === report.id && report.status === "generated" ? current : null); setArtifactStale(false);
     if (report.status !== "generated" || !api.getCurrentPdfArtifact) return;
-    void api.getCurrentPdfArtifact(report.id).then((artifact) => { if (active) setPdfArtifact(artifact); }).catch(() => undefined);
+    void api.getCurrentPdfArtifact(report.id).then((artifact) => { if (active) setPdfArtifact(artifact); })
+      .catch((caught: unknown) => { if (active && caught instanceof ApiError && caught.code === "PDF_ARTIFACT_STALE") setArtifactStale(true); });
     return () => { active = false; };
   }, [api, report.id, report.status]);
   useEffect(() => {
@@ -424,13 +424,64 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
       else setActionError(caught instanceof ApiError ? caught.message : "Capture review could not be completed.");
     } finally { setBusy(false); }
   }
+  async function applyProfileCurrency() {
+    setBusy(true); setActionError(null);
+    try { const updated = await api.applyClientProfileCurrency(report.id, report); onReport(updated); setValidation(updated.validation); }
+    catch (caught) { if (caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT") setConflict(true); else setActionError(caught instanceof ApiError ? caught.message : "The client currency could not be applied to this report."); }
+    finally { setBusy(false); }
+  }
   async function generatePdf() {
+    if (clientSetupBlocker) { setActionError(clientSetupBlocker); return; }
     setBusy(true); setActionError(null); setConflict(false);
-    try { const result = await api.generatePdf(report.id, report.version); onReport(result.report); setPdfArtifact(result.artifact); setValidation(result.report.validation); }
+    try { const result = await api.generatePdf(report.id, report.version, report.reportMonth); onReport(result.report); setPdfArtifact(result.artifact); setValidation(result.report.validation); }
     catch (caught) {
       if (caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT") setConflict(true);
+      else if (caught instanceof ApiError && caught.code === "REPORT_MONTH_MISMATCH") setActionError(`REPORT_MONTH_MISMATCH: ${caught.message}`);
       else setActionError(caught instanceof ApiError ? caught.message : "PDF generation could not be completed.");
     } finally { setBusy(false); }
+  }
+  /**
+   * Automatic capture complete (all sections present, none stale, no data blockers) → the backend machine-validates
+   * the captures and generates the final PDF, Drive PDF and Google Doc. No approval is recorded or required. Each
+   * capture set is attempted once per panel; a failure is shown with a retry and never triggers a recapture.
+   */
+  async function autoGenerateFinal() {
+    if (clientSetupBlocker) { setAutoError(clientSetupBlocker); return; }
+    setAutoGenerating(true); setAutoError(null); setFinalizeError(null); setActionError(null); setConflict(false);
+    try {
+      const result = await api.autoGenerateFinalReport(report.id, report.version, report.reportMonth);
+      onReport(result.report); setValidation(result.report.validation); setPdfArtifact(result.artifact);
+    } catch (caught) {
+      if (caught instanceof ApiError && caught.code === "REPORT_VERSION_CONFLICT") setConflict(true);
+      setAutoError(caught instanceof ApiError ? `${caught.code}: ${caught.message}` : "The automatic final report could not be completed.");
+    } finally { setAutoGenerating(false); }
+  }
+  useEffect(() => {
+    if (!autoReady || autoAttempted.current.has(automaticCaptureKey)) return;
+    autoAttempted.current.add(automaticCaptureKey);
+    void autoGenerateFinal();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runs once per capture set when it becomes ready.
+  }, [autoReady, automaticCaptureKey]);
+  /** Runs after the explicit Approve All confirmation (or to finish a chain that stopped after approval). */
+  async function finalizeReport() {
+    if (clientSetupBlocker) { setApproveAllOpen(false); setActionError(clientSetupBlocker); return; }
+    setApproveAllOpen(false); setFinalizeError(null); setActionError(null); setConflict(false); setBusy(true);
+    setFinalizing({ stage: "approving", approved: approvedAutomaticCount, total: automaticTypes.length });
+    try {
+      const result = await approveAllAndFinalize(api, report, automaticTypes, setFinalizing);
+      onReport(result.report); setValidation(result.report.validation); setPdfArtifact(result.artifact);
+    } catch (caught) {
+      if (caught instanceof FinalizeError) { onReport(caught.report); setValidation(caught.report.validation); setFinalizeError(caught.message); if (caught.cause instanceof ApiError && caught.cause.code === "REPORT_VERSION_CONFLICT") setConflict(true); }
+      else setFinalizeError(caught instanceof Error ? caught.message : "The final report could not be completed.");
+    } finally { setFinalizing(null); setBusy(false); }
+  }
+  /** Retries only Drive or only the Google Doc for the existing canonical PDF; never re-renders or recaptures. */
+  async function retryDelivery(kind: "drive" | "doc" | "adopt") {
+    setDeliveryRetry(kind); setFinalizeError(null);
+    const candidate = pdfArtifact?.googleDoc?.googleDocCandidateId;
+    try { setPdfArtifact(kind === "drive" ? await api.retryDriveDelivery(report.id) : kind === "adopt" && candidate ? await api.adoptGoogleDoc(report.id, candidate) : await api.retryGoogleDoc(report.id)); }
+    catch (caught) { setFinalizeError(`${kind === "drive" ? "Google Drive" : kind === "adopt" ? "Adopting the existing Google Doc" : "Google Doc"} retry failed: ${caught instanceof ApiError ? `${caught.code}: ${caught.message}` : "unknown error"}. The final PDF is unaffected.`); }
+    finally { setDeliveryRetry(null); }
   }
   async function generateDevelopmentReviewPdf() {
     setDevelopmentReviewBusy(true); setActionError(null);
@@ -458,11 +509,26 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
     }
     setRunnerStarted(true); setCaptureItem(runner.next);
   }
-  async function startAutomaticRunner(mode: "full" | "resume" = "full") {
+  /**
+   * `only` retakes exactly one section that is captured but still pending review: a resume run whose plan is that
+   * section alone. The backend keeps the other captures (their hashes are re-verified) and replaces this one only once
+   * the fresh capture passes, still unapproved. Approved evidence is never retaken this way.
+   */
+  async function startAutomaticRunner(mode: "full" | "resume" = "full", only?: ChecklistItem) {
     if (readinessLoading) { setActionError("Checking the report configuration before automatic capture."); return; }
     if (clientConfigurationBlocker) { setActionError(clientConfigurationBlocker); return; }
+    if (clientSetupBlocker) { setActionError(clientSetupBlocker); return; }
+    pendingStart.current = null; setPreflightBlocker(null);
+    // A Klaviyo tab-access or account problem is not a client-setup problem: say what to do, and continue on its own
+    // after the next toolbar click (the account is verified again before anything is captured).
+    const blockStart = (error: string | null) => {
+      const blocker = classifyPreflightFailure(error, { clientName: report.client.name, profileConfigured: Boolean((latestTargets.current ?? targets)?.profile), sourceConfigured: Boolean((latestTargets.current ?? targets)?.businessReview?.dashboardUrl) });
+      setPreflightBlocker(blocker); setActionError(null);
+      if (blocker.kind !== "CLIENT_CONFIGURATION_MISSING") setTargetError(null);
+      pendingStart.current = blocker.resumesOnToolbarClick ? { mode, ...(only ? { only } : {}) } : null;
+    };
     // A resume captures only the missing or stale automatic sections; existing captures are kept as they are.
-    const freshQueue = mode === "resume" ? resumeQueue : getAutomaticCapturePlan(report);
+    const freshQueue = only ? [only] : mode === "resume" ? resumeQueue : getAutomaticCapturePlan(report);
     const first = freshQueue[0];
     if (!first) { setActionError("No supported automatic sections are enabled for this report."); return; }
     // A Subscriber Growth source save already in flight (e.g. the automatic one on opening the report) finishes first.
@@ -473,30 +539,38 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
       // same account. Discovery (and saving) runs only when no binding exists yet.
       const saved = targets?.businessReview;
       const preflight = await discoverAndSaveBusinessReview(false, Boolean(saved?.dashboardUrl && (saved.accountLabel || saved.providerAccountId)));
-      if (!preflight.targets) { setActionError(`Client setup needs attention before capture. ${preflight.error}`); return; }
+      if (!preflight.targets) { blockStart(preflight.error); return; }
       verifiedTargets = preflight.targets;
     }
     // Section 10 reuses the client's saved Subscriber growth source; only when none is saved yet is the source the
     // service worker verified at the toolbar click saved now, on top of the targets confirmed above.
     if (freshQueue.some((item) => item.screenshotType === "email_subscriber_growth") && !verifiedTargets?.sourceUrls?.subscriberGrowthUrl) {
       const saved = await discoverAndSaveSubscriberGrowth({ base: verifiedTargets });
-      if (!saved.targets) { setActionError(`Client setup needs attention before capture. ${saved.error}`); return; }
+      if (!saved.targets) { blockStart(saved.error); return; }
       verifiedTargets = saved.targets;
     }
     // React state updates above are asynchronous. Carry this exact preflight
     // result into the capture render so it cannot use the stale target closure.
     setAutomaticRunTargets(verifiedTargets);
     if (localImportedReviewEnabled() && typeof api.startLocalAutomaticCaptureRun === "function" && (freshQueue.length === expectedAutomaticCount || mode === "resume")) {
-      setLocalAutomaticRunMode(mode);
+      setLocalAutomaticRunMode(mode); setResumePlan(mode === "resume" ? freshQueue : null);
       setCaptureItem(null); setRunnerStarted(false); setAutomaticRunnerStarted(false); setLocalAutomaticAcceptanceActive(true); setActionError(null); return;
     }
     setRunnerStarted(false); setAutomaticRunQueue(freshQueue); setAutomaticRunIndex(0); setAutomaticRunnerStarted(true); setCaptureItem(first);
   }
+  startAutomaticRunnerRef.current = startAutomaticRunner;
+  // "Create & Start Automatic Capture": start once, as soon as the client configuration has loaded.
+  const autoStarted = useRef(false);
+  useEffect(() => {
+    if (!autoStart || autoStarted.current || readinessLoading || !targets) return;
+    autoStarted.current = true; onAutoStarted?.();
+    void startAutomaticRunnerRef.current("full");
+  }, [autoStart, readinessLoading, targets, onAutoStarted]);
   async function saveClientProfile() {
     if (!isValidIanaTimeZone(profileTimeZone)) { setTargetError("Enter a valid IANA timezone."); return; }
     setTargetBusy(true); setTargetError(null);
     try {
-      const saved = await api.saveClientReportTargets(report.client.id, { ...targetInput(latestTargets.current ?? targets), profile: { name: report.client.name, timezone: profileTimeZone, currency: report.client.currency, conversionMetric: { label: "Placed Order", providerMetricId: null }, sections: null } });
+      const saved = await api.saveClientReportTargets(report.client.id, { ...targetInput(latestTargets.current ?? targets), profile: { name: report.client.name, timezone: profileTimeZone, currency: (latestTargets.current ?? targets)?.profile?.currency ?? report.client.currency, conversionMetric: (latestTargets.current ?? targets)?.profile?.conversionMetric ?? { label: "Placed Order", providerMetricId: null }, sections: (latestTargets.current ?? targets)?.profile?.sections ?? null } });
       adoptTargets(saved); setActionError(null);
     } catch (caught) { setTargetError(caught instanceof ApiError ? caught.message : "The client timezone could not be saved."); }
     finally { setTargetBusy(false); }
@@ -591,7 +665,7 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
         return { targets: latestTargets.current ?? targets, error: null };
       }
       const input = targetInput(latestTargets.current ?? targets);
-      input.businessReview = { dashboardUrl: result.dashboardUrl, displayName: "Business Review", accountLabel: result.accountLabel, ...(result.providerAccountId ? { providerAccountId: result.providerAccountId, providerIdentityKind: result.providerIdentityKind ?? "account" } : {}) };
+      input.businessReview = { dashboardUrl: result.dashboardUrl, displayName: "Business Review", accountLabel: klaviyoAccountDisplayName(result.accountLabel), ...(result.providerAccountId ? { providerAccountId: result.providerAccountId, providerIdentityKind: result.providerIdentityKind ?? "account" } : {}) };
       const saved = await api.saveClientReportTargets(report.client.id, input);
       const nextReadiness = await api.getReportReadiness(report.client.id, report.sections);
       adoptTargets(saved); setReadiness(nextReadiness); setTargetError(null);
@@ -637,7 +711,7 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
     catch { setCampaignsSourceInspection({ ok: false, code: "SCRIPT_INJECTION_FAILED", message: "Campaigns inspection could not run." }); }
   }
 
-  if (localAutomaticAcceptanceActive) return <LocalAutomaticAcceptanceRun api={api} report={report} targets={automaticRunTargets ?? targets} plan={localAutomaticRunMode === "resume" ? resumeQueue : automaticItems} mode={localAutomaticRunMode} allSections={automaticItems} service={automaticCaptureService} onClose={(updated) => { if (updated) onReport(updated); setLocalAutomaticAcceptanceActive(false); setAutomaticRunTargets(null); }} />;
+  if (localAutomaticAcceptanceActive) return <LocalAutomaticAcceptanceRun api={api} report={report} targets={automaticRunTargets ?? targets} plan={localAutomaticRunMode === "resume" ? resumePlan ?? resumeQueue : automaticItems} mode={localAutomaticRunMode} allSections={automaticItems} service={automaticCaptureService} onClose={(updated) => { if (updated) onReport(updated); setLocalAutomaticAcceptanceActive(false); setAutomaticRunTargets(null); setResumePlan(null); }} />;
 
   if (localImportedReviewEnabled() && importedReviewItem?.screenshotType) {
     const imported = report.screenshots.find((item) => item.type === importedReviewItem.screenshotType);
@@ -668,16 +742,22 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
     onVersionConflict={() => { writeSessionValue(pendingCaptureStorageKey(report.id), null); setCaptureItem(null); setRunnerStarted(false); setAutomaticRunnerStarted(false); setAutomaticRunQueue([]); setAutomaticRunIndex(0); setConflict(true); }} onCancel={() => { writeSessionValue(pendingCaptureStorageKey(report.id), null); setCaptureItem(null); setRunnerStarted(false); setAutomaticRunnerStarted(false); setAutomaticRunQueue([]); setAutomaticRunIndex(0); }}
   />;
 
+  if (approveAllOpen) return <ApproveAllReview api={api} report={report} items={automaticItems} blockers={approveBlockers} onConfirm={() => void finalizeReport()} onBack={() => setApproveAllOpen(false)} />;
+
   if (reviewOpen) return <CaptureReview api={api} report={report} items={runner.required} completed={report.status === "ready_for_review"} busy={busy} completionError={actionError} onComplete={() => void completeCaptureReview()} onBack={() => setReviewOpen(false)} onRetake={(item) => { setReviewOpen(false); selectManualCapture(item); }} />;
 
   return <main>
     <section className="card report-hero"><p className="kicker">Monthly report</p><h1>{report.client.name}</h1><p className="report-month">{formatReportMonth(report.reportMonth)}</p>
-      <div className="period-preview"><span>Reporting Period<strong>{formatCalendarRange(report.period.startDate, report.period.endDate)}</strong></span><span>Previous Comparison<strong>{formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}</strong></span></div>
-      <p className="progress-copy">Final report readiness: {runner.completed} / {runner.required.length} required screenshots approved</p>
-      {runner.isComplete ? <><section aria-label="Capture Review"><h2>Capture Review</h2><p>{report.status === "ready_for_review" || (report.status === "generated" && pdfArtifact) ? "✓ Completed" : "Review required"}</p></section>{report.status === "generated" && pdfArtifact ? <><section aria-label="Report"><h2>Report</h2><p>✓ Generated</p></section><div className="actions"><button className="primary" onClick={() => openPdf()}>Open PDF</button><button onClick={() => openPdf(true)}>Download PDF</button><button onClick={openPreview}>Preview Report</button><button onClick={() => setReviewOpen(true)}>View Review</button></div></> : report.status === "ready_for_review" ? <div className="actions"><button onClick={() => setReviewOpen(true)}>View Review</button><button onClick={openPreview}>Preview Report</button><button className="primary" disabled={busy} onClick={() => void generatePdf()}>{busy ? "Generating PDF…" : "Generate PDF"}</button></div> : <button className="primary" onClick={() => setReviewOpen(true)}>Review Report</button>}{automaticItems.length > 0 && <button className="secondary" onClick={() => void startAutomaticRunner()} disabled={readinessLoading}>Start Fresh Automatic Capture · {automaticItems.length} sections</button>}</> : <div className="actions"><button className="primary" onClick={startRunner} disabled={readinessLoading}>Start Report</button>{canResume && <button className="primary" onClick={() => void startAutomaticRunner("resume")} disabled={readinessLoading}>Resume Automatic Capture · {resumeQueue.map(({ label }) => label).join(", ")}</button>}{automaticItems.length > 0 && <button onClick={() => void startAutomaticRunner()} disabled={readinessLoading}>Start Automatic Capture · {automaticItems.length} sections</button>}</div>}
+      <div className="period-preview"><span>Client<strong>{report.client.name}</strong></span><span>Report Month<strong>{formatReportMonth(report.reportMonth)}</strong></span><span>Reporting Period<strong>{formatCalendarRange(report.period.startDate, report.period.endDate)}</strong></span><span>Previous Comparison<strong>{formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}</strong></span></div>
+      {clientSetupMissing && <div role="alert" className="notice error-notice" aria-label="Client setup incomplete"><strong>Client setup incomplete</strong><p>Missing:</p><ul>{clientSetupMissing.map((item) => <li key={item}>{item}</li>)}</ul><p className="support-copy">Automatic capture and final generation stay disabled until the client is READY.</p></div>}
+      <p className="progress-copy">{automaticComplete && !runner.isComplete ? `Automatic capture: ${automaticTypes.length} / ${expectedAutomaticCount} sections captured` : `Final report readiness: ${runner.completed} / ${runner.required.length} required screenshots approved`}</p>
+      {runner.isComplete ? <><section aria-label="Capture Review"><h2>Capture Review</h2><p>{report.status === "ready_for_review" || (report.status === "generated" && pdfArtifact) ? "✓ Completed" : "Review required"}</p></section>{report.status === "ready_for_review" || (report.status === "generated" && pdfArtifact) ? <div className="actions"><button onClick={() => setReviewOpen(true)}>View Review</button><button onClick={openPreview}>Preview Report</button></div> : <div className="actions"><button className="primary" disabled={busy || dataBlockers.length > 0 || Boolean(clientSetupBlocker)} onClick={() => void finalizeReport()}>Finish Final Report</button><button onClick={() => setReviewOpen(true)}>Review Report</button></div>}{automaticItems.length > 0 && <button className="secondary" onClick={() => void startAutomaticRunner()} disabled={readinessLoading || Boolean(clientSetupBlocker)}>Start Fresh Automatic Capture · {automaticItems.length} sections</button>}</> : <>{awaitingApproval && <section aria-label="Optional Human Review"><p className="support-copy">Human review is optional: the final report is generated automatically from the machine-validated captures.</p>
+        <div className="actions"><button disabled={busy || autoGenerating || approveBlockers.length > 0} onClick={() => { setFinalizeError(null); setApproveAllOpen(true); }}>Review & Approve {automaticTypes.length} Captures</button></div></section>}
+      <div className="actions"><button className={automaticComplete ? undefined : "primary"} onClick={startRunner} disabled={readinessLoading || Boolean(clientSetupBlocker)}>Start Report</button>{canResume && <button className="primary" onClick={() => void startAutomaticRunner("resume")} disabled={readinessLoading || Boolean(clientSetupBlocker)}>Resume Automatic Capture · {resumeQueue.map(({ label }) => label).join(", ")}</button>}{automaticItems.length > 0 && <button onClick={() => void startAutomaticRunner()} disabled={readinessLoading || Boolean(clientSetupBlocker)}>Start Automatic Capture · {automaticItems.length} sections</button>}</div></>}
       <button className="secondary" onClick={onStartNew}>Start New Report</button>
     </section>
-    {localImportedReviewEnabled() && hasAllAutomaticCaptures && <section className="card" aria-label="Development Review PDF"><h2>Development Review PDF</h2><p className="support-copy">{includesSubscriberGrowth ? "DEVELOPMENT REVIEW — 9 CORE SECTIONS + SUBSCRIBER GROWTH VERIFIED." : "DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED."} Optional sections remain intentionally unconfigured when no verified evidence exists.</p><div className="actions"><button className="primary" disabled={developmentReviewBusy} onClick={() => void generateDevelopmentReviewPdf()}>{developmentReviewBusy ? "Generating Review PDF…" : developmentReviewPdf ? "Regenerate Review PDF" : "Generate Review PDF"}</button>{developmentReviewPdf && <><button onClick={() => setDevelopmentPreviewOpen((open) => !open)}>{developmentPreviewOpen ? "Hide Review PDF Preview" : "Preview Review PDF"}</button><button onClick={() => openDevelopmentReviewPdf(false)}>Open PDF</button><button onClick={() => openDevelopmentReviewPdf(true)}>Download PDF</button></>}</div>{developmentReviewPdf && <p className="support-copy">Saved for report version {developmentReviewPdf.reportVersion} · {developmentReviewPdf.physicalPageCount} pages · {developmentReviewPdf.fileName}</p>}{developmentPreviewOpen && developmentReviewPdf && <iframe className="review-pdf-preview" title="Development Review PDF Preview" src={api.developmentReviewPdfUrl(report.id)} />}</section>}
+    {localImportedReviewEnabled() && hasAllAutomaticCaptures && <section className="card" aria-label="Development Review PDF"><p className="kicker">DEVELOPMENT REVIEW PDF</p><h2>Development Review PDF</h2><p className="notice">This is a temporary review PDF. It does not update Google Drive or the editable Google Doc.</p><p className="support-copy">{includesSubscriberGrowth ? "DEVELOPMENT REVIEW — 9 CORE SECTIONS + SUBSCRIBER GROWTH VERIFIED." : "DEVELOPMENT REVIEW — 9 CORE SECTIONS VERIFIED."} Optional sections remain intentionally unconfigured when no verified evidence exists.</p><div className="actions"><button className="primary" disabled={developmentReviewBusy} onClick={() => void generateDevelopmentReviewPdf()}>{developmentReviewBusy ? "Generating Review PDF…" : developmentReviewPdf ? "Regenerate Review PDF" : "Generate Review PDF"}</button>{developmentReviewPdf && <><button onClick={() => setDevelopmentPreviewOpen((open) => !open)}>{developmentPreviewOpen ? "Hide Review PDF Preview" : "Preview Review PDF"}</button><button onClick={() => openDevelopmentReviewPdf(false)}>Open Review PDF</button><button onClick={() => openDevelopmentReviewPdf(true)}>Download Review PDF</button></>}</div>{developmentReviewPdf && <p className="support-copy">Saved for report version {developmentReviewPdf.reportVersion} · {developmentReviewPdf.physicalPageCount} pages · {developmentReviewPdf.fileName}</p>}{developmentPreviewOpen && developmentReviewPdf && <iframe className="review-pdf-preview" title="Development Review PDF Preview" src={api.developmentReviewPdfUrl(report.id)} />}</section>}
+    <FinalClientReport report={report} cover={reportCover(report)} approved={runner.completed} required={runner.required.length} complete={runner.isComplete} automatic={{ captured: automaticTypes.length, expected: expectedAutomaticCount, complete: automaticComplete, validated: automaticValidated, blockers: autoBlockers, generating: autoGenerating, error: autoError, humanApproved: approvedAutomaticCount }} artifact={pdfArtifact} busy={busy} dataBlockers={dataBlockers} profileCurrency={targets?.profile?.currency ?? null} finalizing={finalizing} finalizeError={finalizeError} deliveryRetry={deliveryRetry} onApplyCurrency={() => void applyProfileCurrency()} onGenerate={() => void (report.status === "ready_for_review" || report.status === "approved" ? generatePdf() : autoGenerateFinal())} onRetryDelivery={(kind) => void retryDelivery(kind)} onOpen={openPdf} />
     <section className="card" aria-label="Client Setup"><div className="section-heading"><div><h2>Client Setup</h2><p className="support-copy">Automatic capture verifies the currently authorized Klaviyo account and discovers Business Review before section one. Final-only targets do not block the {automaticItems.length} automatic sections.</p></div><button onClick={() => setTargetEditorOpen((open) => !open)}>{targetEditorOpen ? "Close Advanced Targets" : "Configure Missing Targets"}</button></div>
       <ul className="checklist"><li><span className={`check-icon ${targets?.businessReview?.accountLabel ? "approved" : "pending"}`}>{targets?.businessReview?.accountLabel ? "✓" : "○"}</span><span><strong>Klaviyo account</strong><small>{targets?.businessReview?.accountLabel ? `${targets.businessReview.accountLabel}${targets.businessReview.providerAccountId ? " · stable identity saved" : " · display identity saved"}` : "Not yet verified · Tention verifies the authorized account before capture"}</small></span></li><li><span className={`check-icon ${clientConfigurationBlocker ? "unapproved" : "approved"}`}>{clientConfigurationBlocker ? "!" : "✓"}</span><span><strong>Timezone</strong><small>{clientProfile ? `${clientProfile.timezone} · saved client configuration` : `Not saved for this client · this report was created with ${report.client.timezone}`}</small></span></li><li><span className="check-icon pending">○</span><span><strong>Overview source</strong><small>Uses the current authorized Klaviyo reporting tab · checked during capture</small></span></li><li><span className={`check-icon ${targets?.businessReview?.dashboardUrl ? "approved" : "pending"}`}>{targets?.businessReview?.dashboardUrl ? "✓" : "○"}</span><span><strong>Business Review</strong><small>{targets?.businessReview?.dashboardUrl ? "Verified reporting source saved for this client" : "Not yet verified · discovered automatically during preflight"}</small></span></li>
         {includesSubscriberGrowth && <li><span className={`check-icon ${targets?.sourceUrls?.subscriberGrowthUrl ? "approved" : "pending"}`}>{targets?.sourceUrls?.subscriberGrowthUrl ? "✓" : "○"}</span><span><strong>Subscriber Growth source</strong><small>{targets?.sourceUrls?.subscriberGrowthUrl ? "Verified Subscriber growth source saved for this client · reused every month" : "Not yet saved · open Audience → Profiles → View subscriber growth (any view or date) and click the Tention toolbar icon once · it is prepared and saved automatically"}</small></span>{!targets?.sourceUrls?.subscriberGrowthUrl && <button disabled={targetBusy} onClick={() => void discoverAndSaveSubscriberGrowth()}>Save Subscriber Growth Source</button>}</li>}</ul>
@@ -695,12 +775,13 @@ function ReportDetail({ api, captureService, navigationService, automaticCapture
     <section className="card" aria-label="Automatic Capture Progress"><div className="section-heading"><h2>Automatic Capture Progress</h2><span className="count">{automaticItems.length} supported sections</span></div><p className="support-copy">Captured: {automaticItems.filter(({ state }) => state === "approved" || state === "unapproved").length} / {automaticItems.length} · Pending review: {automaticItems.filter(({ state }) => state === "unapproved").length} · Approved: {automaticItems.filter(({ state }) => state === "approved").length} · Missing/stale: {automaticItems.filter(({ state }) => state === "missing" || state === "stale").length}</p><ul className="checklist runner-checklist">{automaticItems.map((item) => <li key={item.section}>{item.section === "top_campaigns" && item.state === "stale" ? <button className="recapture-row-button" aria-label="Recapture Top Campaigns" onClick={() => recaptureStaleTopCampaigns(item)}><span className={`check-icon ${item.state}`}>○</span><span><strong>{item.label}</strong><small>Stale evidence · recapture required</small></span><span className="recapture-action-label">Recapture</span></button> : <><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.state === "unapproved" ? "!" : "○"}</span><span><strong>{item.label}</strong><small>{item.state === "approved" ? "Approved" : item.state === "unapproved" ? "Captured · Pending review" : item.state === "stale" ? "Stale evidence · recapture required" : "Missing"}</small></span>{item.state === "approved" && <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button>}</>}</li>)}</ul></section>
     <section className="card" aria-label="Final Report Readiness"><h2>Final Report Readiness</h2><p className="support-copy">Final report progress counts required screenshots only after approval. The final-only sections below are separate from the {automaticItems.length} automatic captures; required/optional status is shown explicitly.</p>{finalOnlyItems.length ? <ul className="checklist">{finalOnlyItems.map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : "○"}</span><span><strong>{item.label}</strong><small>{item.state === "approved" ? "Approved" : item.state === "unapproved" ? "Captured · Pending review" : item.state === "stale" ? "Stale · recapture required" : "Not yet captured"} · {item.requirement === "required" ? "Required for final report" : "Optional"}</small></span></li>)}</ul> : <p className="support-copy">No final-only screenshot sections are configured.</p>}</section>
     <section className="card"><div className="section-heading"><h2>Report Progress</h2><span className="count">{runner.completed} / {runner.required.length} required completed</span></div>
-      <ul className="checklist runner-checklist">{runner.required.map((item) => <li key={item.section} className={item.section === runner.next?.section ? "current-step" : ""}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.section === runner.next?.section ? "→" : "○"}</span><span><strong>{item.label}</strong><small>{item.section === runner.next?.section ? "Next required capture" : checklistText(item.state, item.requirement)}</small></span>{localImportedReviewEnabled() && item.state === "unapproved" && item.screenshotType && report.screenshots.some((shot) => shot.type === item.screenshotType && shot.captureOrigin === "live_acceptance_import") && <button disabled={busy} onClick={() => selectImportedReview(item)}>Review saved capture</button>}{item.state === "approved" && <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button>}</li>)}</ul>
+      <ul className="checklist runner-checklist">{runner.required.map((item) => <li key={item.section} className={item.section === runner.next?.section ? "current-step" : ""}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : item.section === runner.next?.section ? "→" : "○"}</span><span><strong>{item.label}</strong><small>{item.section === runner.next?.section ? "Next required capture" : checklistText(item.state, item.requirement)}</small></span>{localImportedReviewEnabled() && item.state === "unapproved" && item.screenshotType && report.screenshots.some((shot) => shot.type === item.screenshotType && shot.captureOrigin === "live_acceptance_import") && <><button disabled={busy} onClick={() => selectImportedReview(item)}>Review saved capture</button>{automaticTypeSet.has(item.screenshotType) && typeof api.startLocalAutomaticCaptureRun === "function" && report.status === "draft" && <button disabled={busy || readinessLoading} onClick={() => void startAutomaticRunner("resume", item)}>Retake saved capture</button>}</>}{item.state === "approved" && <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button>}</li>)}</ul>
     </section>
     {optional.length > 0 && <details className="card optional-sections"><summary>Optional Sections · {optional.length} available</summary><ul className="checklist">{optional.map((item) => <li key={item.section}><span className={`check-icon ${item.state}`}>{item.state === "approved" ? "✓" : "○"}</span><span><strong>{item.label}</strong><small>{checklistText(item.state, item.requirement)}</small></span>{localImportedReviewEnabled() && item.state === "unapproved" && item.screenshotType && report.screenshots.some((shot) => shot.type === item.screenshotType && shot.captureOrigin === "live_acceptance_import") && <button disabled={busy} onClick={() => selectImportedReview(item)}>Review saved capture</button>}{item.state === "approved" ? <button disabled={busy} onClick={() => selectManualCapture(item)}>Retake</button> : !report.screenshots.some((shot) => shot.type === item.screenshotType && shot.captureOrigin === "live_acceptance_import") && <button disabled={busy} onClick={() => selectManualCapture(item)}>Capture</button>}</li>)}</ul></details>}
     <details className="card report-options"><summary>Report options</summary><button className="danger" disabled={busy} onClick={() => onRequestDelete(report)}>Delete Report</button></details>
     {conflict && <section role="alert" className="card conflict"><h2>This report was updated somewhere else.</h2><p>Reload the latest version before deciding what to do next.</p><button onClick={() => void reload()}>Reload Latest Version</button></section>}
     {actionError && <p role="alert" className="notice error-notice">{actionError}</p>}
+    {preflightBlocker && <section role="alert" aria-label={preflightBlocker.title} className={`notice ${preflightBlocker.kind === "KLAVIYO_TAB_ACCESS_REQUIRED" ? "" : "error-notice"}`}><strong>{preflightBlocker.title}</strong><p>{preflightBlocker.message}</p>{preflightBlocker.resumesOnToolbarClick && <p className="support-copy">Capture continues automatically after that click.</p>}{preflightBlocker.code && <small>{preflightBlocker.code}</small>}</section>}
     <section className="card advanced"><button className="text-button" aria-expanded={advancedOpen} onClick={toggleAdvanced}>{advancedOpen ? "Hide Advanced / Debug" : "Show Advanced / Debug"}</button>
       {advancedOpen && <div className="advanced-content"><p className="support-copy">Technical report state and validation details. These controls are not part of the capture workflow.</p>
         {import.meta.env.DEV && <section aria-label="Development capture persistence"><h2>Development capture persistence</h2><div className="metadata"><span>API<strong>{safeApiDisplayUrl(extensionApiBaseUrl)}</strong></span><span>Report ID<strong>{report.id}</strong></span><span>Client ID<strong>{report.client.id}</strong></span><span>Month<strong>{toMonthValue(report.reportMonth)}</strong></span><span>Last capture upload<strong>{captureUploadStatus?.stage ?? "not attempted"}</strong></span><span>Last backend response<strong>{captureUploadStatus?.httpStatus === null || captureUploadStatus?.httpStatus === undefined ? "no HTTP response" : `HTTP ${captureUploadStatus.httpStatus}`}{captureUploadStatus?.operation ? ` · ${captureUploadStatus.operation}` : ""}</strong></span><span>Typed error<strong>{captureUploadStatus?.errorCode ?? "none"}</strong></span></div></section>}
@@ -728,71 +809,6 @@ function ReportDeleteDialog({ report, confirmation, busy, error, onConfirmation,
 }) {
   return <section role="dialog" aria-modal="true" aria-labelledby="delete-report-title" className="card delete-dialog"><h2 id="delete-report-title">Delete report?</h2><p><strong>{report.client.name}</strong><br />{formatReportMonth(report.reportMonth)}</p><p className="support-copy">This permanently deletes this monthly report and its stored screenshot assets.</p><label>Type DELETE to confirm<input aria-label="Type DELETE to confirm" value={confirmation} onChange={(event) => onConfirmation(event.target.value)} autoComplete="off" /></label>{error && <p role="alert" className="notice error-notice">{error}</p>}<div className="actions"><button disabled={busy} onClick={onCancel}>Cancel</button><button className="danger" disabled={busy || confirmation !== "DELETE"} onClick={onDelete}>{busy ? "Deleting…" : "Delete Report"}</button></div></section>;
 }
-
-function ClientTargetEditor({ targets, busy, error, onSave, onDiscover, onUseCurrentPage }: { targets: ClientReportTargets | null; busy: boolean; error: string | null; onSave(input: ClientReportTargetsInput): void; onDiscover(): void; onUseCurrentPage(): void }) {
-  const [value, setValue] = useState<ClientReportTargetsInput>(() => targetInput(targets));
-  useEffect(() => { setValue(targetInput(targets)); }, [targets]);
-  const updateEntity = (key: "customerSegment" | "nonCustomerSegment", field: "id" | "name", next: string) => {
-    setValue((current) => ({ ...current, [key]: { ...(current[key] ?? {}), [field]: next } }));
-  };
-  return <form className="section-config" onSubmit={(event) => { event.preventDefault(); onSave(cleanTargetInput(value)); }}>
-    <fieldset disabled={!targets || busy}><legend>Client capture targets</legend>
-      <p className="support-copy">Store only stable IDs or clear names. These settings are shared by this client’s reports; they do not navigate or inspect Klaviyo.</p>
-      <div className="business-review-target" aria-label="Business Review discovery"><strong>Business Review reporting source</strong><p className="support-copy">{targets?.businessReview?.dashboardUrl ? `Verified for ${targets.businessReview.accountLabel ?? "this client"}. The dashboard address stays internal.` : "Not configured. Tention can discover the existing dashboard from the authenticated Klaviyo account."}</p><div className="actions"><button type="button" disabled={busy} onClick={onDiscover}>{busy ? "Verifying…" : "Discover Business Review"}</button><button type="button" disabled={busy} onClick={onUseCurrentPage}>Use Current Page</button></div></div>
-      <details className="advanced-target-fields"><summary>Advanced report targets</summary><p className="support-copy">These stable names/IDs are only needed for ambiguous final-report sections. They are not required to start the automatic capture.</p>
-      {sourceUrlFields.map(([key, label]) => <label key={key}>{label}<input aria-label={label} type="url" value={value.sourceUrls?.[key] ?? ""} onChange={(event) => setValue((current) => ({ ...current, sourceUrls: { ...(current.sourceUrls ?? {}), [key]: event.target.value } }))} /></label>)}
-      <label>Email Welcome flow listing IDs (comma-separated)<input aria-label="Email Welcome flow listing IDs" value={(value.welcomeFlowListing?.flows ?? []).map(({ id }) => id).join(", ")} onChange={(event) => setValue((current) => ({ ...current, welcomeFlowListing: { mode: "email_welcome_flows", flows: pairTargets(splitTargets(event.target.value), current.welcomeFlowListing?.flows.map(({ name }) => name) ?? []) } }))} /></label>
-      <label>Email Welcome flow listing names (comma-separated)<input aria-label="Email Welcome flow listing names" value={(value.welcomeFlowListing?.flows ?? []).map(({ name }) => name).join(", ")} onChange={(event) => setValue((current) => ({ ...current, welcomeFlowListing: { mode: "email_welcome_flows", flows: pairTargets(current.welcomeFlowListing?.flows.map(({ id }) => id) ?? [], splitTargets(event.target.value)) } }))} /></label>
-      <label>Customer segment ID<input aria-label="Customer segment ID" value={value.customerSegment?.id ?? ""} onChange={(event) => updateEntity("customerSegment", "id", event.target.value)} /></label>
-      <label>Customer segment name<input aria-label="Customer segment name" value={value.customerSegment?.name ?? ""} onChange={(event) => updateEntity("customerSegment", "name", event.target.value)} /></label>
-      <label>Non-customer segment ID<input aria-label="Non-customer segment ID" value={value.nonCustomerSegment?.id ?? ""} onChange={(event) => updateEntity("nonCustomerSegment", "id", event.target.value)} /></label>
-      <label>Non-customer segment name<input aria-label="Non-customer segment name" value={value.nonCustomerSegment?.name ?? ""} onChange={(event) => updateEntity("nonCustomerSegment", "name", event.target.value)} /></label>
-      <label>Signup form scope<select aria-label="Signup form scope" value={value.signupForms?.mode ?? "all"} onChange={(event) => setValue((current) => ({ ...current, signupForms: { ...(current.signupForms ?? { ids: [], names: [] }), mode: event.target.value as "all" | "configured" } }))}><option value="all">All signup forms</option><option value="configured">Configured forms only</option></select></label>
-      <label>Signup form IDs (comma-separated)<input aria-label="Signup form IDs" value={(value.signupForms?.ids ?? []).join(", ")} onChange={(event) => setValue((current) => ({ ...current, signupForms: { ...(current.signupForms ?? { mode: "all", names: [] }), ids: splitTargets(event.target.value) } }))} /></label>
-      <label>Signup form names (comma-separated)<input aria-label="Signup form names" value={(value.signupForms?.names ?? []).join(", ")} onChange={(event) => setValue((current) => ({ ...current, signupForms: { ...(current.signupForms ?? { mode: "all", ids: [] }), names: splitTargets(event.target.value) } }))} /></label>
-      </details>
-    </fieldset>
-    {error && <p role="alert" className="field-error">{error}</p>}
-    <button className="primary" type="submit" disabled={!targets || busy}>{busy ? "Saving…" : "Save Client Targets"}</button>
-  </form>;
-}
-
-function targetInput(targets: ClientReportTargets | null): ClientReportTargetsInput {
-  return {
-    profile: targets?.profile ?? null,
-    businessReview: targets?.businessReview ?? null, sourceUrls: targets?.sourceUrls ?? null, primaryEmailList: targets?.primaryEmailList ?? null, primarySmsList: targets?.primarySmsList ?? null,
-    welcomeFlow: targets?.welcomeFlow ?? null, welcomeFlowListing: targets?.welcomeFlowListing ?? null, customerSegment: targets?.customerSegment ?? null, nonCustomerSegment: targets?.nonCustomerSegment ?? null,
-    signupForms: targets?.signupForms ?? { mode: "all", ids: [], names: [] },
-  };
-}
-function splitTargets(value: string): string[] { return value.split(",").map((item) => item.trim()).filter(Boolean); }
-function pairTargets(ids: string[], names: string[]) { return ids.map((id, index) => ({ id, name: names[index] ?? id, channel: "email" as const })); }
-function cleanTargetInput(input: ClientReportTargetsInput): ClientReportTargetsInput {
-  const entity = (value: { id?: string | undefined; name?: string | undefined } | null) => {
-    const id = value?.id?.trim(); const name = value?.name?.trim();
-    return id || name ? { ...(id ? { id } : {}), ...(name ? { name } : {}) } : null;
-  };
-  const business = input.businessReview;
-  const dashboardUrl = business?.dashboardUrl?.trim(); const dashboardId = business?.dashboardId?.trim(); const displayName = business?.displayName?.trim(); const accountLabel = business?.accountLabel?.trim(); const providerAccountId = business?.providerAccountId?.trim();
-  const welcomeId = input.welcomeFlow?.id?.trim(); const welcomeName = input.welcomeFlow?.name?.trim(); const aliases = input.welcomeFlow?.aliases ?? [];
-  const sourceUrls = Object.fromEntries(sourceUrlFields.flatMap(([key]) => {
-    const url = input.sourceUrls?.[key]?.trim(); return url ? [[key, url]] : [];
-  })) as ClientSourceUrls;
-  return {
-    profile: input.profile ?? null,
-    businessReview: dashboardUrl || dashboardId || displayName || accountLabel ? { ...(dashboardUrl ? { dashboardUrl } : {}), ...(dashboardId ? { dashboardId } : {}), ...(displayName ? { displayName } : {}), ...(accountLabel ? { accountLabel } : {}), ...(providerAccountId ? { providerAccountId, providerIdentityKind: business?.providerIdentityKind ?? "account" } : {}) } : null,
-    sourceUrls: Object.keys(sourceUrls).length ? sourceUrls : null,
-    primaryEmailList: entity(input.primaryEmailList), primarySmsList: entity(input.primarySmsList), customerSegment: entity(input.customerSegment), nonCustomerSegment: entity(input.nonCustomerSegment),
-    welcomeFlow: welcomeId || welcomeName ? { ...(welcomeId ? { id: welcomeId } : {}), ...(welcomeName ? { name: welcomeName } : {}), aliases } : null,
-    welcomeFlowListing: input.welcomeFlowListing,
-    signupForms: input.signupForms,
-  };
-}
-const sourceUrlFields = [
-  ["overviewUrl", "Overview source URL"], ["campaignsUrl", "Campaigns source URL"], ["topFlowsUrl", "Top Flows source URL"],
-  ["signupFormsUrl", "Signup Forms source URL"], ["flowsUrl", "Flows source URL"],
-  ["segmentsUrl", "Lists & Segments source URL"], ["deliverabilityUrl", "Deliverability Score source URL"],
-] as const satisfies readonly [keyof ClientSourceUrls, string][];
 
 function CaptureReview({ api, report, items, completed, busy, completionError, onComplete, onBack, onRetake }: { api: ApiClient; report: ReportDraft; items: ChecklistItem[]; completed: boolean; busy: boolean; completionError: string | null; onComplete(): void; onBack(): void; onRetake(item: ChecklistItem): void }) {
   const [images, setImages] = useState<Record<string, string>>({});
@@ -854,10 +870,6 @@ function lifecycleActions(status: ReportDraft["status"]): [ReportMutationEvent, 
   };
   return actions[status] ?? [];
 }
-function supportedTimeZones(): string[] {
-  const supportedValuesOf = (Intl as typeof Intl & { supportedValuesOf?: (key: "timeZone") => string[] }).supportedValuesOf;
-  return supportedValuesOf ? supportedValuesOf("timeZone") : ["America/New_York", "America/Los_Angeles", "Europe/London", "Asia/Kolkata"];
-}
 function humanize(value: string): string { return value.split("_").map((word) => word[0]?.toUpperCase() + word.slice(1)).join(" "); }
 function readinessText(status: string): string {
   if (status === "missing_configuration") return "Missing configuration";
@@ -884,4 +896,130 @@ function saveKlaviyoAccountUrl(reportId: string, value: string): void {
     if (value.trim()) sessionStorage.setItem(klaviyoAccountUrlKey(reportId), value.trim());
     else sessionStorage.removeItem(klaviyoAccountUrlKey(reportId));
   } catch { /* Session storage is a convenience, never a report-data dependency. */ }
+}
+
+/** Automatic-capture facts the final report card shows; machine validation, not human approval, gates generation. */
+interface AutomaticFinalState { captured: number; expected: number; complete: boolean; validated: boolean; blockers: string[]; generating: boolean; error: string | null; humanApproved: number }
+
+/**
+ * The client-facing deliverable, kept apart from the development review PDF: final generation writes the canonical
+ * PDF, then the Drive PDF and the editable Google Doc. A fully machine-validated automatic capture generates it on its
+ * own; otherwise it waits for every required screenshot to be approved.
+ */
+function FinalClientReport({ report, cover, approved, required, complete, automatic, artifact, busy, dataBlockers, profileCurrency, finalizing, finalizeError, deliveryRetry, onApplyCurrency, onGenerate, onRetryDelivery, onOpen }: {
+  report: ReportDraft;
+  /** Front-cover values from this report's own period-verified Executive Summary capture; final generation needs them. */
+  cover: ReturnType<typeof reportCover>;
+  approved: number; required: number; complete: boolean; automatic: AutomaticFinalState; artifact: ReportPdfArtifact | null; busy: boolean;
+  /** Currency / conversion metric ID that are not configured; the backend enforces the same rule. */
+  dataBlockers: FinalGenerationBlocker[];
+  /** The client's saved profile currency; offered for this report only while the report's own currency is unset. */
+  profileCurrency: string | null; onApplyCurrency: () => void;
+  /** Progress of the optional Approve All chain; null when idle. */
+  finalizing: FinalizeProgress | null; finalizeError: string | null; deliveryRetry: "drive" | "doc" | "adopt" | null;
+  onGenerate: () => void; onRetryDelivery: (kind: "drive" | "doc" | "adopt") => void; onOpen: (download?: boolean) => void;
+}) {
+  const generated = report.status === "generated" && artifact !== null;
+  const automaticPath = automatic.complete;
+  const working = finalizing !== null || automatic.generating;
+  const reviewDone = report.status === "ready_for_review" || report.status === "approved" || report.status === "failed" || report.status === "auto_validated";
+  const blockedReason = working || generated ? null
+    : dataBlockers.length ? `${dataBlockers.map(({ code }) => code).join(", ")}: ${dataBlockers.map(({ message }) => message).join(" ")}`
+      : automaticPath ? (automatic.blockers.length ? automatic.blockers.join(" ") : null)
+        : !complete ? `Waiting for all ${automatic.expected || required} automatic captures; the final report is then generated automatically.` : null;
+  const drive = artifact?.driveDelivery; const doc = artifact?.googleDoc;
+  // The Drive month folder that holds both the PDF and the Doc (Root/Year/Month).
+  const folderId = drive?.driveFolderId ?? doc?.googleDocFolderId ?? null;
+  const progress = finalizing ? finalizing.stage === "approving" ? `Approving ${finalizing.approved} / ${finalizing.total}…` : finalizing.stage === "submitting" ? "Submitting for review…" : "Generating…"
+    : automatic.generating ? "Validating and generating…" : null;
+  const validationState = automatic.generating && !automatic.validated ? "Validating…"
+    : automatic.validated || generated ? "PASS"
+      : automatic.error ? "FAIL"
+        : blockedReason ? "BLOCKED" : automaticPath ? "Pending" : "Waiting for capture";
+  const pdfState = progress ? progress : generated ? "PASS" : automatic.error && automatic.validated ? "FAIL" : blockedReason ? "BLOCKED" : "Not generated";
+  const driveState = progress ? "Waiting for PDF" : !drive ? (generated ? "FAIL · not delivered" : blockedReason ? "BLOCKED" : "Not generated") : drive.driveUploadStatus === "uploaded" ? "PASS" : `FAIL · ${drive.driveErrorCode ?? "unknown"}`;
+  const docState = progress ? "Waiting for PDF" : !doc ? (generated ? "FAIL · not synced" : blockedReason ? "BLOCKED" : "Not generated") : doc.googleDocStatus === "synced" ? "PASS" : `FAIL · ${doc.googleDocErrorCode ?? "unknown"}`;
+  // A retry only after a failed attempt; a successful automatic capture never needs a Generate click.
+  const canRetryGenerate = !generated && !working && !blockedReason && (automatic.error !== null || report.status === "failed" || (reviewDone && !automaticPath));
+  return <section className="card" aria-label="Final Client Report"><p className="kicker">FINAL CLIENT REPORT</p><h2>Final Client Report</h2>
+    <p className="support-copy">{report.client.name} · {formatReportMonth(report.reportMonth)} · {formatCalendarRange(report.period.startDate, report.period.endDate)}</p>
+    <div className="metadata">
+      <span>Captured<strong>{automaticPath || automatic.captured ? `${automatic.captured}/${automatic.expected}` : `${approved} / ${required}`}</strong></span>
+      <span>Automated validation<strong>{validationState}</strong></span>
+      <span>Cover values<strong>{cover.ok ? "PASS" : "NOT VERIFIED"}</strong></span>
+      {progress && <span>Final Report<strong>{progress}</strong></span>}
+      <span>Final PDF<strong>{pdfState}</strong></span>
+      <span>Google Drive<strong>{driveState}</strong></span>
+      <span>Google Doc<strong>{docState}</strong></span>
+      <span>Human review<strong>{automaticPath ? (automatic.humanApproved > 0 ? `Optional · ${automatic.humanApproved}/${automatic.captured} approved` : "Optional") : `${approved} / ${required} approved`}</strong></span>
+    </div>
+    {blockedReason && <p className="support-copy">Reason: {blockedReason}</p>}
+    {!cover.ok && automatic.complete && !generated && <p role="status" className="notice error-notice">Report cover: {cover.issues.map(({ metric, message }) => metric ? `${metric} — ${message}` : message).join(" ")} A fresh Executive Summary capture reads these values; they are never taken from an image.</p>}
+    {automatic.error && <p role="alert" className="notice error-notice">Automatic final report failed: {automatic.error}. No capture was repeated; saved screenshots are unchanged.</p>}
+    {finalizeError && <p role="alert" className="notice error-notice">{finalizeError}</p>}
+    {!generated && report.client.currency === null && profileCurrency && /^[A-Z]{3}$/.test(profileCurrency) && <div className="actions"><button disabled={busy} onClick={onApplyCurrency}>Apply client currency ({profileCurrency}) to this report</button></div>}
+    {!generated && dataBlockers.length > 0 && <p role="status" className="notice error-notice">Data definition incomplete — final generation stays blocked until these are configured: {dataBlockers.map(({ code, field }) => `${code} (${field})`).join(", ")}.</p>}
+    {/* The Drive PDF is a fixed copy; the native Google Doc is the editable version. They are different files. */}
+    <div className="actions" aria-label="Report files">
+      {drive?.driveWebViewLink && <a className="button-link" href={drive.driveWebViewLink} target="_blank" rel="noopener noreferrer" title={drive.driveFileName ?? undefined}>Open Drive PDF</a>}
+      {doc?.googleDocWebViewLink && <a className="button-link" href={doc.googleDocWebViewLink} target="_blank" rel="noopener noreferrer" title={doc.googleDocName ?? undefined}>{doc.googleDocStatus === "synced" ? "Open Editable Google Doc" : "Open Existing Google Doc"}</a>}
+      {folderId && <a className="button-link" href={`https://drive.google.com/drive/folders/${encodeURIComponent(folderId)}`} target="_blank" rel="noopener noreferrer">Open {formatReportMonth(report.reportMonth)} Folder</a>}
+    </div>
+    {doc?.googleDocCandidateId && <div role="status" className="notice error-notice" aria-label="Unverified Google Doc">
+      <p>Existing Google Doc found but not verified as Tention-managed. It was not changed. Adopt it only if it is this report's Doc: its content will be replaced with this report and Tention will update it from now on.</p>
+      <div className="actions">
+        {doc.googleDocCandidateWebViewLink && <a className="button-link" href={doc.googleDocCandidateWebViewLink} target="_blank" rel="noopener noreferrer">Open Existing Google Doc</a>}
+        <button disabled={deliveryRetry !== null} onClick={() => onRetryDelivery("adopt")}>{deliveryRetry === "adopt" ? "Adopting…" : "Adopt Existing Doc"}</button>
+      </div>
+    </div>}
+    <div className="actions">
+      {canRetryGenerate && <button className="primary" disabled={busy} onClick={onGenerate}>{busy ? "Generating Final Report…" : "Retry Final Report"}</button>}
+      {generated && <><button className="primary" onClick={() => onOpen()}>Open Final PDF</button><button onClick={() => onOpen(true)}>Download Final PDF</button></>}
+      {generated && drive?.driveUploadStatus !== "uploaded" && <button disabled={deliveryRetry !== null} onClick={() => onRetryDelivery("drive")}>{deliveryRetry === "drive" ? "Retrying Drive upload…" : "Retry Google Drive upload"}</button>}
+      {generated && doc?.googleDocStatus !== "synced" && <button disabled={deliveryRetry !== null} onClick={() => onRetryDelivery("doc")}>{deliveryRetry === "doc" ? "Retrying Google Doc…" : "Retry Google Doc"}</button>}
+    </div>
+  </section>;
+}
+
+/**
+ * Shows every saved capture before a single explicit approval. Each pending image is fetched through the backend's
+ * review route, which re-verifies client, month, source proof, stored bytes and SHA-256 before serving it; approval is
+ * offered only once all of them loaded. Nothing is approved until the user confirms.
+ */
+function ApproveAllReview({ api, report, items, blockers, onConfirm, onBack }: {
+  api: ApiClient; report: ReportDraft; items: ChecklistItem[]; blockers: string[]; onConfirm(): void; onBack(): void;
+}) {
+  const [images, setImages] = useState<Record<string, string>>({});
+  const [failures, setFailures] = useState<Record<string, string>>({});
+  // Reload only when the set of captures itself changes (section, hash, approval), not on every parent render.
+  const captureKey = items.map((item) => { const shot = report.screenshots.find((candidate) => candidate.type === item.screenshotType); return `${item.section}:${shot?.sha256 ?? "-"}:${shot?.approved ? 1 : 0}`; }).join("|");
+  useEffect(() => {
+    setImages({}); setFailures({});
+    let active = true; const urls: string[] = [];
+    for (const item of items) {
+      const shot = item.screenshotType ? report.screenshots.find((candidate) => candidate.type === item.screenshotType) : undefined;
+      if (!shot) { setFailures((current) => ({ ...current, [item.section]: "Capture missing." })); continue; }
+      const load = shot.approved ? api.getScreenshotImage(report.id, shot.type) : api.getPendingImportedScreenshotImage(report.id, shot.type, shot.sha256 ?? "");
+      void load.then((blob) => { const url = URL.createObjectURL(blob); urls.push(url); if (active) setImages((current) => ({ ...current, [item.section]: url })); })
+        .catch((caught) => { if (active) setFailures((current) => ({ ...current, [item.section]: caught instanceof ApiError ? caught.message : "Stored capture could not be verified." })); });
+    }
+    return () => { active = false; urls.forEach((url) => URL.revokeObjectURL(url)); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- captureKey covers items and screenshots
+  }, [api, report.id, captureKey]);
+  const loaded = items.filter((item) => images[item.section]).length;
+  const ready = loaded === items.length && Object.keys(failures).length === 0 && blockers.length === 0;
+  return <main><section className="card report-hero"><p className="kicker">Capture review</p><h1>Review & approve {items.length} captures</h1>
+      <p className="support-copy">{report.client.name} · {formatReportMonth(report.reportMonth)} · {formatCalendarRange(report.period.startDate, report.period.endDate)} compared to {formatCalendarRange(report.period.previousStartDate, report.period.previousEndDate)}</p>
+      <p className="support-copy">Check every screenshot below. Approving all {items.length} then creates the final PDF, the Google Drive PDF and the editable Google Doc automatically.</p></section>
+    {blockers.length > 0 && <p role="alert" className="notice error-notice">Approval unavailable: {blockers.join(" ")}</p>}
+    {Object.keys(failures).length > 0 && <p role="alert" className="notice error-notice">Not all captures could be verified, so nothing can be approved: {Object.entries(failures).map(([section, message]) => `${section}: ${message}`).join(" · ")}</p>}
+    <section className="card review-grid">{items.map((item, index) => {
+      const shot = report.screenshots.find((candidate) => candidate.type === item.screenshotType);
+      return <article key={item.section} aria-label={`Capture ${index + 1} ${item.label}`}><h2>{index + 1}. {item.label}</h2>
+        {images[item.section] ? <img src={images[item.section]} alt={`Saved ${item.label} capture`} /> : failures[item.section] ? <p className="notice error-notice">{failures[item.section]}</p> : <p className="support-copy">Verifying and loading…</p>}
+        <p className="support-copy">{shot?.approved ? "Already approved" : "Pending approval"}{shot ? ` · captured ${new Date(shot.capturedAt).toLocaleString()} · SHA-256 ${(shot.sha256 ?? "missing").slice(0, 12)}…` : ""}</p></article>;
+    })}</section>
+    <div className="actions"><button className="primary" disabled={!ready} onClick={onConfirm}>Approve All {items.length}</button><button onClick={onBack}>Back without approving</button></div>
+    {!ready && blockers.length === 0 && Object.keys(failures).length === 0 && <p className="support-copy">Verified {loaded} / {items.length} captures…</p>}
+  </main>;
 }

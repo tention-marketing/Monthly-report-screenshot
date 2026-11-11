@@ -2,7 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { automaticCaptureTypesForSections, createScreenshotSourceProof, matchesReportCaptureSpec, REPORT_CAPTURE_SPEC_V1, TOP_CAMPAIGNS_LIMIT, TOP_FLOWS_LIMIT, screenshotRecordSchema, screenshotSourceProofSchema, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
-import { deriveClientId, ReportDomainError, ReportPersistenceError, upsertScreenshotMetadataBatch, validateReportDraft, type ReportDraftRepository } from "@tention/report-domain";
+import { applyReportEvent, deriveClientId, ReportDomainError, ReportPersistenceError, upsertScreenshotMetadataBatch, validateReportDraft, type ReportDraftRepository } from "@tention/report-domain";
+
+/**
+ * A fresh complete automatic run may replace the automatic captures of a report in any of these states. A report that
+ * was already reviewed, machine-validated, generated or failed returns to an incomplete state (with a lifecycle event),
+ * so its next final report is validated and generated again from the new captures. Never while generating.
+ */
+const REIMPORTABLE_STATUSES: ReadonlySet<ReportDraft["status"]> = new Set(["draft", "captures_incomplete", "ready_for_review", "auto_validated", "generated", "failed"]);
 import { getReportPeriod } from "@tention/report-core";
 import type { ScreenshotStorage } from "../storage/screenshot-storage.js";
 import { inspectPng } from "../storage/png.js";
@@ -35,7 +42,7 @@ export async function importCompletedAutomaticCaptureRun(options: { repository: 
   const source = await options.repository.getById(run.reportId);
   if (!source || source.client.id !== run.clientId || source.client.name !== run.clientName || source.client.timezone !== run.timezone
     || source.reportMonth.year !== reportMonth.year || source.reportMonth.month !== reportMonth.month || source.period.startDate !== period.startDate || source.period.endDate !== period.endDate
-    || source.period.previousStartDate !== period.previousStartDate || source.period.previousEndDate !== period.previousEndDate || source.status !== "draft") {
+    || source.period.previousStartDate !== period.previousStartDate || source.period.previousEndDate !== period.previousEndDate || !REIMPORTABLE_STATUSES.has(source.status)) {
     throw new ReportDomainError("REPORT_VALIDATION_FAILED", "The automatic run no longer resolves to the expected canonical client/month draft.");
   }
   // Exactly the report's own automatic sections: the nine core sections, plus Section 10 only when the report includes it.
@@ -135,7 +142,11 @@ export async function importCompletedAutomaticCaptureRun(options: { repository: 
       const updated = upsertScreenshotMetadataBatch(draft, newRecords, { now: options.now() });
       const allowedPending = new Set(["REQUIRED_SCREENSHOT_MISSING", "REQUIRED_SCREENSHOT_UNAPPROVED"]);
       if (updated.validation.errors.some(({ code }) => !allowedPending.has(code))) throw new ReportDomainError("REPORT_VALIDATION_FAILED", "Imported automatic captures did not pass Phase A validation.");
-      draft = await options.repository.save(updated, draft.version);
+      // New evidence invalidates any earlier review, validation or generation: the report is reopened in the same save.
+      const reopen = draft.status === "failed" ? "RESET_TO_DRAFT" as const : draft.status === "draft" || draft.status === "captures_incomplete" ? null : "MARK_CAPTURES_INCOMPLETE" as const;
+      draft = reopen
+        ? await options.repository.saveWithLifecycleEvent(applyReportEvent({ ...updated, version: draft.version }, reopen, { now: options.now() }), draft.version, reopen)
+        : await options.repository.save(updated, draft.version);
     }
     const byTypeAfter = new Map(draft.screenshots.map((entry) => [entry.type, entry]));
     if (runTypes.some((type) => byTypeAfter.get(type)?.sha256 !== captures.find((capture) => capture.type === type)?.sha256)

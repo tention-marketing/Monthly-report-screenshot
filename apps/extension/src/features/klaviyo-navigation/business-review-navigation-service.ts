@@ -1,4 +1,5 @@
 import { REPORT_CAPTURE_SPEC_V1, type ReportPeriod } from "@tention/report-schema";
+import { injectPeriodEntry } from "./injected/period-entry-contract.js";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
 import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
 import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
@@ -60,6 +61,8 @@ export class ChromeBusinessReviewCaptureNavigation implements BusinessReviewCapt
       // not cut off immediately after the readiness window.
       if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
       injection = { tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null };
+      // The shared period helper first: the adapter replaces whatever range Klaviyo kept with the report's own.
+      await injectPeriodEntry(scripting, grant.grant.grantedTabId);
       const results = await withTimeout(() => scripting.executeScript<unknown>({
         target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareBusinessReviewCaptureDocument,
         args: [BUSINESS_REVIEW_TARGETS[screenshotType], { startDate: period.startDate, endDate: period.endDate, previousStartDate: period.previousStartDate, previousEndDate: period.previousEndDate }, ...(recoveryRequests(recovery, "extended-readiness") ? [6_000, 30_000] as const : [] as const)],

@@ -29,7 +29,8 @@ export class DashboardAutoCaptureController {
       if (!this.capture.captureVisibleTabFor) { await this.fail(request, "CAPTURE_FAILED", "The verified Klaviyo tab could not be captured safely."); return; }
       await this.store.set({ request, stage: "capturing" });
       const captured = await this.capture.captureVisibleTabFor({ tabId: prepared.sourceTabId, windowId: prepared.windowId });
-      await this.store.set({ request, stage: "review_ready", sourceTabId: prepared.sourceTabId, detectedPeriod: prepared.detectedPeriod, periodEvidence: prepared.observedPeriod, target: prepared.target, captured });
+      await this.store.set({ request, stage: "review_ready", sourceTabId: prepared.sourceTabId, detectedPeriod: prepared.detectedPeriod, periodEvidence: prepared.observedPeriod, target: prepared.target, captured,
+        ...(prepared.businessPerformance !== undefined ? { businessPerformanceEvidence: prepared.businessPerformance, businessPerformanceIssues: prepared.businessPerformanceIssues ?? [], businessPerformanceReadout: prepared.businessPerformanceReadout ?? {} } : {}) });
     } catch (error) {
       const raw = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
       const code = typeof raw === "string" ? raw as AutoCaptureFailureState["code"] : "CAPTURE_FAILED";

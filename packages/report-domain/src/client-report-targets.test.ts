@@ -80,3 +80,22 @@ describe("client report targets", () => {
     expect((await repository.get("club-furniture")).businessReview?.providerAccountId).toBe("account_123");
   });
 });
+
+describe("conversion metric IDs are per client", () => {
+  const profile = (name: string, providerMetricId: string | null) => ({ name, timezone: "America/New_York", currency: "USD", conversionMetric: { label: "Placed Order", providerMetricId }, sections: null });
+  const input = (name: string, providerMetricId: string | null) => ({ ...targetInput({ displayName: "Business Review" }), businessReview: null, profile: profile(name, providerMetricId) });
+
+  it("never saves another client's provider metric ID on a new client", async () => {
+    const repository = new InMemoryClientReportTargetsRepository();
+    await repository.save("club-furniture", input("Club Furniture", "KyqTnx"), now);
+    await expect(repository.save("steven-dann", input("Steven Dann", "KyqTnx"), now)).rejects.toMatchObject({ code: "CONVERSION_METRIC_ID_ALREADY_BOUND" });
+    expect((await repository.get("steven-dann")).profile).toBeNull();
+    await expect(repository.save("steven-dann", input("Steven Dann", "SDmet1"), now)).resolves.toMatchObject({ profile: { conversionMetric: { providerMetricId: "SDmet1" } } });
+  });
+
+  it("re-saving the same client with its own metric ID is allowed", async () => {
+    const repository = new InMemoryClientReportTargetsRepository();
+    await repository.save("club-furniture", input("Club Furniture", "KyqTnx"), now);
+    await expect(repository.save("club-furniture", input("Club Furniture", "KyqTnx"), now)).resolves.toMatchObject({ clientId: "club-furniture" });
+  });
+});

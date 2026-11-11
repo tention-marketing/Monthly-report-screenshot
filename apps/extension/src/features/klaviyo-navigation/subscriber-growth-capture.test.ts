@@ -92,9 +92,10 @@ describe("Section 10 capture fails closed", () => {
     live(options);
     await expect(prepareSubscriberGrowthDocument(capture(august, short))).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_CHART_NOT_RENDERED" });
   });
-  it("does not capture while a spinner is showing", async () => {
+  it("does not capture while a spinner is showing over the metrics (a real loading state is PAGE_NOT_READY)", async () => {
     live({ spinner: true });
-    await expect(prepareSubscriberGrowthDocument(capture(august, short))).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_NOT_STABLE", diagnostics: { loading: true } });
+    await expect(prepareSubscriberGrowthDocument(capture(august, short))).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_PAGE_NOT_READY", diagnostics: { failedCondition: "visibleLoadingElements", readiness: { visibleLoadingElements: ["div"] } } });
+    expect(document.querySelector("[data-tention-subscriber-growth]")).toBeNull();
   });
   it("requires the report client's Klaviyo account", async () => {
     const page = live({ account: "Another Brand" });
@@ -156,9 +157,43 @@ describe("Section 10 screenshot bounds", () => {
     expect(page.composer?.style.visibility).toBe("hidden");
     expect(page.clicks).toEqual(["Email", "Apply"]);
   });
+  // Regression (Club Furniture Sep 2026, captured 2026-11-03): the reporting area stretched to the bottom of a tall window,
+  // so the crop carried ~800 px of blank page plus Klaviyo's floating AI prompt below the Email subscribers card.
+  it("crops at the bottom of the Email subscribers card, leaving out blank page and the AI prompt below it", async () => {
+    const page = live({ viewport: { width: 1440, height: 1600 }, contentHeight: 1_550, composer: true });
+    const result = await prepareSubscriberGrowthDocument(capture(september));
+    expect(result.ok ? "ok" : `${result.code}: ${result.message}`).toBe("ok");
+    if (!result.ok || !("targetRect" in result)) return;
+    const { y, height } = result.targetRect;
+    const bottom = y + height;
+    // Everything the section proves is inside: title, Email tab and date range at the top, both charts at the bottom.
+    expect(y).toBeLessThanOrEqual(document.getElementById("date")!.getBoundingClientRect().top);
+    expect(bottom).toBeGreaterThanOrEqual(document.getElementById("bar")!.getBoundingClientRect().bottom);
+    expect(bottom).toBeGreaterThanOrEqual(document.getElementById("content")!.getBoundingClientRect().bottom);
+    // ...and nothing far below the card: the old crop ran to the reporting area's 1,550 px bottom.
+    expect(bottom - document.getElementById("content")!.getBoundingClientRect().bottom).toBeLessThanOrEqual(12);
+    expect(height).toBeLessThan(900);
+    expect(result.diagnostics).toMatchObject({ trimmedBelowCard: expect.any(Number), hiddenOverlays: 0 });
+    expect(Number(result.diagnostics.trimmedBelowCard)).toBeGreaterThan(700);
+    // The AI prompt sits in the trimmed blank space, so it is neither in the crop nor touched.
+    expect(page.composer!.getBoundingClientRect().top).toBeGreaterThan(bottom);
+    expect(page.composer!.style.visibility).toBe("");
+  });
   it("refuses a card taller than the visible tab rather than clipping it", async () => {
     live({ viewport: { width: 1920, height: 700 } });
     await expect(prepareSubscriberGrowthDocument(capture(september))).resolves.toMatchObject({ ok: false, code: "TARGET_BOUNDS_INVALID" });
+  });
+});
+
+describe("account candidates", () => {
+  it("reads the account name wherever the header shows it, not only from header buttons (Steven Dann live layout)", async () => {
+    live();
+    // Klaviyo renders the switcher as avatar initials plus the name in plain header elements.
+    document.querySelector("header")!.innerHTML = `<div class="account-switcher"><span>ST</span><span>Steven Dann</span></div>`;
+    for (const element of document.querySelectorAll("header *")) (element as HTMLElement).getBoundingClientRect = () => ({ x: 0, y: 0, top: 0, left: 0, right: 120, bottom: 20, width: 120, height: 20, toJSON: () => ({}) });
+    const result = await prepareSubscriberGrowthDocument(source);
+    expect(result).toMatchObject({ ok: true, purpose: "source" });
+    expect("accountLabels" in result ? result.accountLabels.join(" | ") : "").toMatch(/steven dann/i);
   });
 });
 
@@ -195,5 +230,111 @@ describe("one-time source setup on the page (purpose: source)", () => {
   it("reports a missing Email tab with a typed failure", async () => {
     live({ hasEmailTab: false });
     await expect(prepareSubscriberGrowthDocument({ ...source, readinessTimeoutMs: 1_000 })).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_SOURCE_WRONG_PAGE" });
+  });
+});
+
+/**
+ * Regression: Purely Nutrient, October 2026, run 8fa3b760 (2026-11-11). Sections 1–9 passed; Section 10 failed 5 attempts
+ * with SUBSCRIBER_GROWTH_PAGE_NOT_READY although the page was visibly ready. Diagnostics showed headings
+ * ["Subscriber growth", "Email subscribers", "34,487", "Subscriber growth", "882", "44", "Changes to subscribers"] and
+ * tabs.channel = []: this email-only account has no Overview | Email | Text message tabs, and the old readiness predicate
+ * required them.
+ */
+describe("Section 10 readiness on the email-only layout (Purely Nutrient, run 8fa3b760)", () => {
+  const october = { startDate: "2026-10-01", endDate: "2026-10-31" };
+  const PURELY = "Purely Nutrient";
+  const purely = (options: SubscriberGrowthFixtureOptions = {}) => installSubscriberGrowthFixture({ picker: "inputs", layout: "email-only", account: PURELY, periodFormat: "long", ...options });
+  const run = (overrides: Partial<SubscriberGrowthCaptureRequest> = {}) => prepareSubscriberGrowthDocument(capture(october, { clientName: PURELY, ...overrides }));
+  const short = { readinessTimeoutMs: 1_500 };
+  const visibleHeadings = () => Array.from(document.querySelectorAll("h1,h2,h3")).map((node) => node.textContent);
+
+  it("1. reproduces the live structure: same headings, no channel tabs, Growth selected, Last 7 days", () => {
+    purely();
+    expect(visibleHeadings()).toEqual(["Subscriber growth", "Email subscribers", "34,487", "Subscriber growth", "882", "44", "Changes to subscribers"]);
+    expect(document.querySelector("#channels")).toBeNull();
+    expect(document.querySelector("#views [aria-selected=true]")?.textContent).toBe("Growth");
+    expect(document.getElementById("date")?.textContent).toBe("Last 7 days");
+  });
+
+  it("2 + 12. is PAGE READY with Last 7 days, sets Oct 1–31, verifies it, and captures the exact counts", async () => {
+    const page = purely();
+    const result = await run();
+    expect(result).toMatchObject({
+      ok: true, detectedPeriod: "October 1 – 31, 2026", periodEvidence: october,
+      evidence: { channel: "email", view: "growth", emailSubscribers: 34_487, newSubscribers: 882, exclusions: 44, visiblePeriodText: "October 1 – 31, 2026" },
+      diagnostics: {
+        periodBefore: "Last 7 days", periodAfter: "October 1 – 31, 2026", periodProof: { periodMatch: true },
+        readiness: { ready: true, pageIdentityFound: true, emailSubscribersHeadingFound: true, channelLayout: "email-only", emailTabFound: false, growthTabFound: true, growthTabSelected: true, subscriberValueFound: true, newSubscribersValueFound: true, exclusionsValueFound: true, visibleLoadingElements: [], periodShown: "Last 7 days" },
+      },
+    });
+    if (!result.ok || !("diagnostics" in result)) return;
+    expect((result.diagnostics.readiness as { chartBounds: Array<{ width: number; height: number }> }).chartBounds.every(({ width, height }) => width > 0 && height > 0)).toBe(true);
+    // Only the date range was changed; nothing that is not a tab or the picker was clicked.
+    expect(page.clicks).toEqual(["Apply"]);
+    expect(page.state.period).toBe("October 1 – 31, 2026");
+    const crop = document.querySelector("[data-tention-subscriber-growth='capture']")!;
+    for (const part of ["#date", "#views [aria-selected=true]", "#head h2", "#line", "#bar"]) expect(crop.querySelector(part), part).not.toBeNull();
+    if ("targetRect" in result) expect(result.targetRect.visibleControls[0]).toEqual({ text: "Email subscribers", selected: true, kind: "email-only-card" });
+  });
+
+  it("3. ignores a hidden spinner still in the DOM (display:none, aria-hidden, zero size)", async () => {
+    purely({ cardExtras: `<div class="Spinner-module" style="display:none"></div><div role="progressbar" aria-hidden="true"></div><div class="skeleton-row" data-rect="40,60,0,0"></div>` });
+    await expect(run()).resolves.toMatchObject({ ok: true, diagnostics: { readiness: { visibleLoadingElements: [] } } });
+  });
+
+  it("4. ignores an unrelated refresh icon beside the date range", async () => {
+    purely({ pageExtras: `<span class="LastUpdated-refresh-spinner" data-rect="1200,0,16,16"></span>` });
+    await expect(run()).resolves.toMatchObject({ ok: true, periodEvidence: october });
+  });
+
+  it("5. ignores a visible tooltip over the metrics", async () => {
+    purely({ cardExtras: `<div role="tooltip" data-rect="40,60,300,60">New subscribers: profiles that opted in <span class="tooltip-spinner"></span></div>` });
+    await expect(run()).resolves.toMatchObject({ ok: true, evidence: { newSubscribers: 882 } });
+  });
+
+  it("6. needs no tab clicks when Growth is already selected", async () => {
+    const page = purely({ view: "Growth" });
+    await expect(run()).resolves.toMatchObject({ ok: true });
+    expect(page.clicks.filter((click) => click !== "Apply")).toEqual([]);
+  });
+
+  it("7. selects Growth when the card opens on another view", async () => {
+    const page = purely({ view: "Opt-in sources" });
+    await expect(run()).resolves.toMatchObject({ ok: true, evidence: { exclusions: 44 } });
+    expect(page.clicks).toEqual(["Growth", "Apply"]);
+  });
+
+  it("8. waits for metrics and charts that render after an async delay", async () => {
+    purely({ renderDelayMs: 200, metricsDelayMs: 600, chartsDelayMs: 900 });
+    await expect(run()).resolves.toMatchObject({ ok: true, evidence: { emailSubscribers: 34_487 } });
+  });
+
+  it("9. a real skeleton covering the card is PAGE_NOT_READY and names the loading element", async () => {
+    purely({ cardExtras: `<div class="skeleton-block" data-rect="40,60,600,300"></div>` });
+    await expect(run(short)).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_PAGE_NOT_READY", diagnostics: { failedCondition: "visibleLoadingElements", readiness: { pageIdentityFound: true, growthTabSelected: true, visibleLoadingElements: ["div.skeleton-block"] } } });
+  });
+
+  it("10. requires a chart area with non-zero visible bounds", async () => {
+    purely({ lineChart: false, barChart: "none" });
+    await expect(run(short)).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_CHART_NOT_RENDERED", diagnostics: { failedCondition: "chartBounds", readiness: { chartBounds: [], subscriberValueFound: true } } });
+  });
+
+  it("11. a ready page showing the wrong period fails as REPORT_PERIOD_NOT_CONFIRMED, never PAGE_NOT_READY", async () => {
+    purely({ picker: "inert", period: "Sep 1 – Sep 30, 2026" });
+    const result = await run(short);
+    expect(result).toMatchObject({ ok: false, code: "REPORT_PERIOD_NOT_CONFIRMED", diagnostics: { readiness: { ready: true }, periodProof: { parsedStart: "2026-09-01", periodMatch: false } } });
+    expect(document.querySelector("[data-tention-subscriber-growth]")).toBeNull();
+  });
+
+  it("still refuses a Text message card that has no channel tabs", async () => {
+    purely();
+    document.querySelector("#head h2")!.textContent = "Text message subscribers";
+    await expect(run(short)).resolves.toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_PAGE_NOT_READY", diagnostics: { readiness: { emailSubscribersHeadingFound: false } } });
+  });
+
+  it("source setup accepts the email-only page without clicking anything", async () => {
+    const page = purely();
+    await expect(prepareSubscriberGrowthDocument(source)).resolves.toMatchObject({ ok: true, purpose: "source", emailSelected: true, growthSelected: true, selections: [] });
+    expect(page.clicks).toEqual([]);
   });
 });

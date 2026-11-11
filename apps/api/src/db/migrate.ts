@@ -2,6 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import type { Pool } from "pg";
 import { createPostgresPool } from "./pool.js";
+import { loadLocalEnvironment } from "../server-config.js";
 
 export async function runMigrations(pool: Pool, directory = fileURLToPath(new URL("migrations", import.meta.url))): Promise<string[]> {
   await pool.query(`
@@ -34,6 +35,8 @@ export async function runMigrations(pool: Pool, directory = fileURLToPath(new UR
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
+  // Local development reads the repository .env, exactly like the API server; the environment takes precedence.
+  loadLocalEnvironment(fileURLToPath(new URL("../../../../.env", import.meta.url)));
   const pool = createPostgresPool(process.env.DATABASE_URL);
   try {
     const applied = await runMigrations(pool);

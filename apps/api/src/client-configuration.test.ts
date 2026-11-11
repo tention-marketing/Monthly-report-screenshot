@@ -10,7 +10,7 @@ let repository: InMemoryReportDraftRepository;
 
 beforeEach(() => {
   repository = new InMemoryReportDraftRepository();
-  app = buildApp({ now: () => new Date(NOW), repository, clientReportTargetsRepository: new InMemoryClientReportTargetsRepository() });
+  app = buildApp({ requireClientSetupReady: false, now: () => new Date(NOW), repository, clientReportTargetsRepository: new InMemoryClientReportTargetsRepository() });
 });
 afterEach(async () => app.close());
 
@@ -64,6 +64,32 @@ describe("canonical client configuration", () => {
     const saved = await configure("alpha-goods", { name: "Alpha Goods", timezone: "Europe/London" }, { businessReview });
     expect(saved.json()).toMatchObject({ profile: { name: "Alpha Goods", timezone: "Europe/London", conversionMetric: { label: "Placed Order", providerMetricId: null } }, businessReview });
     expect((await app.inject({ method: "GET", url: "/api/v1/clients/alpha-goods/report-targets" })).json()).toMatchObject({ profile: { timezone: "Europe/London" }, businessReview });
+  });
+
+  it("saving one client's configuration never changes another client's, in either direction", async () => {
+    const get = async (clientId: string) => (await app.inject({ method: "GET", url: `/api/v1/clients/${clientId}/report-targets` })).json();
+    const alpha = {
+      businessReview: { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/alpha-review", displayName: "Business Review", accountLabel: "AG Alpha Goods" },
+      sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers", deliverabilityUrl: "https://www.klaviyo.com/analytics/deliverability/email/score" },
+    };
+    await configure("alpha-goods", { name: "Alpha Goods", timezone: "America/New_York" }, alpha);
+    const alphaBefore = await get("alpha-goods");
+
+    // A brand-new client starts empty: nothing from the other client is inherited.
+    expect(await get("beta-outfitters")).toMatchObject({ profile: null, businessReview: null, sourceUrls: null });
+    const beta = { businessReview: { dashboardUrl: "https://www.klaviyo.com/analytics/dashboards/beta-review", displayName: "Business Review", accountLabel: "BO Beta Outfitters" } };
+    await configure("beta-outfitters", { name: "Beta Outfitters", timezone: "America/Los_Angeles" }, beta);
+    await configure("beta-outfitters", { name: "Beta Outfitters", timezone: "America/Los_Angeles" }, { ...beta, sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" } });
+    expect(await get("alpha-goods")).toEqual(alphaBefore);
+    const betaAfter = await get("beta-outfitters");
+    expect(betaAfter).toMatchObject({ profile: { name: "Beta Outfitters", timezone: "America/Los_Angeles" }, businessReview: beta.businessReview, sourceUrls: { subscriberGrowthUrl: "https://www.klaviyo.com/people/subscribers" } });
+    expect(betaAfter.sourceUrls.deliverabilityUrl).toBeUndefined();
+
+    // And the reverse: re-saving Client A leaves Client B exactly as it was.
+    await configure("alpha-goods", { name: "Alpha Goods", timezone: "America/New_York" }, { ...alpha, sourceUrls: { ...alpha.sourceUrls, campaignsUrl: "https://www.klaviyo.com/omnicampaigns" } });
+    expect(await get("beta-outfitters")).toEqual(betaAfter);
+    const reports = await Promise.all([createReport({ id: "alpha-goods" }, { year: 2026, month: 9 }), createReport({ id: "beta-outfitters" }, { year: 2026, month: 9 })]);
+    expect(reports.map((report) => report.json().client)).toMatchObject([{ id: "alpha-goods", timezone: "America/New_York" }, { id: "beta-outfitters", timezone: "America/Los_Angeles" }]);
   });
 
   it("does not list clients that only have legacy targets and no profile", async () => {

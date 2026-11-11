@@ -1,4 +1,5 @@
 import type { ReportPeriod } from "@tention/report-schema";
+import { injectPeriodEntry } from "./injected/period-entry-contract.js";
 import { chromeErrorMessage, isChromeOperationTimeout, withTimeout } from "../../lib/chrome/with-timeout.js";
 import { recoveryRequests, waitForSettledTab, type AttemptRecovery } from "../../lib/chrome/settle-tab.js";
 import { injectionFailureDiagnostics, type InjectionResultLike } from "../../lib/chrome/injection-diagnostics.js";
@@ -39,6 +40,7 @@ export class ChromeCampaignsCaptureNavigation implements CampaignsCaptureNavigat
       if (!isCampaignsListUrl(tab.url)) return { kind: "failed", code: "CAMPAIGNS_ROUTE_REQUIRED", message: "Open the Klaviyo Campaigns list (/omnicampaigns), then click the Tention Reports toolbar icon. Individual campaign pages are not permitted." };
       if (recoveryRequests(recovery, "settle-before-inject")) await waitForSettledTab(tabs, grant.grant.grantedTabId);
       injection = { tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null };
+      await injectPeriodEntry(scripting, grant.grant.grantedTabId);
       const results = await withTimeout(() => scripting.executeScript<unknown>({ target: { tabId: grant.grant.grantedTabId, frameIds: [0] }, func: prepareCampaignsCaptureDocument, args: [request] }), "preparing the Klaviyo Campaigns listing", Math.max(this.timeoutMs, 60_000));
       const main = results.find((result) => result.frameId === 0) ?? results[0];
       const describe = (found: InjectionResultLike | null) => injectionFailureDiagnostics({ section: "top_campaigns", scripting: scripting as never, tabs: tabs as never, tabId: grant.grant.grantedTabId, urlBefore: tab.url ?? null, results, main: found, failureStage: "SCRIPT_RESULT" });

@@ -1,6 +1,6 @@
 import {
   clientReportTargetsInputSchema, clientReportTargetsSchema, REPORT_CAPTURE_SPEC_V1,
-  reportReadinessSchema, type ClientReportTargets, type ClientReportTargetsInput,
+  reportReadinessSchema, sameKlaviyoAccountIdentity, type ClientReportTargets, type ClientReportTargetsInput,
   type ReportCaptureSectionKey, type ReportReadiness, type ReportReadinessSection,
   type SectionConfiguration,
 } from "@tention/report-schema";
@@ -88,6 +88,11 @@ function isConfiguredTarget(targets: ClientReportTargets, target: string): boole
 }
 function humanize(value: string): string { return value.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()); }
 
+/** Klaviyo metric IDs are account-specific: one saved on another client can only be a copy, so it is never accepted. */
+export function conversionMetricAlreadyBound(): ReportPersistenceError {
+  return new ReportPersistenceError("CONVERSION_METRIC_ID_ALREADY_BOUND", "This Klaviyo metric ID is already saved on another client. Use the metric ID from this client's own Klaviyo account.");
+}
+
 /** Explicit non-production backing store for local API development and unit tests. */
 export class InMemoryClientReportTargetsRepository implements ClientReportTargetsRepository {
   private readonly values = new Map<string, ClientReportTargets>();
@@ -101,8 +106,14 @@ export class InMemoryClientReportTargetsRepository implements ClientReportTarget
     if (oldBusiness?.providerAccountId && nextBusiness?.providerAccountId !== oldBusiness.providerAccountId) {
       throw new ReportPersistenceError("CLIENT_ACCOUNT_BINDING_IMMUTABLE", "The saved Klaviyo account binding cannot be changed implicitly.");
     }
-    if (!oldBusiness?.providerAccountId && oldBusiness?.accountLabel && nextBusiness?.accountLabel !== oldBusiness.accountLabel) {
+    // The account binding is immutable; only a presentation correction of the same account ("AC Acme Home" →
+    // "Acme Home") may change its label.
+    if (!oldBusiness?.providerAccountId && oldBusiness?.accountLabel && nextBusiness?.accountLabel !== oldBusiness.accountLabel && !sameKlaviyoAccountIdentity(oldBusiness.accountLabel, nextBusiness?.accountLabel)) {
       throw new ReportPersistenceError("CLIENT_ACCOUNT_BINDING_IMMUTABLE", "The saved Klaviyo account binding cannot be changed implicitly.");
+    }
+    const incomingMetricId = normalized.profile?.conversionMetric.providerMetricId?.trim();
+    if (incomingMetricId && [...this.values.entries()].some(([otherClientId, value]) => otherClientId !== clientId && value.profile?.conversionMetric.providerMetricId?.trim() === incomingMetricId)) {
+      throw conversionMetricAlreadyBound();
     }
     const incomingProviderId = nextBusiness?.providerAccountId;
     if (incomingProviderId && [...this.values.entries()].some(([otherClientId, value]) => otherClientId !== clientId && value.businessReview?.providerAccountId === incomingProviderId)) {

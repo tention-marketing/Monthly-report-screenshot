@@ -4,7 +4,7 @@ import {
   ReportPersistenceError, type ReportDraftRepository, type ReportEvent,
 } from "@tention/report-domain";
 import {
-  reportDraftSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, type ReportDraft, type ReportLifecycleEvent, type ReportPdfArtifact,
+  reportDraftSchema, reportLifecycleEventSchema, reportPdfArtifactSchema, type ReportDraft, type ReportLifecycleEvent, type ReportPdfArtifact, type ReportPdfDriveDelivery, reportPdfDriveDeliverySchema, type ReportGoogleDoc, reportGoogleDocSchema,
 } from "@tention/report-schema";
 
 // PostgreSQL DATE is a business calendar date, so never parse it through the machine timezone.
@@ -16,6 +16,8 @@ interface DraftRow extends QueryResultRow {
   previous_period_start: string | Date; previous_period_end: string | Date; status: ReportDraft["status"];
   sections: unknown; screenshots: unknown; validation: unknown; version: number;
   created_at: string | Date; updated_at: string | Date;
+  /** Report-time conversion metric + Klaviyo account; NULL on reports created before client onboarding. */
+  client_setup_snapshot?: unknown;
 }
 
 interface HistoryRow extends QueryResultRow {
@@ -25,7 +27,7 @@ interface HistoryRow extends QueryResultRow {
 }
 interface ArtifactRow extends QueryResultRow {
   id: string; report_id: string; storage_key: string; mime_type: string; byte_size: number;
-  sha256: string; source_fingerprint: string; template_version: string; generated_at: string | Date;
+  sha256: string; source_fingerprint: string; template_version: string; generated_at: string | Date; drive_delivery?: unknown; google_doc?: unknown;
 }
 
 export class PostgresReportDraftRepository implements ReportDraftRepository {
@@ -41,9 +43,9 @@ export class PostgresReportDraftRepository implements ReportDraftRepository {
           INSERT INTO report_drafts (
             id, client_id, client_name, client_timezone, client_currency, report_year, report_month,
             period_start, period_end, previous_period_start, previous_period_end, status, sections,
-            screenshots, validation, version, created_at, updated_at
+            screenshots, validation, version, created_at, updated_at, client_setup_snapshot
           ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
           ) RETURNING *
         `, draftValues(parsed));
         const stored = parseDraftRow(requireRow(result.rows[0]));
@@ -182,6 +184,26 @@ export class PostgresReportDraftRepository implements ReportDraftRepository {
     });
   }
 
+  async saveArtifactDriveDelivery(reportId: string, artifactId: string, delivery: ReportPdfDriveDelivery): Promise<ReportPdfArtifact> {
+    return this.withErrors(async () => {
+      const parsed = reportPdfDriveDeliverySchema.parse(delivery);
+      const result = await this.pool.query<ArtifactRow>(`UPDATE report_pdf_artifacts SET drive_delivery = $3::jsonb
+        WHERE report_id = $1 AND id = $2 RETURNING *`, [reportId, artifactId, JSON.stringify(parsed)]);
+      if (!result.rows[0]) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "The PDF artifact does not exist for this report.");
+      return parseArtifactRow(result.rows[0]);
+    });
+  }
+
+  async saveArtifactGoogleDoc(reportId: string, artifactId: string, googleDoc: ReportGoogleDoc): Promise<ReportPdfArtifact> {
+    return this.withErrors(async () => {
+      const parsed = reportGoogleDocSchema.parse(googleDoc);
+      const result = await this.pool.query<ArtifactRow>(`UPDATE report_pdf_artifacts SET google_doc = $3::jsonb
+        WHERE report_id = $1 AND id = $2 RETURNING *`, [reportId, artifactId, JSON.stringify(parsed)]);
+      if (!result.rows[0]) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "The PDF artifact does not exist for this report.");
+      return parseArtifactRow(result.rows[0]);
+    });
+  }
+
   async rekeyLocalDraft(fromId: string, toId: string, expectedVersion: number): Promise<ReportDraft> {
     return this.withErrors(async () => {
       const client = await this.pool.connect();
@@ -279,12 +301,13 @@ function draftValues(draft: ReportDraft): unknown[] {
     draft.reportMonth.year, draft.reportMonth.month, draft.period.startDate, draft.period.endDate,
     draft.period.previousStartDate, draft.period.previousEndDate, draft.status, JSON.stringify(draft.sections),
     JSON.stringify(draft.screenshots), JSON.stringify(draft.validation), draft.version, draft.createdAt, draft.updatedAt,
+    draft.client.conversionMetric || draft.client.klaviyoAccount ? JSON.stringify({ conversionMetric: draft.client.conversionMetric ?? null, klaviyoAccount: draft.client.klaviyoAccount ?? null }) : null,
   ];
 }
 
 function parseDraftRow(row: DraftRow): ReportDraft {
   const result = reportDraftSchema.safeParse({
-    id: row.id, client: { id: row.client_id, name: row.client_name, timezone: row.client_timezone, currency: row.client_currency?.trim() ?? null },
+    id: row.id, client: { id: row.client_id, name: row.client_name, timezone: row.client_timezone, currency: row.client_currency?.trim() ?? null, ...clientSnapshot(row.client_setup_snapshot) },
     reportMonth: { year: row.report_year, month: row.report_month },
     period: { startDate: calendarDate(row.period_start), endDate: calendarDate(row.period_end), previousStartDate: calendarDate(row.previous_period_start), previousEndDate: calendarDate(row.previous_period_end) },
     status: row.status, sections: row.sections, screenshots: row.screenshots, validation: row.validation,
@@ -292,6 +315,14 @@ function parseDraftRow(row: DraftRow): ReportDraft {
   });
   if (!result.success) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", `Persisted report data failed schema validation: ${result.error.message}`);
   return result.data;
+}
+
+/** The written-once report-time snapshot; reports created before onboarding have none and carry no snapshot keys. */
+function clientSnapshot(value: unknown): Pick<ReportDraft["client"], "conversionMetric" | "klaviyoAccount"> {
+  if (value === null || value === undefined) return {};
+  if (typeof value !== "object" || Array.isArray(value)) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Persisted client setup snapshot is invalid.");
+  const snapshot = value as { conversionMetric?: unknown; klaviyoAccount?: unknown };
+  return { conversionMetric: (snapshot.conversionMetric ?? null) as never, klaviyoAccount: (snapshot.klaviyoAccount ?? null) as never };
 }
 
 function parseHistoryRow(row: HistoryRow): ReportLifecycleEvent {
@@ -307,6 +338,8 @@ function parseArtifactRow(row: ArtifactRow): ReportPdfArtifact {
     id: row.id, reportId: row.report_id, storageKey: row.storage_key, mimeType: row.mime_type,
     byteSize: row.byte_size, sha256: row.sha256.trim(), sourceFingerprint: row.source_fingerprint.trim(),
     templateVersion: row.template_version, generatedAt: instant(row.generated_at),
+    ...(row.drive_delivery ? { driveDelivery: row.drive_delivery } : {}),
+    ...(row.google_doc ? { googleDoc: row.google_doc } : {}),
   });
   if (!result.success) throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Persisted PDF artifact failed schema validation.");
   return result.data;
