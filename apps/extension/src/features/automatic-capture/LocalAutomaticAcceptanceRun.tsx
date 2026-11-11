@@ -17,6 +17,15 @@ interface Props {
   mode?: "full" | "resume";
   /** The report's full automatic section list, for "10/10"-style numbering during a resume. */
   allSections?: ChecklistItem[];
+  /**
+   * Local development only: also write the run's attempt diagnostics and evidence to the dev-only run store. The
+   * canonical report never depends on it: every passed section is saved on the report the moment it passes.
+   */
+  diagnostics?: boolean;
+  /** Called with the canonical report after each section is saved on it, before the next section starts. */
+  onPersisted?(report: ReportDraft): void;
+  /** Return to the report as soon as every planned section passed (automatic finalization continues there). */
+  closeOnSuccess?: boolean;
 }
 type Result = { section: string; label: string; status: "pending" | "running" | "PASS" | "FAIL"; phase: "Preparing" | "Capturing"; durationMs: number | null; attempt: number; error: string | undefined };
 type Target = BusinessReviewTargetBounds | DashboardTargetBounds;
@@ -25,6 +34,8 @@ type Target = BusinessReviewTargetBounds | DashboardTargetBounds;
 const MAX_ATTEMPTS = 5;
 /** The final recovery level's bounded pause before rebuilding the section from scratch. */
 const COOL_DOWN_MS = 3_000;
+/** The report itself refused the capture (wrong client, wrong month, section not enabled): a retry cannot help. */
+const PERMANENT_SAVE_CODES = new Set(["REPORT_CLIENT_MISMATCH", "REPORT_MONTH_MISMATCH", "AUTOMATIC_SECTION_NOT_ENABLED", "REPORT_NOT_FOUND", "REPORT_GENERATING"]);
 const EXTENSION_BUILD = typeof __TENTION_BUILD__ === "string" ? __TENTION_BUILD__ : "unbundled";
 
 const semantic: Partial<Record<ScreenshotType, { card: string; view: string | null }>> = {
@@ -36,7 +47,7 @@ const semantic: Partial<Record<ScreenshotType, { card: string; view: string | nu
 };
 
 /** Local acceptance uses the real toolbar-authorized capture controllers but stores evidence outside canonical screenshots. */
-export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, service, onClose, mode = "full", allSections = plan }: Props) {
+export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, service, onClose, mode = "full", allSections = plan, diagnostics = false, onPersisted, closeOnSuccess = false }: Props) {
   const position = (section: string) => `${allSections.findIndex((item) => item.screenshotType === section) + 1}/${allSections.length}`;
   const [results, setResults] = useState<Result[]>(() => plan.map((item) => ({ section: item.screenshotType!, label: item.label, status: "pending", phase: "Preparing", durationMs: null, attempt: 0, error: undefined })));
   const [runId, setRunId] = useState<string | null>(null);
@@ -79,10 +90,14 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
         if (!normalized.ok) throw new Error(normalized.message);
         normalization = normalized; setZoom(normalized);
       }
-      await api.startLocalAutomaticCaptureRun({ runId: id, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: runStartedAt.toISOString(), extensionBuild: EXTENSION_BUILD, ...(mode === "resume" ? { mode, plannedSections: plan.map((item) => item.screenshotType!) } : {}) });
+      if (diagnostics) await api.startLocalAutomaticCaptureRun({ runId: id, reportId: report.id, clientId: report.client.id, reportMonth: report.reportMonth, startedAt: runStartedAt.toISOString(), extensionBuild: EXTENSION_BUILD, ...(mode === "resume" ? { mode, plannedSections: plan.map((item) => item.screenshotType!) } : {}) });
       // Capture states (each holding a full-viewport screenshot) left by earlier sections, runs, or months are released.
       await service.clearAll?.().catch(() => undefined);
-    } catch (error) { setRunError(errorMessage(error, "Local acceptance diagnostics could not be started.")); setRunning(false); return; }
+    } catch (error) { setRunError(errorMessage(error, "Automatic capture could not be started.")); setRunning(false); return; }
+    // The canonical report each section is saved on; its version advances with every saved section.
+    let canonical: ReportDraft = report;
+    // Dev-only diagnostics; production keeps the attempt record in memory and the passed capture on the report.
+    const saveDiagnostics = (section: ScreenshotType, result: AutomaticCaptureSectionResult) => diagnostics ? api.saveLocalAutomaticCaptureSection(id, section, result) : Promise.resolve();
 
     // A consumed section's stored state (its full-viewport screenshot) is released at once, so states never accumulate.
     const release = async (request: ExecutiveSummaryAutoCaptureRequest | null) => { if (request) await service.clear(request).catch(() => undefined); };
@@ -122,7 +137,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
 
         try {
           const confirmStarted = performance.now();
-          await bounded(api.saveLocalAutomaticCaptureSection(id, type, persistedResult), 30_000, "PERSISTENCE_TIMEOUT");
+          await bounded(saveDiagnostics(type, persistedResult), 30_000, "PERSISTENCE_TIMEOUT");
           backendConfirmMs += Math.round(performance.now() - confirmStarted);
           // Every attempt starts with a fresh controller state and re-enters its
           // canonical source navigation; no prior DOM or capture state is reused. A new attempt id makes any write
@@ -184,9 +199,21 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           cropMs = Math.round(performance.now() - cropStartedAt);
           stage = "UPLOADING";
           const uploadStartedAt = performance.now();
-          let acknowledgment: Awaited<ReturnType<ApiClient["saveLocalAutomaticCaptureEvidence"]>>;
+          let acknowledgment: { sha256: string };
           mark("uploadStartedAt");
-          try { acknowledgment = await bounded(api.saveLocalAutomaticCaptureEvidence(id, type, "capture", crop, attempt), 30_000, "UPLOAD_TIMEOUT"); mark("uploadCompletedAt"); }
+          try {
+            if (diagnostics) await bounded(api.saveLocalAutomaticCaptureEvidence(id, type, "capture", crop, attempt), 30_000, "UPLOAD_TIMEOUT");
+            // Saved on the canonical report now, as machine-validated automatic evidence (no human approval), so a
+            // later section's failure never loses it and a resume captures only what is missing.
+            if (!state.captured.sourceUrl) throw Object.assign(new Error("The captured page did not report its Klaviyo URL."), { code: "SCREENSHOT_SOURCE_URL_INVALID" });
+            const saved = await bounded(api.saveAutomaticCapture(canonical, type, { sourceUrl: state.captured.sourceUrl, sourceProof: proof, image: crop }), 30_000, "UPLOAD_TIMEOUT")
+              .catch((error: unknown) => { throw PERMANENT_SAVE_CODES.has(errorCode(error)) ? Object.assign(error as object, { permanent: true }) : error; });
+            const record = saved.screenshots.find((shot) => shot.type === type);
+            if (!record?.sha256) throw Object.assign(new Error(`The report did not confirm the saved ${item.label} capture.`), { code: "SCREENSHOT_PERSISTENCE_NOT_CONFIRMED" });
+            canonical = saved; onPersisted?.(saved);
+            acknowledgment = { sha256: record.sha256 };
+            mark("uploadCompletedAt");
+          }
           finally { uploadMs = Math.round(performance.now() - uploadStartedAt); }
           stage = "VERIFYING_BACKEND_SAVE";
           const totalMs = Math.round(performance.now() - start);
@@ -200,7 +227,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           };
           persistedResult = { ...persistedResult, status: "pass", finishedAt: new Date().toISOString(), durationMs: totalMs, observedUrl: safeUrl(state.captured.sourceUrl), observedSourceIdentity: proof.sourceIdentity, observedPeriod: state.detectedPeriod, visibleControls: state.target.visibleControls ?? [], usableRowCount: typeof state.target.availableRowCount === "number" ? state.target.availableRowCount : null, screenshotResult: "fresh_semantic_crop_saved", sourceProofResult: "PASS", sha256: acknowledgment.sha256, diagnostics: passDiagnostics };
           const confirmPassStarted = performance.now();
-          await bounded(api.saveLocalAutomaticCaptureSection(id, type, persistedResult), 30_000, "PERSISTENCE_TIMEOUT");
+          await bounded(saveDiagnostics(type, persistedResult), 30_000, "PERSISTENCE_TIMEOUT");
           mark("sectionResultSavedAt");
           backendConfirmMs += Math.round(performance.now() - confirmPassStarted);
           const finalTotalMs = Math.round(performance.now() - start);
@@ -208,7 +235,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           // Persist measured acknowledgement timing too; this second acknowledgement
           // remains inside the barrier and must succeed before N+1 can start.
           const timingConfirmStarted = performance.now();
-          await bounded(api.saveLocalAutomaticCaptureSection(id, type, { ...persistedResult, diagnostics: { ...persistedResult.diagnostics, stageTimeline } }), 30_000, "PERSISTENCE_TIMEOUT");
+          await bounded(saveDiagnostics(type, { ...persistedResult, diagnostics: { ...persistedResult.diagnostics, stageTimeline } }), 30_000, "PERSISTENCE_TIMEOUT");
           backendConfirmMs += Math.round(performance.now() - timingConfirmStarted);
           passed = true;
           const sectionDuration = Math.round(performance.now() - sectionStart);
@@ -218,6 +245,8 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           break;
         } catch (error) {
           finalErrorCode = errorCode(error); finalError = errorMessage(error, "Automatic capture failed.");
+          // Someone else changed the report: the next attempt saves on its latest version (nothing is overwritten blindly).
+          if (finalErrorCode === "REPORT_VERSION_CONFLICT") canonical = await api.getReportDraft(report.id).catch(() => canonical);
           previousFailure = { code: finalErrorCode, message: finalError };
           const classification = classifyFailure(finalErrorCode, finalError);
           mark("failedAt");
@@ -227,7 +256,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
           const capturedFailure = failureState?.viewportScreenshot ?? (ready ? ready.captured : null);
           const totalMs = Math.round(performance.now() - start);
           let viewportEvidence = "not_available";
-          if (capturedFailure) {
+          if (capturedFailure && diagnostics) {
             try {
               const viewportAck = await bounded(api.saveLocalAutomaticCaptureEvidence(id, type, "viewport", dataUrlBlob(capturedFailure.dataUrl), attempt), 30_000, "UPLOAD_TIMEOUT");
               viewportEvidence = `saved:${viewportAck.sha256}`;
@@ -246,7 +275,7 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
             diagnostics: { extensionBuild: EXTENSION_BUILD, recovery: recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline, failureStage: stage === "NAVIGATION" || stage === "PAGE_READY" ? failureStageFromCode(finalErrorCode) : stage, failureCode: finalErrorCode, failureMessage: finalError, ...(diagnostic ?? {}), ...(ready ? { periodEvidence: ready.periodEvidence ?? null, targetBounds: ready.target } : {}), viewportEvidence, stageTimingsMs: { ...(isNumericRecord(diagnostic?.stageTimingsMs) ? diagnostic.stageTimingsMs : {}), ...(ready?.target.stageTimingsMs ?? {}), navigationMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "navigationMs"), pageReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "pageReadyMs"), periodSetMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "periodSetMs"), cardResolveMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "cardResolveMs"), viewSwitchMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "viewSwitchMs"), contentReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "contentReadyMs"), captureMs, cropMs, uploadMs, backendConfirmMs, totalMs }, attemptNumber: attempt, maxAttempts: MAX_ATTEMPTS, attemptHistory: [...attemptHistory] },
           };
           attemptHistory.push({ attemptNumber: attempt, ...recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline: { ...stageTimeline }, startedAt, finishedAt: failedResult.finishedAt, durationMs: totalMs, failureStage: failedResult.diagnostics && typeof failedResult.diagnostics.failureStage === "string" ? failedResult.diagnostics.failureStage : stage, errorCode: finalErrorCode, errorMessage: finalError, expectedUrl: failedResult.expectedUrl, observedUrl: failedResult.observedUrl, expectedPeriod: failedResult.expectedPeriod, observedPeriod: failedResult.observedPeriod, stageTimingsMs: failedResult.diagnostics && typeof failedResult.diagnostics.stageTimingsMs === "object" ? failedResult.diagnostics.stageTimingsMs : {}, viewportEvidence });
-          try { await bounded(api.saveLocalAutomaticCaptureSection(id, type, { ...failedResult, diagnostics: { ...failedResult.diagnostics, attemptHistory: [...attemptHistory] } }), 30_000, "PERSISTENCE_TIMEOUT"); }
+          try { await bounded(saveDiagnostics(type, { ...failedResult, diagnostics: { ...failedResult.diagnostics, attemptHistory: [...attemptHistory] } }), 30_000, "PERSISTENCE_TIMEOUT"); }
           catch (saveError) {
             finalError = `Backend did not acknowledge attempt diagnostics: ${errorMessage(saveError, "local diagnostic write failed")}`;
             setPaused(true);
@@ -271,18 +300,15 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
         break;
       }
     }
-    try {
-      await api.finishLocalAutomaticCaptureRun(id, { status: persistedPassCount === plan.length ? "completed" : "failed", finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - runStart) });
-      if (persistedPassCount === plan.length) {
-        setRunError(`All ${plan.length} sections passed, but canonical report persistence is still being confirmed.`);
-        const persisted = await api.importLocalAutomaticCaptureRun(id, report, mode === "resume" ? plan.map((item) => item.screenshotType!) : undefined);
-        setCanonicalReport(persisted);
-        setRunError(null);
-      }
+    // Every passed section is already on the report; a failed run keeps them and a resume captures only the rest.
+    setCanonicalReport(canonical);
+    if (diagnostics) {
+      try { await api.finishLocalAutomaticCaptureRun(id, { status: persistedPassCount === plan.length ? "completed" : "failed", finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - runStart) }); }
+      catch (error) { setRunError(`The capture run finished, but its diagnostics could not be saved: ${errorMessage(error, "backend error")}`); }
     }
-    catch (error) { setRunError(`The capture run finished, but its final result could not be saved: ${errorMessage(error, "backend error")}`); }
     setRunDurationMs(Math.round(performance.now() - runStart));
     setRunning(false);
+    if (closeOnSuccess && persistedPassCount === plan.length) onClose(canonical);
   }
 
   const passed = results.filter(({ status }) => status === "PASS").length;
@@ -294,16 +320,15 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
       && screenshot.clientId === canonicalReport.client.id && screenshot.reportMonth.year === canonicalReport.reportMonth.year && screenshot.reportMonth.month === canonicalReport.reportMonth.month
       ? [screenshot] : [];
   }) : [];
-  const confirmedPending = confirmedCaptures.filter((screenshot) => !screenshot.approved).length;
   const confirmedApproved = confirmedCaptures.filter((screenshot) => screenshot.approved).length;
   return <main className="capture-workflow"><section className="card" aria-live="polite">
-    <p className="kicker">Local live acceptance</p><h1>{running ? "Automatic capture running" : paused ? "Automatic capture paused" : "Automatic capture finished"}</h1><p className="support-copy">Extension build {EXTENSION_BUILD}</p>
+    <p className="kicker">Automatic Capture</p><h1>{running ? "Automatic capture running" : paused ? "Automatic capture paused" : passed === plan.length ? "Automatic Capture Complete" : "Automatic capture finished"}</h1><p className="report-month">{report.client.name}</p><p className="support-copy">Extension build {EXTENSION_BUILD}</p>
     {!running && <h2>AUTOMATIC CAPTURE RESULTS</h2>}
-    <p className="support-copy">{running ? "The extension completes and confirms each section before starting the next. Existing report screenshots are not replaced; fresh evidence is staged for verified canonical persistence." : paused ? `${results.find(({ status }) => status === "FAIL")?.label ?? "The current section"} needs attention. Later sections were not started.` : passed === plan.length && canonicalReport ? `All ${allSections.length} captures are saved to this report and awaiting review.` : passed === plan.length ? `All ${plan.length} sections passed, but canonical report persistence was not confirmed. The report checklist remains unchanged.` : "Automatic capture finished."}</p>
+    <p className="support-copy">{running ? "Each section is verified and saved on the report before the next one starts. No review is needed between sections." : paused ? `${results.find(({ status }) => status === "FAIL")?.label ?? "The current section"} needs attention. Sections that passed are saved on the report; later sections were not started. Resume captures only what is missing.` : passed === plan.length ? `${passed}/${plan.length} PASS · saved on this report. The final report is generated automatically; human review is optional.` : "Automatic capture finished."}</p>
     {current && <p role="status" className="notice">{position(current.section)} {current.label} — {current.phase} (attempt {current.attempt}/{MAX_ATTEMPTS})…</p>}
     {runId && <p className="support-copy">Diagnostic run ID: <code>{runId}</code></p>}
-    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Not started" : result.status === "running" ? `${result.phase} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
-    {!running && <p role="status" className="notice">Fresh captures: {passed} / {plan.length} successful · {canonicalReport ? `${confirmedCaptures.length} / ${allSections.length} captured · ${confirmedPending} pending review · ${confirmedApproved} approved · ${allSections.length - confirmedCaptures.length} missing` : "canonical persistence not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
+    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Waiting" : result.status === "running" ? `${result.phase === "Capturing" ? "Capturing" : "Preparing"} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
+    {!running && <p role="status" className="notice">This run: {passed}/{plan.length} PASS · {canonicalReport ? `Saved on report: ${confirmedCaptures.length}/${allSections.length} captured · ${allSections.length - confirmedCaptures.length} missing · human review optional (${confirmedApproved} approved)` : "report save not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
     {zoom && <p className="support-copy">Klaviyo zoom: {formatZoom(zoom.originalZoom)} → {formatZoom(zoom.captureZoom)} for capture · viewport {Math.round(zoom.viewport.width)} px (minimum {MIN_KLAVIYO_VIEWPORT_WIDTH} px)</p>}
     {zoomRestore?.restored && <p className="support-copy">Klaviyo zoom restored to {formatZoom(zoomRestore.originalZoom)}.</p>}
     {runError && <p role="alert" className="notice error-notice">{runError}</p>}

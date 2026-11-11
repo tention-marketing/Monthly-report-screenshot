@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, type ApiClient } from "@tention/api-client";
-import { clientReportSnapshot, clientReportTargetsSchema, clientSetupBlockers, clientSetupStatus, createScreenshotSourceProof, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
+import { clientReportSnapshot, clientReportTargetsSchema, clientSetupBlockers, clientSetupStatus, createScreenshotSourceProof, REPORT_CAPTURE_SPEC_V1, type ClientReportTargets, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 import { deriveNewClientId } from "../lib/client-id.js";
 import { cleanTargetInput, targetInput } from "../features/clients/client-targets.js";
 import type { ClientSetupSources } from "./App.js";
@@ -93,6 +93,14 @@ function mockApi(overrides: Partial<Record<keyof ApiClient, unknown>> = {}): Api
   }) as ApiClient["getClientSetup"];
   return api;
 }
+/** What the API's per-section automatic save returns: the report with that section as a machine-validated capture. */
+function savedAutomatically(current: ReportDraft, type: ScreenshotType, input: { sourceUrl: string; sourceProof: unknown }): ReportDraft {
+  const index = REPORT_CAPTURE_SPEC_V1.findIndex((spec) => spec.screenshotType === type);
+  const record = { id: `c0000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`, clientId: current.client.id, reportMonth: current.reportMonth, type, capturedAt: NOW.toISOString(),
+    sourceUrl: input.sourceUrl, width: 100, height: 100, approved: false, approvedAt: null, periodConfirmed: true, captureOrigin: "live_acceptance_import" as const,
+    storageKey: `reports/${current.id}/${type}.png`, mimeType: "image/png" as const, byteSize: 100, sha256: String.fromCharCode(97 + (index % 6)).repeat(63) + String(index % 10), sourceProof: input.sourceProof as ReportDraft["screenshots"][number]["sourceProof"], automatedValidatedAt: null };
+  return { ...current, version: current.version + 1, screenshots: [...current.screenshots.filter((shot) => shot.type !== type), record] };
+}
 function baseMockApi(overrides: Partial<Record<keyof ApiClient, unknown>>): ApiClient {
   return {
     listClientConfigurations: vi.fn().mockResolvedValue([]),
@@ -110,6 +118,7 @@ function baseMockApi(overrides: Partial<Record<keyof ApiClient, unknown>>): ApiC
     getDevelopmentReviewPdfStatus: vi.fn().mockRejectedValue(new ApiError("PDF_REVIEW_NOT_GENERATED", "No development review PDF exists.", 404)),
     developmentReviewPdfUrl: vi.fn((id: string, download = false) => `http://127.0.0.1:4000/api/v1/dev/report-drafts/${id}/partial-review/pdf${download ? "?download=1" : ""}`),
     uploadScreenshotImage: vi.fn().mockResolvedValue(report),
+    saveAutomaticCapture: vi.fn(async (current: ReportDraft, type: ScreenshotType, input: { sourceUrl: string; sourceProof: unknown }) => savedAutomatically(current, type, input)),
     getScreenshotImage: vi.fn().mockResolvedValue(new Blob()),
     applyEvent: vi.fn().mockResolvedValue({ ...report, status: "data_fetching", version: 2 }),
     getClientReportTargets: vi.fn().mockImplementation(async (clientId: string) => ({
@@ -165,7 +174,7 @@ describe("extension report workflow", () => {
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([report]) }));
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     await screen.findByRole("heading", { name: "Orion Supplements" });
-    expect(screen.getByText("Final report readiness: 0 / 2 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText(/^Automatic capture: 0 \/ \d+ sections captured$/)).toBeInTheDocument();
     expect(screen.getByText("Next required capture")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Report" })).toBeInTheDocument();
     expect(screen.getByText("Optional")).toBeInTheDocument();
@@ -183,8 +192,8 @@ describe("extension report workflow", () => {
     const user = userEvent.setup(); renderApp(api);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     expect(await screen.findByRole("heading", { name: "AutoLEDTech.com" })).toBeInTheDocument();
-    expect(screen.getByText("Captured: 9 / 9 · Pending review: 9 · Approved: 0 · Missing/stale: 0")).toBeInTheDocument();
-    expect(screen.getAllByText("Captured · Pending review")).toHaveLength(9);
+    expect(screen.getByText("Captured: 9 / 9 · Missing/stale: 0 · Human review optional (0 approved)")).toBeInTheDocument();
+    expect(screen.getAllByText("PASS · saved")).toHaveLength(9);
     expect(screen.getByText("Automatic capture: 9 / 9 sections captured")).toBeInTheDocument();
     expect(screen.queryByText(/Approve all .* required screenshots/)).toBeNull();
     expect(screen.getByText(/final-only sections below are separate from the 9 automatic captures/)).toBeInTheDocument();
@@ -208,12 +217,12 @@ describe("extension report workflow", () => {
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([persisted]), getReportDraft: vi.fn().mockResolvedValue(persisted) });
     const user = userEvent.setup(); const firstMount = renderApp(api);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    expect(await screen.findByText("Final report readiness: 1 / 9 required screenshots approved")).toBeInTheDocument();
-    expect(within(screen.getByRole("region", { name: "Automatic Capture Progress" })).getByText("Approved")).toBeInTheDocument();
+    expect(await screen.findByText("Automatic capture: 1 / 9 sections captured")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Automatic Capture Progress" })).getByText("PASS · human approved")).toBeInTheDocument();
     firstMount.unmount();
 
     renderApp(api);
-    expect(await screen.findByText("Final report readiness: 1 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(await screen.findByText("Automatic capture: 1 / 9 sections captured")).toBeInTheDocument();
     expect(api.getReportDraft).toHaveBeenLastCalledWith(persisted.id);
   });
   it("rehydrates the pending Top Campaigns step after a side-panel reload without recreating the report", async () => {
@@ -246,9 +255,12 @@ describe("extension report workflow", () => {
     expect(recapture).toBeEnabled();
     expect(within(progress).getByText("Top 5 Flows").closest("li")).not.toHaveTextContent("Recapture");
     await user.click(recapture);
-    expect(await screen.findByRole("heading", { name: "Open the correct Klaviyo screen" })).toBeInTheDocument();
+    // The recapture is a one-section automatic run (account re-verified first), never a review screen.
+    expect(await screen.findByRole("heading", { name: /Automatic capture (running|paused)/ })).toBeInTheDocument();
+    expect(screen.getByText("3/9 Top 5 Campaigns")).toBeInTheDocument();
     await waitFor(() => expect(service.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "top_campaigns", reportId: stale.id, period: stale.period, clientName: stale.client.name, clientTimezone: stale.client.timezone })));
-    expect(await screen.findByRole("alert")).toHaveTextContent("CAMPAIGNS_ROUTE_REQUIRED: Top Campaigns must be captured from the Klaviyo Campaigns listing.");
+    expect(vi.mocked(service.start).mock.calls.every(([request]) => request.screenshotType === "top_campaigns")).toBe(true);
+    expect(api.saveAutomaticCapture).not.toHaveBeenCalled();
     expect(api.createReportDraft).not.toHaveBeenCalled();
     expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
   });
@@ -265,7 +277,7 @@ describe("extension report workflow", () => {
     recapture.focus();
     await user.keyboard("{Enter}");
     await waitFor(() => expect(service.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "top_campaigns", reportId: stale.id })));
-    expect(await screen.findByRole("heading", { name: "Open the correct Klaviyo screen" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Automatic capture (running|paused)/ })).toBeInTheDocument();
   });
   it("keeps a fresh approved Top Campaigns screenshot on its normal Retake action", async () => {
     const fresh = runnerReport(["top_campaigns"]);
@@ -273,7 +285,7 @@ describe("extension report workflow", () => {
     const user = userEvent.setup(); renderApp(api);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
     const progress = screen.getByRole("region", { name: "Automatic Capture Progress" });
-    expect(within(progress).getByText("Approved")).toBeInTheDocument();
+    expect(within(progress).getByText("PASS · human approved")).toBeInTheDocument();
     expect(within(progress).queryByRole("button", { name: "Recapture Top Campaigns" })).not.toBeInTheDocument();
     expect(within(progress).getByRole("button", { name: "Retake" })).toBeEnabled();
   });
@@ -296,7 +308,8 @@ describe("extension report workflow", () => {
     });
     const user = userEvent.setup(); renderApp(api);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    expect(await screen.findByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(await screen.findByText("Automatic capture: 1 / 9 sections captured")).toBeInTheDocument();
+    expect(screen.getByText("0 / 9 required completed")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Review saved capture" }));
     expect(await screen.findByRole("heading", { name: "Review saved Executive Summary" })).toBeInTheDocument();
     expect(await screen.findByAltText("Pending imported Executive Summary evidence")).toBeInTheDocument();
@@ -305,7 +318,7 @@ describe("extension report workflow", () => {
     expect(screen.getByRole("button", { name: "Approve this saved evidence" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "Approve this saved evidence" }));
     await waitFor(() => expect(api.approveImportedScreenshot).toHaveBeenCalledWith(canonical.id, "overview", { expectedVersion: 2, expectedSha256: sha256 }));
-    expect(await screen.findByText("Final report readiness: 1 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(await screen.findByText("1 / 9 required completed")).toBeInTheDocument();
   });
   it("does not complete an imported checklist item when backend review acknowledgement fails", async () => {
     mockObjectUrls();
@@ -318,7 +331,7 @@ describe("extension report workflow", () => {
     await user.click(await screen.findByRole("button", { name: "Approve this saved evidence" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("The report changed while reviewing.");
     expect(screen.getByRole("heading", { name: "Review saved Executive Summary" })).toBeInTheDocument();
-    expect(screen.queryByText("Final report readiness: 1 / 9 required screenshots approved")).toBeNull();
+    expect(screen.queryByText("1 / 9 required completed")).toBeNull();
   });
   it("generates, previews, opens, downloads, and reloads only the current development review PDF", async () => {
     const canonical = structuredClone(runnerReport());
@@ -725,7 +738,7 @@ describe("extension report workflow", () => {
     const fullRunnerReport = runnerReport();
     const user = userEvent.setup(); renderApp(mockApi({ listReportDrafts: vi.fn().mockResolvedValue([fullRunnerReport]), getReportDraft: vi.fn().mockResolvedValue(fullRunnerReport) }));
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText("Automatic capture: 0 / 9 sections captured")).toBeInTheDocument();
     expect(screen.getByText("Next required capture")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Start Report" }));
     expect(await screen.findByText("Step 1 of 9")).toBeInTheDocument();
@@ -1031,7 +1044,7 @@ describe("capture workflow cross-section safety", () => {
     expect(screen.getByRole("button", { name: "Confirm & Continue" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Retake" }));
     await user.click(screen.getByRole("button", { name: "Back to report" }));
-    expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText("Automatic capture: 0 / 9 sections captured")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Show Advanced / Debug" }));
     expect(screen.getByLabelText("Development capture persistence")).toHaveTextContent("http://127.0.0.1:4000");
     expect(screen.getByLabelText("Development capture persistence")).toHaveTextContent(initial.id);
@@ -1053,10 +1066,10 @@ describe("capture workflow cross-section safety", () => {
     await cropAndConfirm(user);
     await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
     expect(await screen.findByRole("heading", { name: "This report was updated somewhere else." })).toBeInTheDocument();
-    expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText("Automatic capture: 0 / 9 sections captured")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Reload Latest Version" }));
     await waitFor(() => expect(api.getReportDraft).toHaveBeenCalledWith(initial.id));
-    expect(screen.getByText("Final report readiness: 0 / 9 required screenshots approved")).toBeInTheDocument();
+    expect(screen.getByText("Automatic capture: 0 / 9 sections captured")).toBeInTheDocument();
   });
   it("keeps every capture action visibly named, including disabled approval", async () => {
     const optionalReport: ReportDraft = { ...runnerReport(), sections: { signup_form: "optional" } };
@@ -1129,23 +1142,6 @@ describe("capture workflow cross-section safety", () => {
     await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
     expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "campaign_metrics", expect.objectContaining({ periodConfirmed: true, sourceUrl: "https://www.klaviyo.com/analytics/dashboards" }));
   });
-  it("runs enabled Business Review targets in canonical order and retains Phase A source proof", async () => {
-    const initial = businessReviewAutoReport(); const afterOverview = businessReviewAutoReport(["campaign_metrics"]);
-    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), uploadScreenshotImage: vi.fn().mockResolvedValue(afterOverview), getReportReadiness: vi.fn().mockResolvedValue({ ready: true, sections: [] }) });
-    const automaticCaptureService: AutoCaptureService = {
-      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: "https://www.klaviyo.com/analytics/dashboards", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } })),
-      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
-    };
-    const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService);
-    await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
-    expect(await screen.findByAltText("Captured browser tab")).toBeInTheDocument();
-    const image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "campaign_metrics", expect.objectContaining({ sourceProof: expect.objectContaining({ sectionKey: "campaign_metrics", sourceIdentity: "business-review|campaign-performance|metrics" }) })));
-    expect(automaticCaptureService.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "campaign_metrics" }));
-  });
   it.each([[3, "3 of 5 — Klaviyo shows only 3 usable flows for this month"], [1, "1 of 5 — Klaviyo shows only 1 usable flow for this month"], [5, "Top 5 flows"]])("automatically captures Top Flows from Klaviyo Home with %i rows and labels the real count", async (rows, label) => {
     const initial = { ...runnerReport(), sections: { top_flows: "required" as const } };
     const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial), uploadScreenshotImage: vi.fn().mockResolvedValue(initial), getReportReadiness: vi.fn().mockResolvedValue({ ready: true, sections: [] }) });
@@ -1155,53 +1151,15 @@ describe("capture workflow cross-section safety", () => {
     };
     const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService);
     await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
+    // Manual mode (Start Report) keeps its per-section review screen; automatic mode never shows it.
+    await user.click(screen.getByRole("button", { name: "Start Report" }));
+    await user.click(await screen.findByRole("button", { name: "Capture Automatically" }));
     const image = await screen.findByAltText("Captured browser tab");
     Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
     expect(await screen.findByText(label)).toBeInTheDocument();
     expect(automaticCaptureService.start).toHaveBeenCalledWith(expect.objectContaining({ screenshotType: "top_flows" }));
     await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
     await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "top_flows", expect.objectContaining({ sourceProof: expect.objectContaining({ sourceIdentity: "klaviyo-home|top-performing-flows|default" }) })));
-  });
-  it.each([
-    ["rejected", new ApiError("SCREENSHOT_UPLOAD_ACK_MISMATCH", "The API acknowledgement did not match the approved screenshot and source proof.", 200)],
-    ["persisted", null],
-  ] as const)("marks recaptured Top Campaigns complete only once the API has persisted it (%s)", async (_case, uploadError) => {
-    const stale = staleTopCampaignReport();
-    const persisted = runnerReport(["top_campaigns"]);
-    const campaignsEvidence = { accountIdentity: stale.client.name, clientTimezone: stale.client.timezone, visibleMetricLabel: "Conversion metric Placed Order", rankingMethod: "klaviyo-native-sort" as const, eligibleRowCount: 4, includedRowCount: 3,
-      rows: [9800, 4210.5, 1050.25].map((placedOrderValue, index) => ({ name: `Campaign ${index + 1}`, type: "Email", status: "Sent" as const, sendDate: "2026-07-14", openRate: "40%", clickRate: "2%", placedOrderValue })) };
-    const api = mockApi({ listReportDrafts: vi.fn().mockResolvedValue([stale]), getReportDraft: vi.fn().mockResolvedValue(stale),
-      uploadScreenshotImage: uploadError ? vi.fn().mockRejectedValue(uploadError) : vi.fn().mockResolvedValue(persisted) });
-    const service: AutoCaptureService = {
-      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", campaignsEvidence,
-        target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100, availableRowCount: 4, includedRowCount: 3 },
-        captured: { sourceUrl: "https://www.klaviyo.com/omnicampaigns?appBarNav=true&startDate=2026-07-01&endDate=2026-07-31", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } })),
-      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
-    };
-    const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, service);
-    await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    await user.click(within(screen.getByRole("region", { name: "Automatic Capture Progress" })).getByRole("button", { name: "Recapture Top Campaigns" }));
-    await screen.findByAltText("Captured browser tab");
-    const image = screen.getByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    expect(await screen.findByText("3 of 4 eligible Sent campaigns")).toBeInTheDocument();
-    expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
-    await user.click(screen.getByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenCalledWith(stale.id, "top_campaigns", expect.objectContaining({
-      expectedVersion: stale.version, sourceUrl: expect.stringContaining("https://www.klaviyo.com/omnicampaigns"),
-      sourceProof: expect.objectContaining({ sourceIdentity: "klaviyo-campaigns|campaign-list|placed-order-revenue-desc", campaigns: campaignsEvidence }),
-    })));
-    if (uploadError) {
-      expect(await screen.findByRole("alert")).toHaveTextContent("The API acknowledgement did not match");
-      expect(screen.getByRole("button", { name: "Confirm & Continue" })).toBeInTheDocument();
-      expect(service.clear).not.toHaveBeenCalled();
-    } else {
-      const progress = await screen.findByRole("region", { name: "Automatic Capture Progress" });
-      expect(within(progress).getByText("Top 5 Campaigns").closest("li")).toHaveTextContent("Approved");
-      expect(within(progress).queryByRole("button", { name: "Recapture Top Campaigns" })).not.toBeInTheDocument();
-      expect(api.createReportDraft).not.toHaveBeenCalled();
-    }
   });
   it("requires explicit manual confirmation of both exact months for Month Comparison and uploads canonical proof", async () => {
     const initial = runnerReport(["overview", "top_campaigns", "top_flows"]);
@@ -1230,69 +1188,6 @@ describe("capture workflow cross-section safety", () => {
       sourceProof: expect.objectContaining({ sectionKey: "month_comparison", sourceIdentity: "business-review|growth-overview|message-type-breakdown|previous-period", expectedPeriod: { startDate: "2026-07-01", endDate: "2026-07-31", comparisonStartDate: "2026-06-01", comparisonEndDate: "2026-06-30" } }),
     })));
   });
-  it("runs Executive Summary and Top 5 Flows on Klaviyo Home, then Top Campaigns through the canonical Campaigns path", async () => {
-    const initial = runnerReport(); const afterOverview = runnerReport(["overview"]); const afterFlows = runnerReport(["overview", "top_flows"]); const afterCampaigns = runnerReport(["overview", "top_flows", "top_campaigns"]);
-    const api = mockApi({
-      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
-      uploadScreenshotImage: vi.fn().mockImplementation((_reportId: string, type: ScreenshotType) => Promise.resolve(type === "overview" ? afterOverview : type === "top_flows" ? afterFlows : afterCampaigns)),
-    });
-    const automaticCaptureService: AutoCaptureService = {
-      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: request.screenshotType === "top_campaigns" ? "https://www.klaviyo.com/omnicampaigns?appBarNav=true" : "https://www.klaviyo.com/dashboard", isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } })),
-      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
-    };
-    const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService);
-    await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
-    let image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenCalledWith(initial.id, "overview", expect.objectContaining({ sourceProof: expect.objectContaining({ sourceIdentity: "klaviyo-home|business-performance-summary|default" }) })));
-    image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenLastCalledWith(initial.id, "top_flows", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/dashboard", sourceProof: expect.objectContaining({ sourceFamily: "klaviyo-home", semanticCard: "top-performing-flows", semanticTab: "default", sourceIdentity: "klaviyo-home|top-performing-flows|default", expectedPeriod: { startDate: "2026-07-01", endDate: "2026-07-31" } }) })));
-    image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(api.uploadScreenshotImage).toHaveBeenLastCalledWith(initial.id, "top_campaigns", expect.objectContaining({ sourceUrl: "https://www.klaviyo.com/omnicampaigns?appBarNav=true", sourceProof: expect.objectContaining({ sourceIdentity: "klaviyo-campaigns|campaign-list|placed-order-revenue-desc" }) })));
-    expect(automaticCaptureService.start).toHaveBeenNthCalledWith(1, expect.objectContaining({ screenshotType: "overview" }));
-    expect(automaticCaptureService.start).toHaveBeenNthCalledWith(2, expect.objectContaining({ screenshotType: "top_flows" }));
-    expect(automaticCaptureService.start).toHaveBeenNthCalledWith(3, expect.objectContaining({ screenshotType: "top_campaigns" }));
-  });
-  it("passes the freshly discovered Business Review target into the same automatic run", async () => {
-    const initial = { ...runnerReport(), client: { ...runnerReport().client, id: "club-furniture", name: "Club Furniture" } };
-    const afterOverview = { ...initial, screenshots: runnerReport(["overview"]).screenshots.map((shot) => ({ ...shot, clientId: "club-furniture" })) };
-    const afterFlows = { ...initial, screenshots: runnerReport(["overview", "top_flows"]).screenshots.map((shot) => ({ ...shot, clientId: "club-furniture" })) };
-    const discoveredUrl = "https://www.klaviyo.com/analytics/dashboards/verified-club-review";
-    const emptyTargets = { clientId: "club-furniture", businessReview: null, primaryEmailList: null, primarySmsList: null, welcomeFlow: null, customerSegment: null, nonCustomerSegment: null, signupForms: null, welcomeFlowListing: null, createdAt: null, updatedAt: null };
-    const savedTargets = { ...emptyTargets, businessReview: { dashboardUrl: discoveredUrl, displayName: "Business Review", accountLabel: "CL Club Furniture", providerAccountId: "acct_club_fixture", providerIdentityKind: "account" as const }, createdAt: NOW.toISOString(), updatedAt: NOW.toISOString() };
-    const api = mockApi({
-      listReportDrafts: vi.fn().mockResolvedValue([initial]), getReportDraft: vi.fn().mockResolvedValue(initial),
-      getClientReportTargets: vi.fn().mockResolvedValue(emptyTargets), saveClientReportTargets: vi.fn().mockResolvedValue(savedTargets),
-      uploadScreenshotImage: vi.fn().mockImplementation((_reportId: string, type: ScreenshotType) => Promise.resolve(type === "overview" ? afterOverview : afterFlows)),
-    });
-    const discovery = vi.fn().mockResolvedValue({ ok: true, dashboardUrl: discoveredUrl, accountLabel: "CL Club Furniture", providerAccountId: "acct_club_fixture", providerIdentityKind: "account", accountMatchesClient: true, evidence: { businessReviewHeading: true, growthOverview: true, campaignPerformance: true, flowPerformance: true } });
-    const automaticCaptureService: AutoCaptureService = {
-      start: vi.fn().mockImplementation(async (request) => ({ request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Jul 1, 2026 – Jul 31, 2026", target: { x: 10, y: 20, width: 80, height: 60, viewportWidth: 100, viewportHeight: 100 }, captured: { sourceUrl: request.screenshotType === "overview" || request.screenshotType === "top_flows" ? "https://www.klaviyo.com/dashboard" : discoveredUrl, isKlaviyo: true, dataUrl: "data:image/png;base64,AAAA" } })),
-      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
-    };
-    const user = userEvent.setup(); renderApp(api, { getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }, undefined, automaticCaptureService, discovery);
-    await user.click(await screen.findByRole("button", { name: "Open Report" }));
-    await user.click(screen.getByRole("button", { name: /Start Automatic Capture/ }));
-    expect(discovery).toHaveBeenCalledWith(expect.objectContaining({ clientName: "Club Furniture", configuredUrl: null }));
-    expect(api.saveClientReportTargets).toHaveBeenCalledWith("club-furniture", expect.objectContaining({ businessReview: expect.objectContaining({ dashboardUrl: discoveredUrl, providerAccountId: "acct_club_fixture" }) }));
-    let image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(automaticCaptureService.start).toHaveBeenCalledTimes(2));
-    expect(automaticCaptureService.start).toHaveBeenNthCalledWith(2, expect.objectContaining({ screenshotType: "top_flows" }));
-    expect(automaticCaptureService.start).not.toHaveBeenNthCalledWith(2, expect.objectContaining({ accountUrl: discoveredUrl }));
-    image = await screen.findByAltText("Captured browser tab");
-    Object.defineProperties(image, { naturalWidth: { configurable: true, value: 200 }, naturalHeight: { configurable: true, value: 200 } }); fireEvent.load(image);
-    await user.click(await screen.findByRole("button", { name: "Confirm & Continue" }));
-    await waitFor(() => expect(automaticCaptureService.start).toHaveBeenCalledTimes(3));
-    expect(automaticCaptureService.start).toHaveBeenNthCalledWith(3, expect.objectContaining({ screenshotType: "top_campaigns", accountUrl: "https://www.klaviyo.com/omnicampaigns?appBarNav=true", clientName: "Club Furniture", clientTimezone: initial.client.timezone }));
-  });
   it("starts the nine-section local acceptance run from one user action without replacing canonical screenshots", async () => {
     const initial = runnerReport();
     const api = mockApi({
@@ -1314,8 +1209,8 @@ describe("capture workflow cross-section safety", () => {
     expect(api.startLocalAutomaticCaptureRun).toHaveBeenCalledOnce();
     expect(api.saveLocalAutomaticCaptureSection).toHaveBeenCalledTimes(10);
     expect(api.uploadScreenshotImage).not.toHaveBeenCalled();
-    expect(screen.getByText("Fresh captures: 0 / 9 successful", { exact: false })).toBeInTheDocument();
-    expect(screen.getAllByText("Not started")).toHaveLength(8);
+    expect(screen.getByText("This run: 0/9 PASS", { exact: false })).toBeInTheDocument();
+    expect(screen.getAllByText("Waiting")).toHaveLength(8);
   }, 15_000);
   it("saves the Subscriber Growth source once from the authorized tab, then runs all ten sections in order", async () => {
     const initial: ReportDraft = { ...runnerReport(), sections: { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" } };
@@ -1338,7 +1233,7 @@ describe("capture workflow cross-section safety", () => {
     await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 });
     expect(discoverSubscriberGrowth).toHaveBeenCalledOnce();
     expect(api.saveClientReportTargets).toHaveBeenCalledWith("autoled", expect.objectContaining({ sourceUrls: expect.objectContaining({ subscriberGrowthUrl: "https://www.klaviyo.com/discovered-subscriber-growth" }) }));
-    expect(screen.getByText("Fresh captures: 0 / 10 successful", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText("This run: 0/10 PASS", { exact: false })).toBeInTheDocument();
     expect(screen.getByText("10/10 Subscriber Growth")).toBeInTheDocument();
   });
   it("reuses a saved Subscriber Growth source without rediscovering it", async () => {
@@ -1950,8 +1845,8 @@ describe("client onboarding (phase 1) before monthly reports (phase 2)", () => {
     await waitFor(() => expect(api.createReportDraft).toHaveBeenCalledWith(expect.objectContaining({ client: { id: "steven-dann" }, reportMonth: { year: 2026, month: 10 } })));
     expect(vi.mocked(api.createReportDraft).mock.calls[0]![0]).not.toHaveProperty("period");
     // Automatic capture starts by itself on the new report: all 10 sections, for Steven Dann's October.
-    expect(await screen.findByText("Step 1 of 10")).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Executive Summary" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /Automatic capture (running|paused)/ })).toBeInTheDocument();
+    expect(screen.getByText("1/10 Executive Summary")).toBeInTheDocument();
     expect(screen.getByText("Steven Dann", { selector: ".report-month" })).toBeInTheDocument();
     // Capture starts by itself: its preflight re-proves the saved account; nothing is configured again.
     await waitFor(() => expect(fakes.verifyAccount).toHaveBeenCalledWith(expect.objectContaining({ verifySavedAccountOnly: true, configuredAccountLabel: "Steven Dann" })));
@@ -2485,4 +2380,164 @@ describe("client onboarding (phase 1) before monthly reports (phase 2)", () => {
     const saved = cleanTargetInput(targetInput(readySteven()));
     expect(saved.sourceUrls).toEqual(READY_SOURCES);
   });
+});
+
+describe("one Start Automatic Capture click runs every section with no review gate (production and local builds)", () => {
+  const TEN = { ...NINE_SECTION_CONFIGURATION, email_subscriber_growth: "required" as const };
+  const ORDER: ScreenshotType[] = ["overview", "top_flows", "top_campaigns", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability", "email_subscriber_growth"];
+  const SG_URL = "https://www.klaviyo.com/audience/subscriber-growth/email";
+  const deliveredArtifact = (reportId: string) => ({ id: "c0000000-0000-4000-8000-000000000001", reportId, storageKey: `reports/${reportId}/artifacts/a.pdf`, mimeType: "application/pdf" as const, byteSize: 10, sha256: "b".repeat(64), sourceFingerprint: "c".repeat(64), templateVersion: "monthly-report-v1", generatedAt: NOW.toISOString(),
+    driveDelivery: { driveUploadStatus: "uploaded" as const, driveFileName: "AutoLEDTech.com - July 2026.pdf", driveFileId: "pdf-id", driveFolderId: "folder-id", driveWebViewLink: "https://drive.google.com/file/d/pdf-id/view", driveUploadedAt: NOW.toISOString(), driveUploadAction: "created" as const, driveErrorCode: null, driveAttemptedAt: NOW.toISOString() },
+    googleDoc: { googleDocStatus: "synced" as const, googleDocId: "doc-id", googleDocUrl: "https://docs.google.com/document/d/doc-id/edit", googleDocFolderId: "folder-id", googleDocSyncedAt: NOW.toISOString(), googleDocAction: "created" as const, googleDocErrorCode: null, googleDocAttemptedAt: NOW.toISOString(), googleDocTemplateVersion: "monthly-report-v1" } });
+
+  beforeEach(() => {
+    class FakeImage { naturalWidth = 1440; naturalHeight = 900; onload: (() => void) | null = null; onerror: (() => void) | null = null; set src(_value: string) { queueMicrotask(() => this.onload?.()); } }
+    vi.stubGlobal("Image", FakeImage);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({ drawImage: vi.fn() } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => callback(new Blob([new Uint8Array([1, 2, 3])], { type: "image/png" })));
+  });
+  afterEach(() => { vi.unstubAllGlobals(); });
+  /** Records whether a review screen or a Confirm & Continue button is ever rendered while the test runs. */
+  function watchForReviewGate() {
+    const seen = { review: false, confirm: false, runScreen: false };
+    const check = () => {
+      const text = document.body.textContent ?? "";
+      if (/Review screenshot/i.test(text) && document.querySelector(".crop-preview")) seen.review = true;
+      if (text.includes("Confirm & Continue")) seen.confirm = true;
+      if (/Automatic capture running/.test(text)) seen.runScreen = true;
+    };
+    const observer = new MutationObserver(check); observer.observe(document.body, { subtree: true, childList: true, characterData: true });
+    return { seen, stop: () => observer.disconnect() };
+  }
+
+  /** What each page adapter returns when its section is machine-verified for the report's exact period. */
+  function verified(request: Parameters<AutoCaptureService["start"]>[0], draft: ReportDraft): AutoCaptureState {
+    const type = request.screenshotType;
+    const visible = "Jul 1, 2026 - Jul 31, 2026";
+    return {
+      request, stage: "review_ready", sourceTabId: 7, detectedPeriod: visible,
+      periodEvidence: { startDate: draft.period.startDate, endDate: draft.period.endDate, ...(type === "month_comparison" ? { comparisonStartDate: draft.period.previousStartDate, comparisonEndDate: draft.period.previousEndDate } : {}) },
+      target: { x: 0, y: 0, width: 720, height: 450, viewportWidth: 1440, viewportHeight: 900, availableRowCount: type === "top_campaigns" ? 3 : type === "top_flows" ? 5 : undefined, includedRowCount: type === "top_campaigns" ? 3 : type === "top_flows" ? 5 : undefined, visibleControls: [] },
+      captured: { sourceUrl: type === "top_campaigns" ? "https://www.klaviyo.com/omnicampaigns" : type === "email_subscriber_growth" ? SG_URL : type === "overview" || type === "top_flows" ? "https://www.klaviyo.com/dashboard" : type === "deliverability" ? "https://www.klaviyo.com/analytics/deliverability/email/score" : "https://www.klaviyo.com/analytics/dashboards/verified-test-source", isKlaviyo: true, dataUrl: "data:image/png;base64,AA==" },
+      ...(type === "overview" ? { businessPerformanceEvidence: { totalRevenue: "$584,032.35", totalAttributedRevenue: "$173,849.26", emailAttributedRevenue: "$156,674.44", smsAttributedRevenue: "$17,174.82", campaignRevenue: "$56,527.51", flowRevenue: "$117,321.75", visiblePeriodText: visible } } : {}),
+      ...(type === "top_campaigns" ? { campaignsEvidence: { accountIdentity: draft.client.name, clientTimezone: draft.client.timezone, visibleMetricLabel: "Placed Order", rankingMethod: "klaviyo-native-sort" as const, eligibleRowCount: 3, includedRowCount: 3,
+        rows: [3, 2, 1].map((placedOrderValue) => ({ name: `Campaign ${placedOrderValue}`, type: "Email", status: "Sent" as const, sendDate: "2026-07-10", openRate: null, clickRate: null, placedOrderValue })) } } : {}),
+      ...(type === "email_subscriber_growth" ? { subscriberGrowthEvidence: { channel: "email" as const, view: "growth" as const, emailSubscribers: 34_487, newSubscribers: 882, exclusions: 44, changes: { emailSubscribers: null, newSubscribers: null, exclusions: null }, charts: { subscriberGrowthLine: true as const, newSubscribersExclusionsBar: true as const }, visiblePeriodText: visible } } : {}),
+    } as AutoCaptureState;
+  }
+
+  /** A canonical report store: each automatic save lands on it immediately, like the API. */
+  function backend(initial: ReportDraft, options: { save?: (type: ScreenshotType) => Error | null; generate?: () => Promise<unknown> } = {}) {
+    let current = initial; const events: string[] = [];
+    const api = rememberingTargets(mockApi({
+      listReportDrafts: vi.fn(async () => [current]), getReportDraft: vi.fn(async () => current),
+      saveAutomaticCapture: vi.fn(async (_draft: ReportDraft, type: ScreenshotType, input: { sourceUrl: string; sourceProof: unknown }) => {
+        const failure = options.save?.(type) ?? null;
+        if (failure) { events.push(`refused:${type}`); throw failure; }
+        events.push(`save:${type}`); current = savedAutomatically(current, type, input); return current;
+      }),
+      autoGenerateFinalReport: vi.fn(options.generate ?? (async () => {
+        events.push("auto-generate");
+        current = { ...current, status: "generated" as const, version: current.version + 1, screenshots: current.screenshots.map((shot) => ({ ...shot, automatedValidatedAt: NOW.toISOString() })) };
+        return { report: current, artifact: deliveredArtifact(current.id) };
+      })),
+      getCurrentPdfArtifact: vi.fn(async () => deliveredArtifact(current.id)),
+      applyEvent: vi.fn(), generatePdf: vi.fn(), approveImportedScreenshot: vi.fn(),
+    }), { sourceUrls: { subscriberGrowthUrl: SG_URL } });
+    withConfiguredDataDefinition(initial, api);
+    return { api, events, get current() { return current; } };
+  }
+  function service(events: string[], fail: (type: ScreenshotType) => { code: string; message: string } | null = () => null) {
+    let draft: ReportDraft | null = null;
+    const svc: AutoCaptureService = {
+      start: vi.fn(async (request) => {
+        events.push(`start:${request.screenshotType}`);
+        const failure = fail(request.screenshotType);
+        return failure ? { request, stage: "failed" as const, code: failure.code as never, message: failure.message } : verified(request, draft!);
+      }),
+      get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
+    };
+    return { svc, bind(report: ReportDraft) { draft = report; } };
+  }
+  const fresh = (): ReportDraft => ({ ...runnerReport(), client: { ...runnerReport().client, currency: "USD" }, sections: { ...TEN } });
+  const renderRun = (api: ApiClient, svc: AutoCaptureService) => render(<App api={api} captureService={{ getActiveTab: vi.fn(), captureVisibleTab: vi.fn() }} automaticCaptureService={svc} discoverBusinessReviewSource={testDiscovery} subscriberGrowthSource={sourceHooks(vi.fn())} now={() => new Date(NOW)} />);
+
+  it("1–5, 8, 9, 13, 14: one click captures all 10 in order, saves each before the next, never shows review, then finalizes automatically", async () => {
+    const initial = fresh(); const store = backend(initial); const { svc, bind } = service(store.events); bind(initial);
+    const user = userEvent.setup(); renderRun(store.api, svc);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    const gate = watchForReviewGate();
+    // The only click: everything after it runs by itself.
+    await user.click(screen.getByRole("button", { name: "Start Automatic Capture · 10 sections" }));
+    await waitFor(() => expect(store.api.autoGenerateFinalReport).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    gate.stop();
+    // The run screen was shown; no review screen and no Confirm & Continue ever appeared.
+    expect(gate.seen).toEqual({ review: false, confirm: false, runScreen: true });
+    // Strictly sequential: section N is saved on the report before section N+1 starts.
+    expect(store.events).toEqual([...ORDER.flatMap((type) => [`start:${type}`, `save:${type}`]), "auto-generate"]);
+    expect(svc.start).toHaveBeenCalledTimes(10);
+    // Saved as machine-validated automatic evidence, never as a human approval or through the manual upload.
+    expect(store.current.screenshots.filter((shot) => shot.approved)).toHaveLength(0);
+    expect(store.api.uploadScreenshotImage).not.toHaveBeenCalled();
+    expect(store.api.approveImportedScreenshot).not.toHaveBeenCalled(); expect(store.api.applyEvent).not.toHaveBeenCalled(); expect(store.api.generatePdf).not.toHaveBeenCalled();
+    // Drive/Doc come only from the one automatic generation after a valid 10/10.
+    const done = await screen.findByLabelText("Final Client Report");
+    await waitFor(() => expect(done).toHaveTextContent("Final PDFPASS"));
+    expect(done).toHaveTextContent("Captured10/10"); expect(done).toHaveTextContent("Automated validationPASS"); expect(done).toHaveTextContent("Cover valuesPASS");
+    expect(done).toHaveTextContent("Google DrivePASS"); expect(done).toHaveTextContent("Google DocPASS"); expect(done).toHaveTextContent("Human reviewOptional");
+    // Human review stays available afterwards, but nothing required it.
+    expect(screen.getAllByRole("button", { name: "Review saved capture" }).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /Resume Automatic Capture/ })).toBeNull();
+  }, 20_000);
+
+  it("6 + 7: a Section 10 failure keeps sections 1–9 on the report; Resume captures only Section 10 and then finalizes", async () => {
+    const initial = fresh(); let sgBroken = true;
+    const store = backend(initial); const { svc, bind } = service(store.events, (type) => type === "email_subscriber_growth" && sgBroken ? { code: "ACCOUNT_CONTEXT_MISMATCH", message: "The open Klaviyo account is not AutoLEDTech.com." } : null); bind(initial);
+    const user = userEvent.setup(); renderRun(store.api, svc);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await user.click(screen.getByRole("button", { name: "Start Automatic Capture · 10 sections" }));
+    expect(await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 })).toBeInTheDocument();
+    expect(screen.getByText(/The open Klaviyo account is not AutoLEDTech\.com\./)).toBeInTheDocument();
+    // Sections 1–9 were each saved as they passed; nothing was generated from 9/10.
+    expect(store.current.screenshots.map((shot) => shot.type)).toEqual(ORDER.slice(0, 9));
+    expect(store.api.autoGenerateFinalReport).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Back to report" }));
+    expect(await screen.findByText("Automatic capture: 9 / 10 sections captured")).toBeInTheDocument();
+    sgBroken = false; store.events.length = 0;
+    await user.click(screen.getByRole("button", { name: "Resume Automatic Capture · Subscriber Growth" }));
+    await waitFor(() => expect(store.api.autoGenerateFinalReport).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    expect(store.events).toEqual(["start:email_subscriber_growth", "save:email_subscriber_growth", "auto-generate"]);
+    expect(store.current.screenshots).toHaveLength(10);
+  }, 20_000);
+
+  it.each([
+    ["11: wrong client", "REPORT_CLIENT_MISMATCH", "This capture was made for another client; it was not saved."],
+    ["12: wrong month", "REPORT_MONTH_MISMATCH", "This capture was made for another report month; it was not saved."],
+  ] as const)("%s: the report refuses the capture, the run stops at once and nothing is finalized", async (_label, code, message) => {
+    const initial = fresh();
+    const store = backend(initial, { save: (type) => type === "top_flows" ? new ApiError(code, message, 409) : null }); const { svc, bind } = service(store.events); bind(initial);
+    const user = userEvent.setup(); renderRun(store.api, svc);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await user.click(screen.getByRole("button", { name: "Start Automatic Capture · 10 sections" }));
+    expect(await screen.findByRole("heading", { name: "Automatic capture paused" }, { timeout: 10_000 })).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(message.replace(/[.;]/g, "\\$&")))).toBeInTheDocument();
+    // A permanent refusal is not retried, later sections never start, and the section saved before it is kept.
+    expect(store.events).toEqual(["start:overview", "save:overview", "start:top_flows", "refused:top_flows"]);
+    expect(store.api.autoGenerateFinalReport).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("10: failed machine validation still blocks finalization; no Drive PDF or Google Doc is reported", async () => {
+    const initial = fresh();
+    const store = backend(initial, { generate: async () => { throw new ApiError("REPORT_VALIDATION_FAILED", "Automatic capture overview failed stored-byte verification (hash, size or dimensions); nothing was generated.", 409); } });
+    const { svc, bind } = service(store.events); bind(initial);
+    const user = userEvent.setup(); renderRun(store.api, svc);
+    await user.click(await screen.findByRole("button", { name: "Open Report" }));
+    await user.click(screen.getByRole("button", { name: "Start Automatic Capture · 10 sections" }));
+    await waitFor(() => expect(store.api.autoGenerateFinalReport).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+    const final = await screen.findByLabelText("Final Client Report");
+    expect(await within(final).findByText(/Automatic final report failed: REPORT_VALIDATION_FAILED/)).toBeInTheDocument();
+    expect(final).toHaveTextContent("Automated validationFAIL");
+    expect(final).not.toHaveTextContent("Google DrivePASS"); expect(final).not.toHaveTextContent("Google DocPASS");
+    expect(store.api.generatePdf).not.toHaveBeenCalled();
+  }, 20_000);
 });

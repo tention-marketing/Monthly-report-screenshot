@@ -202,6 +202,33 @@ export function createApiClient(options: ApiClientOptions) {
       }
       return canonical;
     },
+    /**
+     * Persists one passed automatic-capture section on the canonical report immediately, as a machine-validated
+     * automatic capture (never a human approval). Confirmed by the acknowledgement, the local SHA-256 and a canonical
+     * reload; anything else throws, so the runner never advances on an unconfirmed save.
+     */
+    async saveAutomaticCapture(report: Pick<ReportDraft, "id" | "version" | "client" | "reportMonth">, type: ScreenshotType, input: { sourceUrl: string; sourceProof: unknown; image: Blob }): Promise<ReportDraft> {
+      const parsedProof = screenshotSourceProofSchema.safeParse(input.sourceProof);
+      if (!parsedProof.success) throw new ApiError("SCREENSHOT_SOURCE_PROOF_INVALID", "The capture proof does not match the capture proof contract.", null, parsedProof.error.issues);
+      const sourceProof = parsedProof.data;
+      const month = `${report.reportMonth.year}-${String(report.reportMonth.month).padStart(2, "0")}`;
+      const body = await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(report.id)}/screenshots/${type}/automatic-image`, {
+        method: "PUT",
+        headers: { "content-type": "image/png", "x-expected-version": String(report.version), "x-period-confirmed": "true", "x-capture-proof": asciiJson(sourceProof), "x-source-url": input.sourceUrl, "x-expected-client-id": report.client.id, "x-expected-report-month": month },
+        body: input.image,
+      });
+      const ack = z.object({ reportId: z.string(), clientId: z.string(), screenshotType: z.string(), screenshotRecordId: z.string(), captureStatus: z.literal("automatic_pass"), sha256: z.string().regex(/^[a-f0-9]{64}$/), report: reportDraftSchema }).safeParse(body);
+      if (!ack.success || ack.data.reportId !== report.id || ack.data.clientId !== report.client.id || ack.data.screenshotType !== type) throw new ApiError("AUTOMATIC_CAPTURE_ACK_MISMATCH", "The backend did not confirm this automatic capture for this report.", 200, body);
+      if (await sha256(input.image) !== ack.data.sha256) throw new ApiError("SCREENSHOT_SHA256_MISMATCH", "The stored screenshot hash did not match the captured PNG bytes.", 200);
+      const canonical = reportDraftSchema.parse(await requestJson(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(report.id)}`));
+      const persisted = canonical.screenshots.find((shot) => shot.type === type);
+      if (canonical.id !== report.id || canonical.client.id !== report.client.id || canonical.reportMonth.year !== report.reportMonth.year || canonical.reportMonth.month !== report.reportMonth.month
+        || canonical.version < ack.data.report.version || !persisted || persisted.id !== ack.data.screenshotRecordId || persisted.sha256 !== ack.data.sha256
+        || !persisted.periodConfirmed || JSON.stringify(persisted.sourceProof) !== JSON.stringify(sourceProof)) {
+        throw new ApiError("SCREENSHOT_PERSISTENCE_NOT_CONFIRMED", "The canonical report reload did not contain the saved automatic capture.", 200);
+      }
+      return canonical;
+    },
     async getScreenshotImage(id: string, type: ScreenshotType): Promise<Blob> {
       const response = await requestResponse(request, `${baseUrl}/api/v1/report-drafts/${id}/screenshots/${type}/image`);
       if (!response.ok) throw await toApiError(response);
@@ -211,7 +238,7 @@ export function createApiClient(options: ApiClientOptions) {
       return response.blob();
     },
     async getPendingImportedScreenshotImage(id: string, type: ScreenshotType, expectedSha256: string): Promise<Blob> {
-      const response = await requestResponse(request, `${baseUrl}/api/v1/dev/report-drafts/${encodeURIComponent(id)}/screenshots/${type}/pending-image`);
+      const response = await requestResponse(request, `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/screenshots/${type}/pending-image`);
       if (!response.ok) throw await toApiError(response);
       if (response.headers.get("x-report-id") !== id || response.headers.get("x-screenshot-type") !== type || response.headers.get("x-screenshot-sha256") !== expectedSha256
         || !response.headers.get("content-type")?.startsWith("image/png")) throw new ApiError("IMPORTED_REVIEW_IMAGE_ACK_MISMATCH", "The pending review image did not match the selected report capture.", response.status);
@@ -277,7 +304,7 @@ export function createApiClient(options: ApiClientOptions) {
     },
     async approveImportedScreenshot(id: string, type: ScreenshotType, input: { expectedVersion: number; expectedSha256: string }): Promise<ReportDraft> {
       const acknowledgement = screenshotUploadAcknowledgementSchema.parse(await requestJson(request,
-        `${baseUrl}/api/v1/dev/report-drafts/${encodeURIComponent(id)}/screenshots/${type}/review`,
+        `${baseUrl}/api/v1/report-drafts/${encodeURIComponent(id)}/screenshots/${type}/review`,
         jsonRequest("POST", input)));
       const acknowledged = acknowledgement.report.screenshots.find((screenshot) => screenshot.type === type);
       if (acknowledgement.reportId !== id || acknowledgement.report.id !== id || acknowledgement.screenshotType !== type

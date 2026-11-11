@@ -15,7 +15,8 @@ import { PdfArtifactStorageError, type PdfArtifactStorage } from "../storage/pdf
 import { buildReportDocumentModel, ReportDocumentError, renderReportHtml, type ReportDocumentModel } from "../reports/report-document.js";
 import { PdfRendererError, type PdfRenderer } from "../reports/pdf-renderer.js";
 import { createHash } from "node:crypto";
-import { reportCover, type CoverIssue } from "@tention/report-schema";
+import { createScreenshotSourceProof, matchesReportCaptureSpec, reportCover, type CoverIssue } from "@tention/report-schema";
+import { loadPendingImport } from "../reports/automatic-capture-review.js";
 import { REPORT_CAPTURE_SPEC_V1, reportPdfArtifactSchema, screenshotSectionMapping, type ReportDraft, type ReportPdfArtifact, type ScreenshotType } from "@tention/report-schema";
 import { deliverArtifactToDrive, syncArtifactGoogleDoc, type PdfDriveDelivery, type ReportGoogleDocSync } from "../delivery/google-drive-delivery.js";
 import { renderReportGoogleDocHtml } from "../reports/report-google-doc.js";
@@ -71,6 +72,13 @@ const imageUploadHeadersSchema = z.object({
   "x-source-url": z.string().url().optional(),
   "x-capture-proof": captureProofHeaderSchema,
 }).passthrough();
+/** Automatic captures are stored with this origin: machine-validated evidence that a human may optionally approve. */
+const AUTOMATIC_CAPTURE_ORIGIN = "live_acceptance_import" as const;
+const automaticImageHeadersSchema = imageUploadHeadersSchema.extend({
+  "x-expected-client-id": z.string().min(1),
+  "x-expected-report-month": z.string().regex(/^\d{4}-\d{2}$/),
+});
+const reviewRequestSchema = z.object({ expectedVersion: z.number().int().positive(), expectedSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
 const listQuerySchema = z.object({
   clientId: z.string().min(1).optional(),
   year: z.coerce.number().int().min(2000).max(9999).optional(),
@@ -246,6 +254,107 @@ export const reportDraftRoutes: FastifyPluginAsync<RouteOptions> = async (app, o
         throw error;
       }
     } catch (error) { return sendError(reply, error); }
+  });
+
+  /**
+   * One automatic-capture section, persisted the moment it passes: the canonical report keeps it immediately, so a
+   * later section's failure never loses it. The record is a machine-validated automatic capture — never a human
+   * approval (`approved` stays false). The server re-checks the report identity the extension captured for (client,
+   * month, version), that the section is an enabled automatic section, the source proof and its exact period, the
+   * Klaviyo source URL, the PNG, and uniqueness against every other section. Final generation re-verifies the bytes.
+   */
+  app.put<{ Params: { id: string; type: string }; Body: Buffer }>("/report-drafts/:id/screenshots/:type/automatic-image", async (request, reply) => {
+    try {
+      const draft = await options.repository.getById(request.params.id);
+      if (!draft) return reply.code(404).send({ error: "REPORT_NOT_FOUND", message: "This report no longer exists." });
+      const routeType = parseScreenshotType(request.params.type);
+      const headers = automaticImageHeadersSchema.parse(request.headers);
+      if (headers["x-expected-client-id"] !== draft.client.id) return reply.code(409).send({ error: "REPORT_CLIENT_MISMATCH", message: "This capture was made for another client; it was not saved." });
+      if (headers["x-expected-report-month"] !== `${draft.reportMonth.year}-${String(draft.reportMonth.month).padStart(2, "0")}`) return reply.code(409).send({ error: "REPORT_MONTH_MISMATCH", message: "This capture was made for another report month; it was not saved." });
+      ensureExpectedVersion(draft.version, headers["x-expected-version"]);
+      if (draft.status === "generating") return reply.code(409).send({ error: "REPORT_GENERATING", message: "A final report is being generated; captures cannot change now." });
+      const spec = REPORT_CAPTURE_SPEC_V1.find((entry) => entry.screenshotType === routeType);
+      const sectionState = spec ? draft.sections[spec.key] : undefined;
+      if (!spec || spec.automationStatus !== "auto" || sectionState === undefined || sectionState === "disabled") {
+        return reply.code(409).send({ error: "AUTOMATIC_SECTION_NOT_ENABLED", message: `${routeType} is not an enabled automatic section of this report.` });
+      }
+      const proof = headers["x-capture-proof"];
+      const expectedPeriod = JSON.stringify(createScreenshotSourceProof(routeType, draft.period).expectedPeriod);
+      if (!matchesReportCaptureSpec(routeType, proof) || JSON.stringify(proof.expectedPeriod) !== expectedPeriod || JSON.stringify(proof.observedPeriod) !== expectedPeriod) {
+        return reply.code(409).send({ error: "REPORT_PERIOD_NOT_CONFIRMED", message: `The ${routeType} source proof does not show this report's exact period and source.` });
+      }
+      const sourceUrl = normalizeSourceUrl(headers["x-source-url"]);
+      if (!sourceUrl || !sourceUrl.startsWith("https://www.klaviyo.com/")) return reply.code(409).send({ error: "SCREENSHOT_SOURCE_URL_INVALID", message: `The ${routeType} capture did not come from a verified Klaviyo page.` });
+      if (!Buffer.isBuffer(request.body)) throw new ScreenshotStorageError("INVALID_SCREENSHOT_CONTENT", "Screenshot upload must contain PNG bytes.");
+      const dimensions = inspectPng(request.body);
+      const incomingSha = createHash("sha256").update(request.body).digest("hex");
+      if (draft.screenshots.some((shot) => shot.type !== routeType && shot.sha256 === incomingSha)) throw new ReportDomainError("DUPLICATE_SCREENSHOT_SOURCE", `${routeType} duplicates another section's screenshot.`);
+      const capturedAt = options.now().toISOString();
+      const assetId = crypto.randomUUID();
+      const previous = draft.screenshots.find(({ type }) => type === routeType);
+      let savedStorageKey: string | null = null; let metadataSaveCompleted = false;
+      try {
+        const asset = await options.screenshotStorage.put(`reports/${draft.id}/${routeType}/${assetId}.png`, request.body);
+        savedStorageKey = asset.storageKey;
+        if (asset.sha256 !== incomingSha) throw new ScreenshotStorageError("STORAGE_ERROR", "Stored screenshot bytes do not match the upload.");
+        const screenshot = screenshotRecordSchema.parse({
+          id: assetId, clientId: draft.client.id, reportMonth: draft.reportMonth, type: routeType, capturedAt, sourceUrl,
+          width: dimensions.width, height: dimensions.height, approved: false, approvedAt: null, captureOrigin: AUTOMATIC_CAPTURE_ORIGIN,
+          periodConfirmed: true, storageKey: asset.storageKey, mimeType: "image/png", byteSize: asset.byteSize, sha256: asset.sha256,
+          sourceProof: proof, automatedValidatedAt: null,
+        });
+        const invalidates = replacementInvalidatesCaptureReview(draft, routeType);
+        const updated = invalidates
+          ? replaceScreenshotAndInvalidateCaptureReview(draft, screenshot, routeType, { now: options.now() })
+          : upsertScreenshotMetadata(draft, screenshot, routeType, { now: options.now() });
+        ensureCaptureSourceAccepted(updated.validation);
+        const saved = invalidates
+          ? await options.repository.saveWithLifecycleEvent(updated, headers["x-expected-version"], "MARK_CAPTURES_INCOMPLETE")
+          : await options.repository.save(updated, headers["x-expected-version"]);
+        metadataSaveCompleted = true;
+        const persisted = saved.screenshots.find(({ type }) => type === routeType);
+        if (!persisted || persisted.id !== screenshot.id || persisted.sha256 !== screenshot.sha256 || persisted.approved || persisted.captureOrigin !== AUTOMATIC_CAPTURE_ORIGIN
+          || !persisted.periodConfirmed || JSON.stringify(persisted.sourceProof) !== JSON.stringify(screenshot.sourceProof)) {
+          throw new ReportPersistenceError("PERSISTENCE_DATA_INVALID", "Saved automatic capture could not be confirmed in the canonical report.");
+        }
+        if (previous?.storageKey && previous.storageKey !== asset.storageKey) void options.screenshotStorage.delete(previous.storageKey).catch(() => undefined);
+        return { reportId: saved.id, clientId: saved.client.id, reportMonth: saved.reportMonth, screenshotType: routeType, screenshotRecordId: persisted.id, captureStatus: "automatic_pass" as const, sha256: persisted.sha256!, report: saved };
+      } catch (error) {
+        if (savedStorageKey && !metadataSaveCompleted) await options.screenshotStorage.delete(savedStorageKey).catch(() => undefined);
+        throw error;
+      }
+    } catch (error) { return sendError(reply, error); }
+  });
+
+  /** Optional human review of a saved automatic capture: view it. Never required for automatic finalization. */
+  app.get<{ Params: { id: string; type: string } }>("/report-drafts/:id/screenshots/:type/pending-image", async (request, reply) => {
+    try {
+      const { draft, screenshot, bytes } = await loadPendingImport(options.repository, options.screenshotStorage, request.params.id, request.params.type);
+      return reply.type("image/png").header("cache-control", "no-store").header("x-report-id", draft.id).header("x-screenshot-type", screenshot.type).header("x-screenshot-sha256", screenshot.sha256!).send(bytes);
+    } catch (error) {
+      return reply.code(400).send({ error: "IMPORTED_SCREENSHOT_REVIEW_REJECTED", message: error instanceof Error ? error.message : "The saved capture could not be loaded for review." });
+    }
+  });
+  /** Optional human review: record a human approval of one saved automatic capture (same bytes, same proof). */
+  app.post<{ Params: { id: string; type: string } }>("/report-drafts/:id/screenshots/:type/review", async (request, reply) => {
+    try {
+      const { expectedVersion, expectedSha256 } = reviewRequestSchema.parse(request.body);
+      const { draft, screenshot, bytes } = await loadPendingImport(options.repository, options.screenshotStorage, request.params.id, request.params.type);
+      if (draft.version !== expectedVersion) return reply.code(409).send({ error: "REPORT_VERSION_CONFLICT", message: "The report changed while this capture was being reviewed." });
+      if (screenshot.sha256 !== expectedSha256 || createHash("sha256").update(bytes).digest("hex") !== expectedSha256) return reply.code(409).send({ error: "SCREENSHOT_SHA256_MISMATCH", message: "The saved capture changed while it was being reviewed." });
+      const reviewedAt = options.now();
+      const updated = upsertScreenshotMetadata(draft, { ...screenshot, approved: true, approvedAt: reviewedAt.toISOString() }, screenshot.type, { now: reviewedAt });
+      const saved = await options.repository.save(updated, expectedVersion);
+      const persisted = saved.screenshots.find(({ type }) => type === screenshot.type);
+      if (!persisted || persisted.id !== screenshot.id || persisted.sha256 !== expectedSha256 || !persisted.approved || persisted.captureOrigin !== AUTOMATIC_CAPTURE_ORIGIN) {
+        return reply.code(500).send({ error: "IMPORTED_REVIEW_PERSISTENCE_FAILED", message: "The canonical report did not confirm the reviewed capture." });
+      }
+      return { reportId: saved.id, screenshotType: screenshot.type, screenshotRecordId: persisted.id, approvalStatus: "approved" as const, sha256: persisted.sha256!, sourceProofAccepted: true as const, report: saved };
+    } catch (error) {
+      if (error instanceof ReportPersistenceError && error.code === "REPORT_VERSION_CONFLICT") return reply.code(409).send({ error: error.code, message: "The report changed while this capture was being reviewed. Reload and try again." });
+      if (error instanceof ZodError) return reply.code(400).send({ error: "INVALID_IMPORTED_REVIEW_REQUEST", message: "Review request did not include a valid report version and SHA-256." });
+      return reply.code(400).send({ error: "IMPORTED_SCREENSHOT_REVIEW_REJECTED", message: error instanceof Error ? error.message : "The saved capture could not be approved." });
+    }
   });
 
   app.get<{ Params: { id: string; type: string } }>("/report-drafts/:id/screenshots/:type/image", async (request, reply) => {

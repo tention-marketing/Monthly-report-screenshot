@@ -104,7 +104,7 @@ describe("extension API configuration", () => {
     } }));
     const api = createApiClient({ baseUrl: localApiBaseUrl, fetch: imageFetch });
     await expect(api.getPendingImportedScreenshotImage(reportId, "signup_form", sha256)).resolves.toMatchObject({ type: "image/png", size: png.size });
-    expect(imageFetch.mock.calls[0]?.[0]).toBe(`${localApiBaseUrl}/api/v1/dev/report-drafts/${reportId}/screenshots/signup_form/pending-image`);
+    expect(imageFetch.mock.calls[0]?.[0]).toBe(`${localApiBaseUrl}/api/v1/report-drafts/${reportId}/screenshots/signup_form/pending-image`);
     const mismatched = createApiClient({ baseUrl: localApiBaseUrl, fetch: vi.fn().mockResolvedValue(new Response(png, { status: 200, headers: {
       "content-type": "image/png", "x-report-id": "other", "x-screenshot-type": "signup_form", "x-screenshot-sha256": sha256,
     } })) });
@@ -125,7 +125,7 @@ describe("extension API configuration", () => {
     const api = createApiClient({ baseUrl: localApiBaseUrl, fetch });
     const canonical = await api.approveImportedScreenshot(reportId, "signup_form", { expectedVersion: 2, expectedSha256: sha256 });
     expect(fetch).toHaveBeenCalledTimes(2);
-    expect(fetch.mock.calls[0]?.[0]).toBe(`${localApiBaseUrl}/api/v1/dev/report-drafts/${reportId}/screenshots/signup_form/review`);
+    expect(fetch.mock.calls[0]?.[0]).toBe(`${localApiBaseUrl}/api/v1/report-drafts/${reportId}/screenshots/signup_form/review`);
     expect(JSON.parse(String((fetch.mock.calls[0]?.[1] as RequestInit).body))).toEqual({ expectedVersion: 2, expectedSha256: sha256 });
     expect(fetch.mock.calls[1]?.[0]).toBe(`${localApiBaseUrl}/api/v1/report-drafts/${reportId}`);
     expect(canonical.screenshots[0]).toMatchObject({ approved: true, captureOrigin: "live_acceptance_import", sha256 });

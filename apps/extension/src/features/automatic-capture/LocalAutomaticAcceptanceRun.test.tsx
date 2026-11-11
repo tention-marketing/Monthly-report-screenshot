@@ -5,7 +5,7 @@ import type { ApiClient } from "@tention/api-client";
 import type { AutoCaptureService, ExecutiveSummaryAutoCaptureRequest } from "./auto-capture-service.js";
 import { getAutomaticCapturePlan } from "../report-runner/runner.js";
 import { LocalAutomaticAcceptanceRun } from "./LocalAutomaticAcceptanceRun.js";
-import { createScreenshotSourceProof } from "@tention/report-schema";
+import { createScreenshotSourceProof, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 
 const report = createReportDraft({
   client: { id: "autoledtech", name: "AutoLEDTech.com", timezone: "America/New_York", currency: null },
@@ -24,6 +24,14 @@ function importedReport() {
 
 afterEach(() => { vi.restoreAllMocks(); });
 
+/** The canonical per-section save (and reload) the runner uses in every build; added when a test does not define it. */
+function withCanonicalSave<T>(api: T): T {
+  const target = api as unknown as Record<string, unknown>;
+  if (!target.saveAutomaticCapture) target.saveAutomaticCapture = vi.fn(async (current: ReportDraft, type: ScreenshotType) => ({ ...current, version: current.version + 1, screenshots: [...current.screenshots.filter((shot) => shot.type !== type), importedReport().screenshots.find((shot) => shot.type === type)!] }));
+  if (!target.getReportDraft) target.getReportDraft = vi.fn(async () => report);
+  return api;
+}
+
 /** Business performance summary DOM text (values as Klaviyo renders them). */
 const COVER_VALUES = { totalRevenue: "$584,032.35", totalAttributedRevenue: "$173,849.26", emailAttributedRevenue: "$156,674.44", smsAttributedRevenue: "$17,174.82", campaignRevenue: "$56,527.51", flowRevenue: "$117,321.75", visiblePeriodText: "Aug 1, 2026 - Aug 31, 2026" };
 
@@ -32,7 +40,7 @@ function readyState(request: ExecutiveSummaryAutoCaptureRequest) {
     request, stage: "review_ready" as const, sourceTabId: 7, detectedPeriod: "Aug 1, 2026 - Aug 31, 2026",
     periodEvidence: { startDate: "2026-08-01", endDate: "2026-08-31", ...(request.screenshotType === "month_comparison" ? { comparisonStartDate: "2026-07-01", comparisonEndDate: "2026-07-31" } : {}) },
     target: { x: 0, y: 0, width: 720, height: 450, viewportWidth: 1440, viewportHeight: 900, availableRowCount: request.screenshotType === "top_campaigns" ? 3 : request.screenshotType === "top_flows" ? 5 : undefined, visibleControls: [], stageTimingsMs: { navigationMs: 3, pageReadyMs: 4, periodSetMs: 5, cardResolveMs: 6, viewSwitchMs: 7, contentReadyMs: 8 } },
-    captured: { sourceUrl: request.accountUrl, isKlaviyo: true, tabId: 7, dataUrl: "data:image/png;base64,AA==" },
+    captured: { sourceUrl: request.accountUrl ?? "https://www.klaviyo.com/dashboard", isKlaviyo: true, tabId: 7, dataUrl: "data:image/png;base64,AA==" },
     // The Executive Summary capture carries the report cover values read from the period-verified card.
     ...(request.screenshotType === "overview" ? { businessPerformanceEvidence: COVER_VALUES } : {}),
     ...(request.screenshotType === "top_campaigns" ? { campaignsEvidence: {
@@ -62,7 +70,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "BUSINESS_REVIEW_CARD_NOT_FOUND" as const, message: "The reporting card was not found." })),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     expect(service.start).toHaveBeenCalledTimes(5);
@@ -78,7 +86,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     ]);
     expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "failed" }));
     expect(screen.getByText(/Executive Summary needs attention/)).toBeInTheDocument();
-    expect(screen.getAllByText("Not started")).toHaveLength(8);
+    expect(screen.getAllByText("Waiting")).toHaveLength(8);
     expect(screen.getAllByText(/FAIL after 5 attempt/)).toHaveLength(1);
     expect(report.screenshots).toHaveLength(0);
   }, 15_000);
@@ -96,14 +104,14 @@ describe("local one-click automatic acceptance run strict barriers", () => {
         : readyState(request)),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 20_000 });
     const sectionSaves = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map((call) => JSON.stringify(call));
     expect(sectionSaves.some((call) => call.includes("EXECUTIVE_SUMMARY_METRICS_UNVERIFIED") && call.includes("Revenue from Flows was not found"))).toBe(true);
     // Retried (a card that is not ready), and no section ever passed or was imported.
     expect(vi.mocked(service.start).mock.calls.filter(([request]) => request.screenshotType === "overview").length).toBeGreaterThan(1);
     expect(sectionSaves.some((call) => call.includes('"status":"pass"'))).toBe(false);
-    expect(api.importLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+    expect(api.saveAutomaticCapture).not.toHaveBeenCalled();
   }, 30_000);
 
   it("fails a schema-invalid source proof on its first attempt with the exact field instead of retrying", async () => {
@@ -120,13 +128,14 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       }),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     const campaignAttempts = vi.mocked(service.start).mock.calls.filter(([request]) => request.screenshotType === "top_campaigns");
     expect(campaignAttempts).toHaveLength(1);
     expect(screen.getByText(/campaigns\.rows\.0\.type: String must contain at least 1 character/)).toBeInTheDocument();
-    expect(api.importLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+    // The two sections that passed before it are saved on the report; the invalid one never is.
+    expect(vi.mocked(api.saveAutomaticCapture).mock.calls.map(([, type]) => type)).toEqual(["overview", "top_flows"]);
   });
 
   it("does not retry a permanent failure such as the wrong Klaviyo account", async () => {
@@ -138,7 +147,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACCOUNT_CONTEXT_MISMATCH" as const, message: "The authorized Klaviyo account is not this client." })),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     expect(service.start).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/FAIL after 1 attempt/)).toBeInTheDocument();
@@ -155,7 +164,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => narrow(request)),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 });
     expect(service.start).toHaveBeenCalledTimes(5);
     expect(screen.getByText(/KLAVIYO_VIEWPORT_TOO_NARROW/)).toBeInTheDocument();
@@ -175,7 +184,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "REPORT_PERIOD_NOT_CONFIRMED" as const, message: "The requested report period could not be selected safely.", diagnostics: { observedPeriod: regionText, dateControlState: { regionText } } })),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 });
     const failures = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map(([, , result]) => result).filter((result) => result.status === "fail");
     expect(failures.length).toBeGreaterThan(1); // retried rather than paused on a rejected diagnostic write
@@ -196,7 +205,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "BUSINESS_REVIEW_ROWS_NOT_FOUND" as const, message: "The campaign_metrics table's final row was not found." })),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     expect(screen.getByText(/The required report content could not be verified\. \(BUSINESS_REVIEW_ROWS_NOT_FOUND · CARD_NOT_READY\)/)).toBeInTheDocument();
     expect(screen.queryByText(/reporting view could not be selected/)).not.toBeInTheDocument();
@@ -219,8 +228,8 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       }),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
-    await waitFor(() => expect(api.importLocalAutomaticCaptureRun).toHaveBeenCalled(), { timeout: 10_000 });
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    await waitFor(() => expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "completed" })), { timeout: 10_000 });
     expect(calls.month_comparison).toBe(3);
     // Every attempt clears the section's controller state and starts it again (each start re-enters its source fresh).
     // A clean start for each of the three attempts, then the consumed state is released.
@@ -251,8 +260,8 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       }),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined), clearAll: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
-    await waitFor(() => expect(api.importLocalAutomaticCaptureRun).toHaveBeenCalled(), { timeout: 10_000 });
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    await waitFor(() => expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "completed" })), { timeout: 10_000 });
     expect(starts).toHaveLength(2);
     expect(starts[0]!.recovery).toEqual({ level: 0, actions: ["fresh-source"], previousFailure: null });
     expect(starts[1]!.recovery).toEqual({ level: 1, actions, previousFailure: code });
@@ -277,9 +286,9 @@ describe("local one-click automatic acceptance run strict barriers", () => {
         get: vi.fn().mockImplementation(async (request: ExecutiveSummaryAutoCaptureRequest) => request.screenshotType === "flow_metrics" && request.attemptId === attempts[0]?.attemptId ? { request, stage: "capturing" as const } : null),
         clear: vi.fn().mockResolvedValue(undefined), clearAll: vi.fn().mockResolvedValue(undefined),
       };
-      render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
-      for (let step = 0; step < 30 && !vi.mocked(api.importLocalAutomaticCaptureRun).mock.calls.length; step += 1) await vi.advanceTimersByTimeAsync(10_000);
-      expect(api.importLocalAutomaticCaptureRun).toHaveBeenCalled();
+      render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+      for (let step = 0; step < 30 && !vi.mocked(api.finishLocalAutomaticCaptureRun).mock.calls.length; step += 1) await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "completed" }));
       expect(attempts).toHaveLength(2);
       expect(attempts[1]!.recovery).toEqual({ level: 1, actions: ["fresh-source", "release-capture-state"], previousFailure: "CAPTURE_TIMEOUT" });
       const failure = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.find(([, type, result]) => type === "flow_metrics" && result.status === "fail")![2];
@@ -291,7 +300,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
   it("refuses to start when the service worker runs a different build than the panel", async () => {
     const api = { startLocalAutomaticCaptureRun: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn() } as unknown as ApiClient;
     const service: AutoCaptureService = { start: vi.fn(), get: vi.fn(), clear: vi.fn(), getExtensionBuild: vi.fn().mockResolvedValue("2000-01-01T00:00:00.000Z") };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/service worker is running build 2000-01-01T00:00:00.000Z.*Reload the extension/));
     expect(api.startLocalAutomaticCaptureRun).not.toHaveBeenCalled();
@@ -306,7 +315,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     const service: AutoCaptureService = { start: vi.fn(), get: vi.fn(), clear: vi.fn(),
       normalizeKlaviyoViewport: vi.fn().mockResolvedValue({ ok: false, code: "KLAVIYO_VIEWPORT_CANNOT_BE_NORMALIZED", message: "Even at 50% zoom Klaviyo is only 1200 px wide (at least 1390 px is needed). The Chrome window itself is too narrow: make the window wider, then start again.", originalZoom: 1, viewport: { width: 1200, height: 900, devicePixelRatio: 1 } }),
       restoreKlaviyoZoom: vi.fn().mockResolvedValue({ restored: false, tabId: null, originalZoom: null, zoomAfter: null }) };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent(/Chrome window itself is too narrow/));
     expect(api.startLocalAutomaticCaptureRun).not.toHaveBeenCalled();
@@ -328,7 +337,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       normalizeKlaviyoViewport: vi.fn(async () => { order.push("normalize"); return normalized; }),
       restoreKlaviyoZoom: vi.fn(async () => { order.push("restore"); return restored; }),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByText("Klaviyo zoom restored to 125%.")).toBeInTheDocument());
     expect(order).toEqual(["normalize", "run-created", "normalize", "capture", "restore"]);
@@ -352,7 +361,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
       normalizeKlaviyoViewport: vi.fn().mockResolvedValue(normalized), restoreKlaviyoZoom: vi.fn().mockResolvedValue(restored),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={plan} allSections={plan} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(service.restoreKlaviyoZoom).toHaveBeenCalledTimes(1));
     expect(service.start).toHaveBeenCalledTimes(2);
@@ -367,7 +376,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     const api = { startLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureSection: vi.fn().mockResolvedValue(undefined), saveLocalAutomaticCaptureEvidence: vi.fn(), finishLocalAutomaticCaptureRun: vi.fn().mockResolvedValue(undefined) } as unknown as ApiClient;
     const service: AutoCaptureService = { start: vi.fn().mockImplementation(async (request) => ({ request, stage: "failed" as const, code: "ACCOUNT_CONTEXT_MISMATCH" as const, message: "Wrong account." })), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
       normalizeKlaviyoViewport: vi.fn().mockResolvedValue(normalized), restoreKlaviyoZoom: vi.fn().mockResolvedValue(restored) };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByText("Klaviyo zoom restored to 125%.")).toBeInTheDocument());
     expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument();
@@ -395,7 +404,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       start: vi.fn().mockImplementation(async (request) => { order.push(`start:${request.screenshotType}`); return readyState(request); }),
       get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockImplementation(async (request) => { order.push(`clear:${request.screenshotType}`); }),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={onClose} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={onClose} />);
     await waitFor(() => expect(api.saveLocalAutomaticCaptureEvidence).toHaveBeenCalledTimes(1));
     expect(service.start).toHaveBeenCalledTimes(1);
     expect(order).toEqual(["clear:overview", "start:overview"]);
@@ -404,7 +413,7 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     await waitFor(() => expect(api.saveLocalAutomaticCaptureSection).toHaveBeenCalledWith(expect.any(String), "overview", expect.objectContaining({ status: "pass" })));
     expect(service.start).toHaveBeenCalledTimes(1);
     releasePassAck();
-    await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture finished" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic Capture Complete" })).toBeInTheDocument());
     expect(service.start).toHaveBeenCalledTimes(9);
     expect(order.filter((entry) => entry.startsWith("start:")).map((entry) => entry.slice(6))).toEqual([
       "overview", "top_flows", "top_campaigns", "month_comparison", "campaign_performance", "campaign_metrics", "flow_performance", "flow_metrics", "deliverability",
@@ -421,13 +430,15 @@ describe("local one-click automatic acceptance run strict barriers", () => {
       }
     }
     expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "completed" }));
-    expect(api.importLocalAutomaticCaptureRun).toHaveBeenCalledTimes(1);
+    // Each section is saved on the canonical report as it passes; there is no end-of-run import.
+    expect(api.importLocalAutomaticCaptureRun).not.toHaveBeenCalled();
+    expect(vi.mocked(api.saveAutomaticCapture).mock.calls.map(([, type]) => type)).toEqual(order.filter((entry) => entry.startsWith("start:")).map((entry) => entry.slice(6)));
     // Every saved attempt names the extension build that produced it (unbundled under the test runner).
     const saved = vi.mocked(api.saveLocalAutomaticCaptureSection).mock.calls.map(([, , result]) => (result as { diagnostics: Record<string, unknown> }).diagnostics.extensionBuild);
     expect(saved.length).toBeGreaterThan(0);
     expect(new Set(saved)).toEqual(new Set(["unbundled"]));
-    expect(screen.getByText(/9 captured · 9 pending review · 0 approved · 0 missing/)).toBeInTheDocument();
-    expect(screen.getByText("Fresh captures: 9 / 9 successful", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText(/Saved on report: 9\/9 captured · 0 missing · human review optional \(0 approved\)/)).toBeInTheDocument();
+    expect(screen.getByText("This run: 9/9 PASS", { exact: false })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Back to report" }));
     expect(onClose).toHaveBeenCalledWith(expect.objectContaining({ id: report.id, screenshots: expect.arrayContaining([expect.objectContaining({ type: "overview", captureOrigin: "live_acceptance_import", approved: false })]) }));
   });
@@ -441,11 +452,11 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     const service: AutoCaptureService = {
       start: vi.fn().mockImplementation(async (request) => readyState(request)), get: vi.fn().mockResolvedValue(null), clear: vi.fn().mockResolvedValue(undefined),
     };
-    render(<LocalAutomaticAcceptanceRun api={api} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
+    render(<LocalAutomaticAcceptanceRun diagnostics api={withCanonicalSave(api)} report={report} targets={null} plan={getAutomaticCapturePlan(report)} service={service} onClose={vi.fn()} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Automatic capture paused" })).toBeInTheDocument(), { timeout: 10_000 }); // attempt 5 includes the bounded cool-down
     expect(service.start).toHaveBeenCalledTimes(5);
     expect(api.saveLocalAutomaticCaptureEvidence).toHaveBeenCalledTimes(10); // capture upload plus viewport diagnostics for each rejected attempt
-    expect(screen.getAllByText("Not started")).toHaveLength(8);
+    expect(screen.getAllByText("Waiting")).toHaveLength(8);
     expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "failed" }));
   }, 15_000);
 });
