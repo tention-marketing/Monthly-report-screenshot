@@ -338,3 +338,133 @@ describe("Section 10 readiness on the email-only layout (Purely Nutrient, run 8f
     expect(page.clicks).toEqual([]);
   });
 });
+
+/**
+ * Windows + Chrome, Steven Dann October 2026: sections 1–9 PASS, Section 10 failed 5/5 with
+ * SUBSCRIBER_GROWTH_TARGET_OCCLUDED (TARGET_OBSCURED) while Klaviyo's "Ask Composer" sat over the lower card. The same
+ * page passed on macOS, whose taller window keeps the card above the Composer.
+ */
+describe("Windows Subscriber Growth occlusion: Ask Composer handled automatically, never captured through", () => {
+  type Occlusion = { viewport: Record<string, unknown>; passes: Array<Record<string, unknown>>; targetRect: { x: number; y: number; w: number; h: number }; occluders: Array<{ kind: string; action: string; element: string; text: string; rect: { x: number; y: number; w: number; h: number }; intersectionArea: number; intersectionPercentage: number }> };
+  const october = { startDate: "2026-10-01", endDate: "2026-10-31" };
+  const run = async (options: SubscriberGrowthFixtureOptions) => {
+    const page = live(options);
+    const result = await prepareSubscriberGrowthDocument(capture(october));
+    return { page, result, occlusion: (result as { diagnostics?: { occlusion?: Occlusion } }).diagnostics?.occlusion };
+  };
+  /** The crop is inside the painted area and nothing outside the card is painted over it. */
+  const expectClearCrop = (result: Awaited<ReturnType<typeof prepareSubscriberGrowthDocument>>, viewport: { width: number; height: number }, scrollbar = 0, dockTop = viewport.height) => {
+    expect(result.ok ? "ok" : `${result.code}: ${JSON.stringify((result as { diagnostics?: { occlusion?: unknown } }).diagnostics?.occlusion ?? null).slice(0, 1_200)}`).toBe("ok");
+    if (!result.ok || !("targetRect" in result)) return;
+    const { x, y, width, height } = result.targetRect;
+    expect(x).toBeGreaterThanOrEqual(0); expect(y).toBeGreaterThanOrEqual(0);
+    expect(x + width).toBeLessThanOrEqual(viewport.width - scrollbar); expect(y + height).toBeLessThanOrEqual(dockTop);
+    const composer = document.getElementById("composer");
+    const shown = composer && composer.isConnected && composer.getBoundingClientRect().width > 0 && getComputedStyle(composer.closest("[data-tention-hidden-overlay]") ?? composer).opacity !== "0";
+    if (shown) { const box = composer!.getBoundingClientRect(); expect(box.top >= y + height || box.bottom <= y || box.left >= x + width || box.right <= x).toBe(true); }
+  };
+  // Composer bar floating over the bottom of the card, as observed live (fixed position relative to the window).
+  const overBottom = (width: number, height: number): [number, number, number, number] => [Math.round(width / 2) - 300, height - 140, 600, 64];
+
+  it("1. no overlay: captures with nothing hidden", async () => {
+    const { result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, channel: "Email" });
+    expectClearCrop(result, { width: 1503, height: 937 }, 17);
+    expect(result.ok && "diagnostics" in result && result.diagnostics).toMatchObject({ hiddenOverlays: 0, collapsedDocks: 0 });
+    expect(occlusion?.occluders).toEqual([]);
+  });
+
+  it("2. Ask Composer (fixed bar in a static wrapper) over the bottom of the card is identified, measured and hidden — never clicked", async () => {
+    const { page, result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, composer: true, composerKind: "wrapped", composerRect: overBottom, channel: "Email" });
+    expectClearCrop(result, { width: 1503, height: 937 }, 17);
+    const composer = occlusion!.occluders.find((item) => item.kind === "composer")!;
+    expect(composer).toMatchObject({ action: "hidden", element: expect.stringContaining("composer-wrapper"), text: expect.stringContaining("Ask Composer") });
+    expect(composer.intersectionArea).toBeGreaterThan(0); expect(composer.intersectionPercentage).toBeGreaterThan(0);
+    expect(composer.rect).toEqual({ x: 452, y: 797, w: 600, h: 64 });
+    expect(occlusion!.viewport).toMatchObject({ innerWidth: 1503, innerHeight: 937, layoutWidth: 1486, devicePixelRatio: 1 });
+    expect(page.clicks).toEqual(["Apply"]);
+  });
+
+  it("2b. the pre-fix rule (hide only an out-of-card element that is itself positioned) would have refused this exact page", async () => {
+    const { result } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, composer: true, composerKind: "wrapped", composerRect: overBottom, channel: "Email" });
+    expect(result.ok).toBe(true);
+    const wrapper = document.getElementById("composer-wrapper")!;
+    expect(getComputedStyle(wrapper).position === "fixed" || getComputedStyle(wrapper).position === "absolute").toBe(false);
+  });
+
+  it("3. a floating Composer partially overlapping the chart is hidden and the crop re-verified", async () => {
+    const { result, occlusion } = await run({ viewport: { width: 1544, height: 960 }, scrollbar: 19, composer: true, composerRect: (width) => [width - 520, 500, 340, 100], channel: "Email" });
+    expectClearCrop(result, { width: 1544, height: 960 }, 19);
+    expect(occlusion!.occluders).toEqual([expect.objectContaining({ action: "hidden", element: "aside#composer" })]);
+    expect(occlusion!.occluders[0]!.intersectionPercentage).toBeLessThan(10);
+  });
+
+  it("4. a tooltip over the chart is hidden as non-report UI", async () => {
+    const { result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, tooltip: true, channel: "Email" });
+    expectClearCrop(result, { width: 1503, height: 937 }, 17);
+    expect(occlusion!.occluders).toEqual([expect.objectContaining({ kind: "non-report-ui", action: "hidden", element: "div#tip" })]);
+  });
+
+  it("5. the Composer re-rendered by Klaviyo after it was hidden is found again and hidden again before capture", async () => {
+    const { result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, composer: true, composerKind: "wrapped", composerRect: overBottom, composerRerenders: 1, channel: "Email" });
+    expectClearCrop(result, { width: 1503, height: 937 }, 17);
+    expect(occlusion!.occluders.filter((item) => item.kind === "composer" && item.action === "hidden")).toHaveLength(2);
+  });
+
+  it("6 + 8. docked Composer on a short Windows window: the scroll area ends above it, so the dock is collapsed and the card placed in the clear area", async () => {
+    const viewport = { width: 1503, height: 937 };
+    const { page, result, occlusion } = await run({ viewport, scrollbar: 17, composer: true, composerKind: "docked", channel: "Email" });
+    expectClearCrop(result, viewport, 17);
+    expect(occlusion!.occluders).toEqual([expect.objectContaining({ kind: "composer", action: "collapsed-dock", text: expect.stringContaining("Ask Composer") })]);
+    expect(page.composer!.style.display).toBe("none");
+    // Report content is never touched.
+    expect(document.querySelector("[data-tention-hidden-overlay]")?.id).toBe("composer");
+  });
+
+  it("6b. docked Composer on a tall window: the card fits above the dock, so it is scrolled into the clear area and the dock is left alone", async () => {
+    const viewport = { width: 1754, height: 1300 };
+    const { page, result } = await run({ viewport, composer: true, composerKind: "docked", contentTop: 1_400, channel: "Email" });
+    expectClearCrop(result, viewport, 0, viewport.height - 120);
+    expect(page.composer!.style.display).toBe("");
+  });
+
+  it("7. geometry that changes after the scroll (content above grows) is re-measured before verification", async () => {
+    const viewport = { width: 1442, height: 1000 };
+    const { result, occlusion } = await run({ viewport, scrollbar: 21, composer: true, composerKind: "wrapped", composerRect: overBottom, contentTop: 1_400, growAfterScroll: 90, channel: "Email" });
+    expectClearCrop(result, viewport, 21);
+    expect(occlusion!.passes.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it.each([
+    ["9. Windows 125% display scaling, Chrome 80%", { width: 1442, height: 1000 }, 21, 1],
+    ["10. Windows Chrome 100%", { width: 1503, height: 937 }, 17, 1],
+    ["11. Windows Chrome 90%", { width: 1544, height: 960 }, 19, 1.125],
+    ["12. Windows Chrome 80%", { width: 1737, height: 1080 }, 21, 1],
+    ["13. side panel open (narrow window)", { width: 1180, height: 900 }, 17, 1.25],
+    ["14. macOS (overlay scrollbars, Retina)", { width: 1754, height: 1586 }, 0, 2],
+  ] as const)("%s: Ask Composer over the card is handled and the crop is clear", async (_name, viewport, scrollbar, dpr) => {
+    const { result, occlusion } = await run({ viewport, scrollbar, devicePixelRatio: dpr, composer: true, composerKind: "wrapped", composerRect: (width, height) => [Math.round(width / 2) - 300, Math.min(height - 140, 760), 600, 64], channel: "Email" });
+    expectClearCrop(result, viewport, scrollbar);
+    expect(occlusion!.viewport).toMatchObject({ innerWidth: viewport.width, layoutWidth: viewport.width - scrollbar, devicePixelRatio: dpr });
+  });
+
+  it("15. real page content painted over the card blocks the capture with the element named — never hidden", async () => {
+    const { result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, contentOverlay: true, channel: "Email" });
+    expect(result).toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_TARGET_OCCLUDED" });
+    expect(occlusion!.occluders).toEqual([expect.objectContaining({ kind: "page-content", action: "blocked", element: "div#banner", text: expect.stringContaining("still processing") })]);
+    expect(document.getElementById("banner")!.style.visibility).toBe("");
+    expect(document.querySelector("[data-tention-subscriber-growth]")).toBeNull();
+  });
+
+  it("15b. a modal dialog over the page blocks the capture — never hidden", async () => {
+    // Already on October, so no date picker (also a dialog) is opened.
+    const { result, occlusion } = await run({ viewport: { width: 1503, height: 937 }, scrollbar: 17, modal: true, channel: "Email", period: "10/01/2026 – 10/31/2026" });
+    expect(result).toMatchObject({ ok: false, code: "SUBSCRIBER_GROWTH_TARGET_OCCLUDED" });
+    expect(occlusion!.occluders).toEqual([expect.objectContaining({ kind: "modal", action: "blocked", element: "div#modal" })]);
+    expect(document.getElementById("modal")!.style.visibility).toBe("");
+  });
+
+  it("a card that cannot fit even after the dock is collapsed is refused, not clipped", async () => {
+    const { result } = await run({ viewport: { width: 1503, height: 760 }, scrollbar: 17, composer: true, composerKind: "docked", channel: "Email" });
+    expect(result).toMatchObject({ ok: false, code: "TARGET_BOUNDS_INVALID", diagnostics: { occlusion: { occluders: [expect.objectContaining({ action: "collapsed-dock" })] } } });
+  });
+});

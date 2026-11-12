@@ -146,4 +146,12 @@ export const KNOWN_FAILURES: readonly KnownFailure[] = [
     regressionTest: "Windows layout: classic scrollbars, zoom, side panel and reflow give the same Top Flows decision",
     matches: (code) => code === "TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW",
   },
+  {
+    id: "SUBSCRIBER_GROWTH_COMPOSER_OCCLUSION", discovered: "2026-11-12 (Steven Dann October 2026, Windows Chrome: sections 1–9 PASS, Section 10 failed 5/5 with Ask Composer over the card)", category: "TARGET_OBSCURED",
+    subsystem: "Subscriber Growth capture adapter (crop placement + overlay handling)",
+    rootCause: "Only an out-of-card element that was itself fixed/sticky/absolute was hidden; Klaviyo mounts the Composer in a static wrapper (or docks it in the page flow, where it ends the scroll area), so it was classed as page content and every attempt failed. The fit check used window.innerHeight, not the area Klaviyo actually paints, so a card clipped above the dock looked visible. Mac's taller window keeps the card above the Composer.",
+    recovery: "The crop is placed inside the painted area (layout viewport ∩ clipping ancestors) by scrolling the card's own scroller; an in-flow Composer/assistant dock is collapsed only when the card cannot otherwise fit; floating non-report layers (whole chain, incl. static wrappers) are hidden with visibility+opacity, then the crop is re-measured and re-verified. Page content and modals still block. Every attempt records viewport, target, clip area and each occluder's element, text, rect, intersection and action.",
+    regressionTest: "Windows Subscriber Growth occlusion: Ask Composer handled automatically, never captured through",
+    matches: (code) => code === "SUBSCRIBER_GROWTH_TARGET_OCCLUDED",
+  },
 ];

@@ -24,6 +24,22 @@ export interface SubscriberGrowthFixtureOptions {
   contentTop?: number; contentHeight?: number;
   composer?: boolean;
   /**
+   * How the Composer is mounted: "fixed" (a positioned element on body), "wrapped" (Klaviyo's static wrapper around a
+   * fixed bar, so the outermost out-of-card element is not itself positioned), or "docked" (in the page flow below
+   * Klaviyo's scroll container, which then ends above it).
+   */
+  composerKind?: "fixed" | "wrapped" | "docked";
+  /** Composer geometry relative to the viewport: [x, y, w, h] as functions of (innerWidth, innerHeight). */
+  composerRect?: (width: number, height: number) => [number, number, number, number];
+  /** Klaviyo re-renders the Composer as a new element this many times after it is hidden. */
+  composerRerenders?: number;
+  /** Width of a classic (Windows) scrollbar; Klaviyo lays out to innerWidth minus this. */
+  scrollbar?: number; devicePixelRatio?: number;
+  /** A tooltip over the line chart; a modal over the page; page content (in flow) painted over the card. */
+  tooltip?: boolean; modal?: boolean; contentOverlay?: boolean;
+  /** Content above the card grows by this many px the first time the page is scrolled. */
+  growAfterScroll?: number;
+  /**
    * "email-only" reproduces Purely Nutrient (run 8fa3b760, 2026-11-11): no Overview | Email | Text message channel tabs,
    * the page opens straight on the "Email subscribers" card, and its numbers are themselves headings.
    */
@@ -125,24 +141,65 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
   };
   document.addEventListener("click", activeClickHandler);
 
-  if (options.composer) {
+  const composerKind = options.composerKind ?? "fixed";
+  const docked = options.composer && composerKind === "docked";
+  if (docked) {
+    // Klaviyo's app shell: the page scrolls inside the site body; the Composer dock sits below it in the flow.
+    const siteBody = document.createElement("div"); siteBody.id = "site-body"; siteBody.style.overflowY = "auto";
+    siteBody.append(...Array.from(document.body.childNodes));
+    document.body.append(siteBody);
+  }
+  const mountComposer = () => {
+    const text = "Ask Composer Which segments am I over-sending to?";
+    if (docked) {
+      const dock = document.createElement("div"); dock.id = "composer"; dock.className = "ComposerDock-dock"; dock.textContent = text;
+      document.body.append(dock); return dock;
+    }
+    if (composerKind === "wrapped") {
+      const wrapper = document.createElement("div"); wrapper.id = "composer-wrapper";
+      wrapper.innerHTML = `<div id="composer" class="ComposerBar-floating" style="position: fixed"><span class="composer-text">${text}</span><button aria-label="Close">×</button></div>`;
+      document.body.append(wrapper); return wrapper.querySelector<HTMLElement>("#composer")!;
+    }
     const composer = document.createElement("aside");
     composer.id = "composer"; composer.style.position = "fixed"; composer.textContent = "Which segments am I over-sending to?";
-    document.body.append(composer);
-    fixture.composer = composer;
-  }
-
+    document.body.append(composer); return composer;
+  };
+  if (options.composer) fixture.composer = mountComposer();
+  let rerendersLeft = options.composerRerenders ?? 0;
+  if (options.tooltip) document.body.insertAdjacentHTML("beforeend", `<div id="tip" role="tooltip" style="position: absolute">Oct 12 · 45 new subscribers</div>`);
+  if (options.modal) document.body.insertAdjacentHTML("beforeend", `<div id="modal" role="dialog" aria-modal="true" style="position: fixed">Your plan is changing</div>`);
+  if (options.contentOverlay) document.body.insertAdjacentHTML("beforeend", `<div id="banner">Data for this period is still processing</div>`);
+  const scrollbar = options.scrollbar ?? 0;
+  Object.defineProperty(document.documentElement, "clientWidth", { configurable: true, get: () => window.innerWidth - scrollbar });
+  Object.defineProperty(window, "devicePixelRatio", { configurable: true, value: options.devicePixelRatio ?? 1 });
+  // Paint state the way a browser decides it: display:none removes the box; the nearest explicit visibility wins.
+  const painted = (element: Element | null): boolean => {
+    if (!element || !element.isConnected) return false;
+    for (let node: Element | null = element; node; node = node.parentElement) if ((node as HTMLElement).style?.display === "none") return false;
+    for (let node: Element | null = element; node; node = node.parentElement) { const value = (node as HTMLElement).style?.visibility; if (value) return value !== "hidden"; }
+    return true;
+  };
+  const dockHeight = 120;
+  const dockShown = () => Boolean(docked && fixture.composer && painted(fixture.composer));
+  const composerBox = () => { const [x, y, w, h] = (options.composerRect ?? ((width: number, height: number) => [width - 360, height - 300, 340, 100]))(window.innerWidth, window.innerHeight); return { x, y, w, h }; };
   const rect = (left: number, top: number, width: number, height: number): DOMRect => ({ x: left, y: top, width, height, left, top, right: left + width, bottom: top + height, toJSON: () => ({}) } as DOMRect);
   // The reporting area reflows to the viewport width, as Klaviyo's layout does next to an open side panel.
-  const pageWidth = () => Math.min(1400, window.innerWidth - 20);
+  const pageWidth = () => Math.min(1400, window.innerWidth - scrollbar - 20);
   vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
-    const top = contentTop - scrollShift; const width = pageWidth();
+    observeComposer();
+    const top = effectiveTop - scrollShift; const width = pageWidth();
     const explicit = this.getAttribute("data-rect");
     if (explicit) { const [x, y, w, h] = explicit.split(",").map(Number); return rect(x!, top + y!, w!, h!); }
     if (this.id === "page") return rect(10, top, width, contentHeight);
     // The bordered Email subscribers card inside the reporting area: Growth view, metrics, and both charts.
     if (this.id === "content") return rect(30, top + 110, width - 40, 690);
-    if (this.id === "composer") return (this as HTMLElement).style.visibility === "hidden" ? rect(0, 0, 0, 0) : rect(window.innerWidth - 360, window.innerHeight - 300, 340, 100);
+    if (this.id === "site-body") return rect(0, 0, window.innerWidth - scrollbar, window.innerHeight - (dockShown() ? dockHeight : 0));
+    if (docked && this.id === "composer") return dockShown() ? rect(0, window.innerHeight - dockHeight, window.innerWidth - scrollbar, dockHeight) : rect(0, 0, 0, 0);
+    if (this.id === "composer" || this.closest("#composer")) { if (!painted(this)) return rect(0, 0, 0, 0); const box = composerBox(); return rect(box.x, box.y, box.w, box.h); }
+    if (this.id === "composer-wrapper") return rect(0, 0, 0, 0);
+    if (this.id === "tip") return rect(400, top + 470, 220, 40);
+    if (this.id === "modal") return rect(300, 200, 600, 400);
+    if (this.id === "banner") return rect(40, top + 700, 600, 60);
     if (this.id === "line") return rect(40, top + 420, width - 60, 160);
     if (this.id === "bar") return rect(40, top + 620, width - 60, 160);
     if (this.id === "trend") return rect(40, top + 300, width - 60, 160);
@@ -152,11 +209,21 @@ export function installSubscriberGrowthFixture(options: SubscriberGrowthFixtureO
     if (this.closest("header")) return rect(10, 10, 160, 30);
     return rect(40, top + 60, 100, 20);
   });
-  Element.prototype.scrollIntoView = function (this: Element) { if (this.id === "page") scrollShift = Math.max(0, contentTop - 10); } as never;
-  // Hit-testing: the fixed composer is on top wherever it is painted, otherwise the page itself.
+  let grown = false; let effectiveTop = contentTop;
+  const setShift = (value: number) => { scrollShift = Math.max(0, value); if (!grown && options.growAfterScroll) { grown = true; effectiveTop += options.growAfterScroll; } };
+  Element.prototype.scrollIntoView = function (this: Element) { if (this.id === "page") setShift(effectiveTop - 10); } as never;
+  const siteBody = document.getElementById("site-body");
+  if (siteBody) Object.defineProperty(siteBody, "scrollTop", { configurable: true, get: () => scrollShift, set: (value: number) => setShift(value) });
+  // Klaviyo re-renders the Composer as a fresh element after it is hidden (React reconciliation).
+  const observeComposer = () => {
+    const current = fixture.composer; if (!current || rerendersLeft <= 0) return;
+    if (!painted(current)) { rerendersLeft -= 1; (current.closest("#composer-wrapper") ?? current).remove(); fixture.composer = mountComposer(); }
+  };
+  // Hit-testing: positioned layers (modal, tooltip, composer, dock) and in-flow page content painted over the card are
+  // on top wherever they are painted, otherwise the page itself. The deepest painted element is returned, as Chrome does.
   Object.defineProperty(document, "elementFromPoint", { configurable: true, value: (x: number, y: number) => {
-    const composer = fixture.composer;
-    if (composer && composer.style.visibility !== "hidden") { const box = composer.getBoundingClientRect(); if (x >= box.left && x <= box.right && y >= box.top && y <= box.bottom) return composer; }
+    const inside = (element: Element | null) => { if (!element || !painted(element)) return false; const box = element.getBoundingClientRect(); return box.width > 0 && x >= box.left && x <= box.right && y >= box.top && y <= box.bottom; };
+    for (const candidate of [document.getElementById("modal"), document.getElementById("tip"), document.querySelector("#composer .composer-text"), fixture.composer, document.getElementById("banner")]) if (inside(candidate)) return candidate;
     return main;
   } });
   return fixture;
@@ -167,6 +234,8 @@ export function removeSubscriberGrowthFixture(): void {
   activeClickHandler = null;
   vi.restoreAllMocks();
   delete (document as { elementFromPoint?: unknown }).elementFromPoint;
+  delete (document.documentElement as { clientWidth?: unknown }).clientWidth;
+  delete (window as { devicePixelRatio?: unknown }).devicePixelRatio;
   delete (Element.prototype as { scrollIntoView?: unknown }).scrollIntoView;
   document.body.innerHTML = "";
   window.history.replaceState({}, "", "/");

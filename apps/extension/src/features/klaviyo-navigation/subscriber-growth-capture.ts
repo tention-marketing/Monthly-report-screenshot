@@ -423,38 +423,167 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       // The crop runs from the top of the reporting area (title, Email tab, date range) to the bottom of the Email
       // subscribers card. Klaviyo's reporting area can stretch to the bottom of the window, and on 2026-11-03 that left
       // ~800 px of blank page and the floating AI prompt in the Section 10 screenshot; nothing below the card is evidence.
-      const area = resolved.card.getBoundingClientRect();
-      const contentBottom = Math.max(resolved.data.getBoundingClientRect().bottom, ...resolved.parts.map((node) => node.getBoundingClientRect().bottom));
-      const cropBottom = Math.min(area.bottom, Math.ceil(contentBottom) + 12);
-      const rect = { left: area.left, top: area.top, right: area.right, bottom: cropBottom, width: area.width, height: cropBottom - area.top };
-      const trimmedBelowCard = Math.max(0, Math.round(area.bottom - cropBottom));
-      if (rect.width < 300 || rect.height < 200) return failure("TARGET_BOUNDS_INVALID", "No clean Subscriber growth card bounds were available.", { cardWidth: Math.round(rect.width), cardHeight: Math.round(rect.height) });
-      if (rect.left < 0 || rect.top < 0 || rect.right > window.innerWidth || rect.bottom > window.innerHeight) return failure("TARGET_BOUNDS_INVALID", "The Email → Growth card does not fit inside the visible tab; enlarge the browser window so both charts and all three metrics are visible.", { cardHeight: Math.round(rect.height), viewportHeight: window.innerHeight });
-      // Floating page chrome (Klaviyo's composer/assistant prompt, toasts, a sticky header) can be painted over the crop.
-      // As in Business Review, what is on top is found by hit-testing across the crop; a positioned element outside the
-      // card is hidden as temporary page styling only, and the crop must then hit only the card. Nothing is clicked.
-      const card = resolved.card;
-      const occluders = () => {
-        if (typeof document.elementFromPoint !== "function") return [];
-        const found = new Set<HTMLElement>();
-        // Dense enough (about every 16 px down, 48 px across) that a short floating bar cannot fall between samples.
-        const columns = Math.max(8, Math.ceil(rect.width / 48)); const rows = Math.max(6, Math.ceil(rect.height / 16));
-        for (let column = 0; column <= columns; column += 1) for (let row = 0; row <= rows; row += 1) {
-          const x = Math.min(window.innerWidth - 1, rect.left + 4 + (rect.width - 8) * column / columns);
-          const y = Math.min(window.innerHeight - 1, rect.top + 4 + (rect.height - 8) * row / rows);
-          const hit = document.elementFromPoint(x, y);
-          if (!hit || card.contains(hit) || hit.contains(card)) continue;
-          let root: Element = hit; let positioned = false;
-          for (let node: Element | null = hit; node && !node.contains(card); node = node.parentElement) { root = node; if (/^(?:fixed|sticky|absolute)$/.test(getComputedStyle(node).position)) positioned = true; }
-          found.add(positioned ? root as HTMLElement : hit as HTMLElement);
-        }
-        return [...found];
+      const card = resolved.card; const evidenceParts = resolved.parts; const evidenceData = resolved.data;
+      const measureCrop = () => {
+        const area = card.getBoundingClientRect();
+        const contentBottom = Math.max(evidenceData.getBoundingClientRect().bottom, ...evidenceParts.map((node) => node.getBoundingClientRect().bottom));
+        const cropBottom = Math.min(area.bottom, Math.ceil(contentBottom) + 12);
+        return { rect: { left: area.left, top: area.top, right: area.right, bottom: cropBottom, width: area.width, height: cropBottom - area.top }, trimmedBelowCard: Math.max(0, Math.round(area.bottom - cropBottom)) };
       };
-      const covering = occluders();
-      const hideable = covering.filter((node) => /^(?:fixed|sticky|absolute)$/.test(getComputedStyle(node).position));
-      for (const overlay of hideable) overlay.style.setProperty("visibility", "hidden", "important");
-      const stillCovered = covering.length ? occluders() : [];
-      if (stillCovered.length) return failure("SUBSCRIBER_GROWTH_TARGET_OCCLUDED", "Something that is part of the page is covering the Subscriber growth card.", { occluders: stillCovered.slice(0, 4).map((node) => `${node.tagName.toLowerCase()} ${label(node).slice(0, 80)}`) });
+      // Klaviyo's painted area: the window minus classic (Windows) scrollbars, intersected with every ancestor that
+      // clips the card. Klaviyo scrolls its pages inside an app container, and its Composer dock can sit in the page flow
+      // below it, so "inside window.innerHeight" is not "visible" (Windows, Steven Dann October 2026).
+      const layoutViewport = () => {
+        const doc = document.documentElement;
+        const width = doc.clientWidth > 0 ? Math.min(doc.clientWidth, window.innerWidth) : window.innerWidth;
+        const height = doc.clientHeight > 0 ? Math.min(doc.clientHeight, window.innerHeight) : window.innerHeight;
+        return { width, height };
+      };
+      const clipArea = () => {
+        const viewport = layoutViewport(); const bounds = { left: 0, top: 0, right: viewport.width, bottom: viewport.height };
+        for (let node = card.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+          const style = getComputedStyle(node);
+          if (/^(?:visible)?$/.test(style.overflowY) && /^(?:visible)?$/.test(style.overflowX)) continue;
+          const box = node.getBoundingClientRect(); if (box.width <= 0 || box.height <= 0) continue;
+          bounds.left = Math.max(bounds.left, box.left); bounds.top = Math.max(bounds.top, box.top); bounds.right = Math.min(bounds.right, box.right); bounds.bottom = Math.min(bounds.bottom, box.bottom);
+        }
+        return bounds;
+      };
+      const scrollerOf = (element: Element): HTMLElement => {
+        for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) if (/^(?:auto|scroll|overlay)$/.test(getComputedStyle(node).overflowY)) return node;
+        return (document.scrollingElement ?? document.documentElement) as HTMLElement;
+      };
+      const round = (value: number) => Math.round(value * 10) / 10;
+      const boxOf = (box: { left: number; top: number; right: number; bottom: number }) => ({ x: round(box.left), y: round(box.top), w: round(box.right - box.left), h: round(box.bottom - box.top) });
+      const POSITIONED = /^(?:fixed|sticky|absolute)$/;
+      // Klaviyo UI that is never report evidence: the Composer / AI assistant, chat, tooltips, popovers, toasts.
+      const NON_REPORT_UI = /composer|assistant|copilot|\bask\b|\bchat\b|ai prompt|feedback|toast|tooltip|popover|intercom/i;
+      const identity = (node: Element) => `${typeof (node as HTMLElement).className === "string" ? (node as HTMLElement).className : ""} ${node.id} ${node.getAttribute("role") ?? ""} ${node.getAttribute("aria-label") ?? ""} ${node.getAttribute("data-testid") ?? ""} ${node.getAttribute("data-asc") ?? ""} ${text(node).slice(0, 200)}`;
+      const isNonReportUi = (node: Element) => NON_REPORT_UI.test(identity(node)) || node.matches("[role=tooltip],[role=status][aria-live],[data-popper-placement]") || Boolean(node.querySelector("[role=tooltip]"));
+      const isModal = (node: Element) => node.matches("[aria-modal=true],dialog[open]") || Boolean(node.querySelector("[aria-modal=true],dialog[open]"));
+      // The outermost element that is not an ancestor of the card, and whether anything on that chain is positioned.
+      // (Klaviyo wraps floating UI in static containers: the wrapper, not only a positioned leaf, is the layer.)
+      const layerOf = (element: Element): { layer: HTMLElement; positioned: boolean } => {
+        let layer: Element = element; let positioned = false;
+        for (let node: Element | null = element; node && !node.contains(card); node = node.parentElement) { layer = node; if (POSITIONED.test(getComputedStyle(node).position)) positioned = true; }
+        return { layer: layer as HTMLElement, positioned };
+      };
+      const HIDDEN_MARK = "data-tention-hidden-overlay";
+      // A layer we hid paints nothing: opacity 0 also covers children that force `visibility: visible`.
+      const insideHiddenLayer = (node: Element) => { const marked = node.closest(`[${HIDDEN_MARK}]`); return Boolean(marked && getComputedStyle(marked).opacity === "0"); };
+      const paints = (element: Element, style: CSSStyleDeclaration) => Array.from(element.childNodes).some((node) => node.nodeType === Node.TEXT_NODE && Boolean(node.textContent?.trim()))
+        || /^(?:img|svg|canvas|input|textarea|button|video|iframe)$/i.test(element.tagName)
+        || (style.backgroundColor !== "" && !/rgba\(\d+,\s*\d+,\s*\d+,\s*0\)|transparent/.test(style.backgroundColor)) || (style.backgroundImage !== "" && style.backgroundImage !== "none") || (style.boxShadow !== "" && style.boxShadow !== "none");
+      type Occluder = { layer: HTMLElement; positioned: boolean; rect: { left: number; top: number; right: number; bottom: number } };
+      /**
+       * Everything outside the card painted over the crop, found two ways: geometrically (any painting element in a
+       * positioned layer that intersects the crop — a short bar cannot slip between samples) and by a dense hit-test
+       * (about every 16 px down and 48 px across) that also finds in-flow content on top.
+       */
+      const findOccluders = (crop: { left: number; top: number; right: number; bottom: number; width: number; height: number }) => {
+        const found = new Map<HTMLElement, Occluder>();
+        const add = (element: Element) => {
+          if (card.contains(element) || element.contains(card) || insideHiddenLayer(element)) return;
+          const { layer, positioned } = layerOf(element);
+          const box = element.getBoundingClientRect(); const existing = found.get(layer);
+          const rect = existing ? { left: Math.min(existing.rect.left, box.left), top: Math.min(existing.rect.top, box.top), right: Math.max(existing.rect.right, box.right), bottom: Math.max(existing.rect.bottom, box.bottom) } : { left: box.left, top: box.top, right: box.right, bottom: box.bottom };
+          found.set(layer, { layer, positioned: positioned || Boolean(existing?.positioned), rect });
+        };
+        for (const element of Array.from(document.body.querySelectorAll("*"))) {
+          if (card.contains(element) || element.contains(card)) continue;
+          const box = element.getBoundingClientRect();
+          if (box.width <= 0 || box.height <= 0 || box.left >= crop.right || box.right <= crop.left || box.top >= crop.bottom || box.bottom <= crop.top) continue;
+          const style = getComputedStyle(element);
+          if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0" || !paints(element, style) || !layerOf(element).positioned) continue;
+          add(element);
+        }
+        if (typeof document.elementFromPoint === "function") {
+          const viewport = layoutViewport();
+          const columns = Math.max(8, Math.ceil(crop.width / 48)); const rows = Math.max(6, Math.ceil(crop.height / 16));
+          for (let column = 0; column <= columns; column += 1) for (let row = 0; row <= rows; row += 1) {
+            const x = Math.min(viewport.width - 1, crop.left + 4 + (crop.width - 8) * column / columns);
+            const y = Math.min(viewport.height - 1, crop.top + 4 + (crop.height - 8) * row / rows);
+            const hit = document.elementFromPoint(x, y);
+            if (hit) add(hit);
+          }
+        }
+        return [...found.values()];
+      };
+      const describeOccluder = (occluder: Occluder, crop: { left: number; top: number; right: number; bottom: number; width: number; height: number }, action: string) => {
+        const width = Math.max(0, Math.min(occluder.rect.right, crop.right) - Math.max(occluder.rect.left, crop.left));
+        const height = Math.max(0, Math.min(occluder.rect.bottom, crop.bottom) - Math.max(occluder.rect.top, crop.top));
+        const kind = isModal(occluder.layer) && !isNonReportUi(occluder.layer) ? "modal" : isNonReportUi(occluder.layer) ? (/composer|assistant|copilot|\bask\b|ai prompt/i.test(identity(occluder.layer)) ? "composer" : "non-report-ui") : occluder.positioned ? "positioned-layer" : "page-content";
+        return { element: describeNode(occluder.layer), role: occluder.layer.getAttribute("role"), position: getComputedStyle(occluder.layer).position, positionedChain: occluder.positioned, kind, text: label(occluder.layer).slice(0, 120),
+          rect: boxOf(occluder.rect), intersectionArea: Math.round(width * height), intersectionPercentage: crop.width * crop.height > 0 ? round(100 * width * height / (crop.width * crop.height)) : 0, action };
+      };
+      const visualViewport = window.visualViewport;
+      const occlusion: Record<string, unknown> & { passes: Record<string, unknown>[]; occluders: Record<string, unknown>[] } = {
+        viewport: { innerWidth: window.innerWidth, innerHeight: window.innerHeight, ...(() => { const viewport = layoutViewport(); return { layoutWidth: viewport.width, layoutHeight: viewport.height }; })(), devicePixelRatio: window.devicePixelRatio,
+          visualViewport: visualViewport ? { width: round(visualViewport.width), height: round(visualViewport.height), scale: visualViewport.scale } : null },
+        passes: [], occluders: [],
+      };
+      let hiddenOverlays = 0; let collapsedDocks = 0;
+      const settle = async () => { await new Promise<void>((resolve) => { const fallback = setTimeout(resolve, 100); requestAnimationFrame?.(() => { clearTimeout(fallback); resolve(); }); }); await pause(150); };
+      let { rect, trimmedBelowCard } = measureCrop();
+      let clear = false;
+      for (let pass = 0; pass < 8 && !clear; pass += 1) {
+        ({ rect, trimmedBelowCard } = measureCrop());
+        const clip = clipArea();
+        const record: Record<string, unknown> = { pass: pass + 1, targetRect: boxOf(rect), clipArea: boxOf(clip) };
+        occlusion.passes.push(record); occlusion.targetRect = boxOf(rect);
+        if (rect.width < 300 || rect.height < 200) return failure("TARGET_BOUNDS_INVALID", "No clean Subscriber growth card bounds were available.", { cardWidth: Math.round(rect.width), cardHeight: Math.round(rect.height), occlusion });
+        const inside = rect.left >= clip.left - 0.5 && rect.right <= clip.right + 0.5 && rect.top >= clip.top - 0.5 && rect.bottom <= clip.bottom + 0.5;
+        if (!inside) {
+          // Scroll the card's own scroller so the whole crop is in the painted area — never a fixed coordinate.
+          const margin = 8; const fits = rect.height + 2 * margin <= clip.bottom - clip.top && rect.width <= clip.right - clip.left + 0.5;
+          if (fits) {
+            const delta = rect.top < clip.top + 0.5 ? rect.top - (clip.top + margin) : rect.bottom - (clip.bottom - margin);
+            const scroller = scrollerOf(card); const before = scroller.scrollTop; scroller.scrollTop = before + Math.round(delta);
+            record.action = { scroll: Math.round(delta), scrollTopBefore: Math.round(before), scrollTopAfter: Math.round(scroller.scrollTop) };
+            await settle(); continue;
+          }
+          // It does not fit: if Klaviyo's Composer/assistant dock (non-report UI in the page flow) takes the space below
+          // or above the scroll area, collapse it so the area grows; report content is never touched.
+          const docks = Array.from(document.body.querySelectorAll("*")).filter((element): element is HTMLElement => {
+            if (element.contains(card) || card.contains(element) || element.hasAttribute(HIDDEN_MARK) || !shown(element) || POSITIONED.test(getComputedStyle(element).position)) return false;
+            const box = element.getBoundingClientRect();
+            return (box.top >= clip.bottom - 2 || box.bottom <= clip.top + 2) && box.width >= 200 && NON_REPORT_UI.test(identity(element)) && !isModal(element);
+          }).filter((element, _index, all) => !all.some((other) => other !== element && other.contains(element)));
+          if (docks.length && collapsedDocks < 3) {
+            for (const dock of docks) {
+              occlusion.occluders.push(describeOccluder({ layer: dock, positioned: false, rect: dock.getBoundingClientRect() }, rect, "collapsed-dock"));
+              dock.setAttribute(HIDDEN_MARK, "dock"); dock.style.setProperty("display", "none", "important"); collapsedDocks += 1;
+            }
+            record.action = { collapsedDocks: docks.length };
+            await settle(); continue;
+          }
+          return failure("TARGET_BOUNDS_INVALID", "The Email → Growth card does not fit inside the visible part of the tab; enlarge the browser window so both charts and all three metrics are visible.", { cardHeight: Math.round(rect.height), viewportHeight: window.innerHeight, visibleHeight: Math.round(clip.bottom - clip.top), occlusion });
+        }
+        const occluders = findOccluders(rect);
+        record.occluders = occluders.length;
+        if (!occluders.length) { clear = true; break; }
+        // Page content on top of the card, or a modal, is a real obstruction: never hidden, never captured through.
+        const blocking = occluders.filter((occluder) => (!occluder.positioned && !isNonReportUi(occluder.layer)) || (isModal(occluder.layer) && !isNonReportUi(occluder.layer)));
+        if (blocking.length) {
+          for (const occluder of blocking) occlusion.occluders.push(describeOccluder(occluder, rect, "blocked"));
+          return failure("SUBSCRIBER_GROWTH_TARGET_OCCLUDED", "Something that is part of the page is covering the Subscriber growth card.", { occluders: blocking.slice(0, 4).map((occluder) => `${occluder.layer.tagName.toLowerCase()} ${label(occluder.layer).slice(0, 80)}`), occlusion });
+        }
+        // Floating non-report UI (Composer, tooltips, toasts, popovers, other positioned layers outside the card) is
+        // hidden as temporary styling — nothing is clicked — and the crop is then re-measured and re-verified.
+        for (const occluder of occluders) {
+          occlusion.occluders.push(describeOccluder(occluder, rect, "hidden"));
+          occluder.layer.setAttribute(HIDDEN_MARK, "overlay");
+          occluder.layer.style.setProperty("visibility", "hidden", "important"); occluder.layer.style.setProperty("opacity", "0", "important");
+          hiddenOverlays += 1;
+        }
+        record.action = { hidden: occluders.length };
+        await settle();
+      }
+      if (!clear) {
+        const remaining = findOccluders(rect);
+        for (const occluder of remaining) occlusion.occluders.push(describeOccluder(occluder, rect, "still-covering"));
+        return failure("SUBSCRIBER_GROWTH_TARGET_OCCLUDED", "Floating page content kept covering the Subscriber growth card after it was hidden.", { occluders: remaining.slice(0, 4).map((occluder) => `${occluder.layer.tagName.toLowerCase()} ${label(occluder.layer).slice(0, 80)}`), occlusion });
+      }
       resolved.card.dataset.tentionSubscriberGrowth = "capture";
       const final = resolved.values;
       const evidence: SubscriberGrowthEvidence = {
@@ -467,7 +596,7 @@ export async function prepareSubscriberGrowthDocument(request: SubscriberGrowthC
       return {
         ok: true, sourceUrl, detectedPeriod: periodText!, periodEvidence: { startDate: period.startDate, endDate: period.endDate }, evidence,
         targetRect: { x: rect.left, y: rect.top, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls: [...(tabState().channel.length ? tabState().channel : [{ text: "Email subscribers", selected: true, kind: "email-only-card" }]), ...tabState().view].map(({ text: value, selected: on, ...rest }) => ({ text: value, selected: on, ...rest })), stageTimingsMs: { ...timings } },
-        diagnostics: { accountIdentity: (accountIdentity ?? "").slice(0, 80), hiddenOverlays: hideable.length, trimmedBelowCard, stableSamples: stableSamples + 1, periodProof: { ...proof }, readiness: pageReady, periodBefore, periodAfter: periodText, charts: { lineMarks: resolved.pair.line.lines, barMarks: resolved.pair.bar.bars } },
+        diagnostics: { accountIdentity: (accountIdentity ?? "").slice(0, 80), hiddenOverlays, collapsedDocks, occlusion, trimmedBelowCard, stableSamples: stableSamples + 1, periodProof: { ...proof }, readiness: pageReady, periodBefore, periodAfter: periodText, charts: { lineMarks: resolved.pair.line.lines, barMarks: resolved.pair.bar.bars } },
       };
     })();
     return JSON.parse(JSON.stringify(result)) as SubscriberGrowthAdapterResult;
