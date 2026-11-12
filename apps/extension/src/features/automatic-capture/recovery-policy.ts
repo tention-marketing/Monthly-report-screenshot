@@ -51,6 +51,9 @@ const BY_CODE: Record<string, FailureCategory> = {
   // The cover values render with the card; a late or partial render is retried like any card that is not ready.
   EXECUTIVE_SUMMARY_METRICS_UNVERIFIED: "CARD_NOT_READY",
   AUTOMATIC_PERIOD_PROOF_MISMATCH: "PERIOD_NOT_CONFIRMED", TOP_CAMPAIGNS_NO_DATA: "NO_DATA", TOP_FLOWS_NO_DATA: "NO_DATA",
+  // "…_ROW_IN_VIEW" is about rows inside the crop, not a Klaviyo view selector; the word fallback below read it as
+  // VIEW_NOT_SELECTED (Windows run 7417360d).
+  TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW: "CARD_NOT_READY", TOP_FLOW_ROWS_NOT_FOUND: "CARD_NOT_READY",
 };
 
 export function classifyFailure(code: string, message = ""): { category: FailureCategory; permanent: boolean; knownFailure: string | null } {
@@ -134,5 +137,13 @@ export const KNOWN_FAILURES: readonly KnownFailure[] = [
     recovery: "Sources that reload a configured URL re-activate the same granted tab in its own window instead of destroying the grant.",
     regressionTest: "re-activates the same granted tab instead of destroying the grant",
     matches: (code) => code === "GRANTED_TAB_NOT_ACTIVE",
+  },
+  {
+    id: "TOP_FLOWS_WINDOWS_LAYOUT", discovered: "2026-11-12 (Club Furniture October 2026, Windows Chrome run 7417360d; the same report passed on macOS)", category: "CARD_NOT_READY",
+    subsystem: "Klaviyo viewport normalizer + Home dashboard adapter (Top performing flows row selection)",
+    rootCause: "Klaviyo's width was measured as window.innerWidth, which on Windows includes classic scrollbars, so a tab normalized to 1390 px laid out narrower (horizontal scrollbar). Top Flows then ranked rows by painted top and judged 'a Draft in range' geometrically: any uncounted row painted above the fifth row's bottom produced TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW, which the word fallback classified as VIEW_NOT_SELECTED.",
+    recovery: "Width is Klaviyo's layout width (scrollbars excluded) in the normalizer, adapter, and runner. Rows come only from the table owning the verified header, ranked in DOM order, status read from the Status cell; geometry that disagrees with the ranking is a retried layout state; a table that cannot fit is KLAVIYO_VIEWPORT_TOO_NARROW with actual and required width.",
+    regressionTest: "Windows layout: classic scrollbars, zoom, side panel and reflow give the same Top Flows decision",
+    matches: (code) => code === "TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW",
   },
 ];

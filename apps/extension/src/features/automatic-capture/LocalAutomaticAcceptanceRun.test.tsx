@@ -4,7 +4,7 @@ import { createReportDraft } from "@tention/report-domain";
 import type { ApiClient } from "@tention/api-client";
 import type { AutoCaptureService, ExecutiveSummaryAutoCaptureRequest } from "./auto-capture-service.js";
 import { getAutomaticCapturePlan } from "../report-runner/runner.js";
-import { LocalAutomaticAcceptanceRun } from "./LocalAutomaticAcceptanceRun.js";
+import { LocalAutomaticAcceptanceRun, layoutViewportWidth } from "./LocalAutomaticAcceptanceRun.js";
 import { createScreenshotSourceProof, type ReportDraft, type ScreenshotType } from "@tention/report-schema";
 
 const report = createReportDraft({
@@ -459,4 +459,13 @@ describe("local one-click automatic acceptance run strict barriers", () => {
     expect(screen.getAllByText("Waiting")).toHaveLength(8);
     expect(api.finishLocalAutomaticCaptureRun).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ status: "failed" }));
   }, 15_000);
+});
+
+describe("runner width backstop uses Klaviyo's layout width (Windows classic scrollbars)", () => {
+  it("prefers the adapter's layout width; screenshot width stays only for crop mapping", () => {
+    // Windows at 80%: the screenshot is 1407 CSS px wide but Klaviyo lays out 1386 px behind a 21 px scrollbar.
+    expect(layoutViewportWidth({ viewportWidth: 1407, layoutViewportWidth: 1386 } as { viewportWidth: number })).toBe(1386);
+    expect(layoutViewportWidth({ viewportWidth: 1394 })).toBe(1394);
+    expect(layoutViewportWidth({ viewportWidth: 1394, layoutViewportWidth: Number.NaN } as { viewportWidth: number })).toBe(1394);
+  });
 });

@@ -17,7 +17,33 @@ const ZOOM_EPSILON = 0.005;
 export const KLAVIYO_ZOOM_RUN_KEY = "tention.klaviyo-zoom-run";
 export const KLAVIYO_CAPTURE_RUN_PORT = "tention-automatic-capture-run";
 
-export interface KlaviyoViewport { width: number; height: number; devicePixelRatio: number }
+/**
+ * `width` is the width Klaviyo actually lays out to: the window's CSS width minus every classic (space-taking)
+ * scrollbar of the document and of Klaviyo's own full-width app scroller. macOS overlay scrollbars take no space, so
+ * there it equals `innerWidth`; on Windows (and macOS with "always show scroll bars") it is ~15–25 CSS px narrower.
+ * The 1390 px floor was proven on overlay-scrollbar layouts, so it is compared with this width, never `innerWidth`.
+ */
+export interface KlaviyoViewport { width: number; height: number; devicePixelRatio: number; innerWidth?: number; scrollbarWidth?: number }
+
+/**
+ * Self-contained (Chrome serializes it into the page): Klaviyo's layout width as defined on KlaviyoViewport.
+ * Exported so the measurement itself is unit-tested against overlay and classic scrollbar geometry.
+ */
+export function readKlaviyoLayoutViewport(): KlaviyoViewport {
+  const doc = document.documentElement;
+  const documentWidth = doc.clientWidth > 0 ? Math.min(doc.clientWidth, window.innerWidth) : window.innerWidth;
+  let appGutter = 0;
+  for (const element of Array.from(document.querySelectorAll("body *"))) {
+    const html = element as HTMLElement;
+    if (html.offsetWidth < documentWidth / 2 || html.clientWidth <= 0 || html.scrollHeight <= html.clientHeight + 1) continue;
+    const style = getComputedStyle(html);
+    if (!/^(?:auto|scroll|overlay)$/.test(style.overflowY)) continue;
+    const gutter = html.offsetWidth - html.clientWidth - (parseFloat(style.borderLeftWidth) || 0) - (parseFloat(style.borderRightWidth) || 0);
+    if (gutter > appGutter && gutter < 60) appGutter = gutter;
+  }
+  const width = Math.round(documentWidth - appGutter);
+  return { width, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio, innerWidth: window.innerWidth, scrollbarWidth: Math.max(0, Math.round(window.innerWidth - width)) };
+}
 
 export type KlaviyoViewportNormalization =
   | { ok: true; tabId: number; originalZoom: number; captureZoom: number; changed: boolean; viewport: KlaviyoViewport }
@@ -34,7 +60,7 @@ export interface ZoomTabsApi {
 }
 
 export function klaviyoViewportTooNarrowMessage(width: number): string {
-  return `Klaviyo is displayed only ${Math.round(width)} px wide, so its cards and tables are clipped. Zoom the Klaviyo tab out (⌘−) or widen the Chrome window until it is at least ${MIN_KLAVIYO_VIEWPORT_WIDTH} px wide, then start again.`;
+  return `Klaviyo is displayed only ${Math.round(width)} px wide, so its cards and tables are clipped. Zoom the Klaviyo tab out (Ctrl − on Windows, ⌘ − on Mac) or widen the Chrome window until it is at least ${MIN_KLAVIYO_VIEWPORT_WIDTH} px wide, then start again.`;
 }
 
 export function formatZoom(zoom: number | null): string {
@@ -45,11 +71,12 @@ export function formatZoom(zoom: number | null): string {
 export async function measureTabViewport(scripting: ViewportScriptingApi, tabId: number): Promise<KlaviyoViewport | null> {
   const [frame] = await scripting.executeScript({
     target: { tabId },
-    func: () => ({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio }),
+    func: readKlaviyoLayoutViewport,
   });
   const value = frame?.result as Partial<KlaviyoViewport> | undefined;
   return value && [value.width, value.height, value.devicePixelRatio].every((item) => typeof item === "number" && Number.isFinite(item) && item > 0)
-    ? { width: value.width!, height: value.height!, devicePixelRatio: value.devicePixelRatio! } : null;
+    ? { width: value.width!, height: value.height!, devicePixelRatio: value.devicePixelRatio!,
+        ...(typeof value.innerWidth === "number" ? { innerWidth: value.innerWidth } : {}), ...(typeof value.scrollbarWidth === "number" ? { scrollbarWidth: value.scrollbarWidth } : {}) } : null;
 }
 
 /**

@@ -1,6 +1,7 @@
 import { REPORT_CAPTURE_SPEC_V1, type ReportPeriod, type ScreenshotType } from "@tention/report-schema";
 import type { PeriodEntryApi } from "./injected/period-entry-contract.js";
 import type { BusinessPerformanceEvidence } from "@tention/report-schema";
+import { MIN_KLAVIYO_VIEWPORT_WIDTH } from "../automatic-capture/klaviyo-viewport.js";
 
 /** Klaviyo Home (`/dashboard`) targets: Executive Summary and Top 5 Flows, both for the exact report month. */
 export const dashboardScreenshotTypes = ["overview", "top_flows"] as const satisfies readonly ScreenshotType[];
@@ -20,6 +21,7 @@ export type DashboardFailureCode =
   | "TOP_FLOW_ROWS_NOT_FOUND"
   | "TOP_FLOWS_NO_DATA"
   | "TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW"
+  | "KLAVIYO_VIEWPORT_TOO_NARROW"
   | "TARGET_NOT_VISIBLE"
   | "TARGET_BOUNDS_INVALID"
   | "TARGET_LAYOUT_NOT_STABLE"
@@ -27,6 +29,8 @@ export type DashboardFailureCode =
 
 export interface DashboardTargetBounds {
   x: number; y: number; width: number; height: number; viewportWidth: number; viewportHeight: number;
+  /** The width Klaviyo lays out to (classic scrollbars excluded); `viewportWidth` stays the screenshot's CSS width. */
+  layoutViewportWidth?: number;
   availableRowCount?: number; includedRowCount?: number;
   visibleControls?: Array<Record<string, string | boolean | null>>;
   stageTimingsMs?: Record<string, number>;
@@ -43,6 +47,8 @@ export interface DashboardTargetDefinition {
   missingCode: "BUSINESS_PERFORMANCE_SUMMARY_NOT_FOUND" | "TOP_PERFORMING_FLOWS_NOT_FOUND";
   /** When set, the crop ends at row min(rowLimit, usable rows); zero usable rows fail closed. */
   rowLimit?: number;
+  /** Reported as the required width when the target cannot fit; travels on the descriptor (the adapter is serialized). */
+  minLayoutWidth?: number;
 }
 
 const definition = (
@@ -59,6 +65,7 @@ const definition = (
   heading,
   missingCode,
   ...(rowLimit === undefined ? {} : { rowLimit }),
+  minLayoutWidth: MIN_KLAVIYO_VIEWPORT_WIDTH,
 });
 
 export const DASHBOARD_TARGETS: Readonly<Record<DashboardScreenshotType, DashboardTargetDefinition>> = {
@@ -101,6 +108,8 @@ export async function prepareDashboardCaptureDocument(
       let periodDiagnostics: Record<string, unknown> | null = null;
       // Every re-positioning step (scroller, scroll delta, target and visible-area geometry) for failure diagnostics.
       const positioning: Record<string, unknown>[] = [];
+      // Top Flows only: viewport geometry, header/table rects, and every candidate row with why it was or was not counted.
+      let selection: Record<string, unknown> | null = null;
       const operationStartedAt = performance.now();
       let failureStage = "PAGE_READY";
       const diagnosticSnapshot = (code: string, message: string) => {
@@ -135,7 +144,7 @@ export async function prepareDashboardCaptureDocument(
         // The descriptor crosses Chrome's serialization boundary with the
         // injected function; do not access module imports in this failure path.
         const expectedSourceIdentity = target.sourceIdentity;
-        return { code, message: redact(message), failureStage, ...(periodDiagnostics ? { periodSetting: periodDiagnostics } : {}), ...(positioning.length ? { positioning: positioning.slice(-6) } : {}), stageTimingsMs: { ...stageTimingsMs, totalMs: Math.max(0, Math.round(performance.now() - operationStartedAt)) }, currentUrl: safeUrl, expectedUrl: safeUrl, expectedSourceIdentity, expectedPeriod: { startDate: expected.startDate, endDate: expected.endDate }, observedPeriod: periodControl ? visibleText(periodControl) : null, dateControlState: periodControl ? { text: visibleText(periodControl), tag: periodControl.tagName.toLowerCase(), role: periodControl.getAttribute("role"), ariaLabel: redact(periodControl.getAttribute("aria-label") ?? "") } : null, dateDialogState: dateDialog ? visibleText(dateDialog).slice(0, 1000) : null, headings, tableHeaders, expectedSemanticCard: target.heading, expectedView: "default", visibleControls: controls, loading: Array.from(document.querySelectorAll("[aria-busy=true],[role=progressbar],[data-loading=true],[data-asc=Spinner]")).some(isVisible), usableRowCount: table?.querySelectorAll("tbody tr,[role=rowgroup] [role=row]").length ?? null, pageHtml: bodyClone.outerHTML.slice(0, 40_000), cardHtml: sanitizeHtml(card), viewRegionHtml: sanitizeHtml(table?.parentElement ?? null) };
+        return { code, message: redact(message), failureStage, ...(periodDiagnostics ? { periodSetting: periodDiagnostics } : {}), ...(positioning.length ? { positioning: positioning.slice(-6) } : {}), ...(selection ? { selection: JSON.parse(JSON.stringify(selection, (key, value) => key === "text" && typeof value === "string" ? redact(value) : value)) } : {}), stageTimingsMs: { ...stageTimingsMs, totalMs: Math.max(0, Math.round(performance.now() - operationStartedAt)) }, currentUrl: safeUrl, expectedUrl: safeUrl, expectedSourceIdentity, expectedPeriod: { startDate: expected.startDate, endDate: expected.endDate }, observedPeriod: periodControl ? visibleText(periodControl) : null, dateControlState: periodControl ? { text: visibleText(periodControl), tag: periodControl.tagName.toLowerCase(), role: periodControl.getAttribute("role"), ariaLabel: redact(periodControl.getAttribute("aria-label") ?? "") } : null, dateDialogState: dateDialog ? visibleText(dateDialog).slice(0, 1000) : null, headings, tableHeaders, expectedSemanticCard: target.heading, expectedView: "default", visibleControls: controls, loading: Array.from(document.querySelectorAll("[aria-busy=true],[role=progressbar],[data-loading=true],[data-asc=Spinner]")).some(isVisible), usableRowCount: table?.querySelectorAll("tbody tr,[role=rowgroup] [role=row]").length ?? null, pageHtml: bodyClone.outerHTML.slice(0, 40_000), cardHtml: sanitizeHtml(card), viewRegionHtml: sanitizeHtml(table?.parentElement ?? null) };
       };
       const fail = (code: DashboardFailureCode, message: string): DashboardAdapterResult => ({ ok: false, code, message, diagnostics: (() => { try { return diagnosticSnapshot(code, message); } catch (error) { return { snapshotError: error instanceof Error ? error.message : String(error) }; } })() });
       try {
@@ -467,43 +476,94 @@ export async function prepareDashboardCaptureDocument(
           const right = Math.max(...boxes.map((box) => box.right)); const bottom = Math.max(...boxes.map((box) => box.bottom));
           return { left, top, right, bottom, width: right - left, height: bottom - top };
         };
-        // Live and Manual flows send messages and are ranked; Draft flows are not. The status pattern also
-        // identifies "any flow row" so a crop can be checked for rows it would show without counting.
+        // Live and Manual flows send messages and are ranked; Draft flows are not.
         const QUALIFYING_FLOW_STATUS = /\b(?:live|manual)\b/i;
         const ANY_FLOW_STATUS = /\b(?:live|manual|draft)\b/i;
-        const usableFlowRows = (card: Element, header: Element, status: RegExp = QUALIFYING_FLOW_STATUS) => {
-          const cardRect = card.getBoundingClientRect(); const headerRect = boxOf(header);
-          const visibleBelowHeader = (row: Element) => {
-            const rect = boxOf(row);
-            return rect.width > 0 && rect.height > 0 && rect.top >= headerRect.bottom && rect.top >= cardRect.top && rect.bottom <= cardRect.bottom;
-          };
-          const byTop = (left: Element, right: Element) => boxOf(left).top - boxOf(right).top;
-          const nativeRows = Array.from(card.querySelectorAll("tbody tr")).filter((row) => visibleBelowHeader(row) && status.test(separatedText(row)) && row.querySelectorAll("td").length >= 2);
-          const ariaRows = Array.from(card.querySelectorAll('[role="row"]')).filter((row) => visibleBelowHeader(row) && status.test(separatedText(row)) && Boolean(row.querySelector('[role="gridcell"], [role="cell"]')));
-          // A flow row names one flow. A structured element holding several flow links
-          // is a wrapper around the list (e.g. a layout row), never a flow row.
+        // The area Klaviyo paints into: the window minus classic (space-taking, e.g. Windows) scrollbars of the document
+        // and of Klaviyo's full-width app scroller. Mirrors readKlaviyoLayoutViewport (klaviyo-viewport.ts). On macOS
+        // overlay scrollbars take no space and this equals innerWidth × innerHeight.
+        const layoutViewport = () => {
+          const doc = document.documentElement;
+          const width = doc.clientWidth > 0 ? Math.min(doc.clientWidth, window.innerWidth) : window.innerWidth;
+          const height = doc.clientHeight > 0 ? Math.min(doc.clientHeight, window.innerHeight) : window.innerHeight;
+          let appGutter = 0;
+          for (const element of Array.from(document.querySelectorAll("body *"))) {
+            const html = element as HTMLElement;
+            if (html.offsetWidth < width / 2 || html.clientWidth <= 0 || html.scrollHeight <= html.clientHeight + 1) continue;
+            const style = getComputedStyle(html);
+            if (!/^(?:auto|scroll|overlay)$/.test(style.overflowY)) continue;
+            const gutter = html.offsetWidth - html.clientWidth - (parseFloat(style.borderLeftWidth) || 0) - (parseFloat(style.borderRightWidth) || 0);
+            if (gutter > appGutter && gutter < 60) appGutter = gutter;
+          }
+          return { width: Math.round(width - appGutter), height };
+        };
+        // Where `element` can actually be seen: the layout viewport ∩ every overflow-clipping ancestor.
+        const visibleAreaOf = (element: Element) => {
+          const viewport = layoutViewport();
+          const bounds = { top: 0, left: 0, right: viewport.width, bottom: viewport.height };
+          for (let node = element.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (/^(?:visible)?$/.test(style.overflowY) && /^(?:visible)?$/.test(style.overflowX)) continue;
+            const box = node.getBoundingClientRect(); if (box.width <= 0 || box.height <= 0) continue;
+            bounds.top = Math.max(bounds.top, box.top); bounds.left = Math.max(bounds.left, box.left); bounds.right = Math.min(bounds.right, box.right); bounds.bottom = Math.min(bounds.bottom, box.bottom);
+          }
+          return bounds;
+        };
+        // Painted = rendered (no hidden/aria-hidden/display:none/visibility:hidden ancestor), not fully transparent, with a box.
+        const painted = (element: Element) => {
+          if (!rendered(element)) return false;
+          for (let node: Element | null = element; node && node !== document.body; node = node.parentElement) if (getComputedStyle(node).opacity === "0") return false;
+          const box = boxOf(element); return box.width > 0 && box.height > 0;
+        };
+        const domOrder = (left: Element, right: Element) => left === right ? 0 : left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+        type FlowCandidate = { element: Element; box: ReturnType<typeof boxOf>; status: string; statusSource: "role=status" | "status-column" | "row-text"; flowRow: boolean; qualifying: boolean };
+        /**
+         * Every rendered row of the flow table that owns the verified header, in Klaviyo's own ranking order (DOM order).
+         * Only that table's rows can qualify: nothing else on Home (Pick up where you left off, campaign cards, drafts,
+         * navigation) and nothing else inside the card. Geometry never decides rank; it is only checked afterwards.
+         */
+        const flowCandidates = (card: Element, header: Element): { scope: Element; statusColumn: number; candidates: FlowCandidate[] } => {
+          renderedCache.clear();
+          const table = header.closest("table,[role=table],[role=grid]");
+          const scope = table && card.contains(table) ? table : card;
+          const headerCells = (() => { const cells = Array.from(header.querySelectorAll("th,[role=columnheader]")); return cells.length ? cells : Array.from(header.children); })();
+          const statusColumn = headerCells.findIndex((cell) => normalize(separatedText(cell)) === "status");
+          const isHeaderPart = (row: Element) => row === header || row.contains(header) || header.contains(row) || Boolean(row.closest("thead"));
+          // A flow row names one flow. A structured element holding several flow links is a wrapper around the list.
           const linkCount = (element: Element) => element.querySelectorAll("a, [role=link]").length;
-          const structuredRows = [...new Set([...nativeRows, ...ariaRows])].filter((row) => linkCount(row) <= 1);
-          if (structuredRows.length) return structuredRows.sort(byTop);
-          const flowLinks = Array.from(card.querySelectorAll("a, [role=link]")).filter((link) => Boolean(separatedText(link).trim()));
-          // A flow row holds exactly one flow link. Climbing past that point reaches
-          // the shared container of every row, which must never count as one row.
-          const rowFromLink = (link: Element) => {
-            let candidate = link.parentElement;
-            while (candidate && candidate !== card) {
-              if (flowLinks.filter((other) => candidate!.contains(other)).length > 1) return null;
-              const text = separatedText(candidate);
-              if (status.test(text) && /\d/.test(text) && visibleBelowHeader(candidate)) return candidate;
-              candidate = candidate.parentElement;
-            }
-            return null;
-          };
-          return [...new Set(flowLinks.flatMap((link) => {
-            const row = rowFromLink(link); return row ? [row] : [];
-          }))].sort(byTop);
+          const structured = [...new Set([
+            ...Array.from(scope.querySelectorAll("tbody tr")).filter((row) => row.querySelectorAll("td").length >= 2),
+            ...Array.from(scope.querySelectorAll('[role="row"]')).filter((row) => Boolean(row.querySelector('[role="gridcell"], [role="cell"]'))),
+          ])].filter((row) => !isHeaderPart(row) && linkCount(row) <= 1 && painted(row) && ANY_FLOW_STATUS.test(separatedText(row)));
+          let rows = structured;
+          if (!rows.length) {
+            // Non-table layouts: a flow row is the largest ancestor of exactly one flow link that shows a status and a number.
+            const flowLinks = Array.from(scope.querySelectorAll("a, [role=link]")).filter((link) => Boolean(separatedText(link).trim()) && !isHeaderPart(link));
+            const rowFromLink = (link: Element) => {
+              for (let candidate = link.parentElement; candidate && candidate !== scope && candidate !== card; candidate = candidate.parentElement) {
+                if (flowLinks.filter((other) => candidate!.contains(other)).length > 1) return null;
+                const text = separatedText(candidate);
+                if (ANY_FLOW_STATUS.test(text) && /\d/.test(text) && painted(candidate)) return candidate;
+              }
+              return null;
+            };
+            rows = [...new Set(flowLinks.flatMap((link) => { const row = rowFromLink(link); return row ? [row] : []; }))];
+          }
+          const candidates = rows.sort(domOrder).map((element): FlowCandidate => {
+            // Status comes from the row's own Status cell; whole-row text (which also holds the flow name) is the last resort.
+            const marked = Array.from(element.querySelectorAll("[role=status]")).filter((node) => rendered(node)).map((node) => separatedText(node)).join(" ").trim();
+            const cells = Array.from(element.children);
+            const [status, statusSource] = marked ? [marked, "role=status" as const]
+              : statusColumn >= 0 && cells.length === headerCells.length ? [separatedText(cells[statusColumn]!), "status-column" as const]
+              : [separatedText(element), "row-text" as const];
+            const flowRow = ANY_FLOW_STATUS.test(status);
+            return { element, box: boxOf(element), status: status.slice(0, 40), statusSource, flowRow, qualifying: flowRow && QUALIFYING_FLOW_STATUS.test(status) };
+          });
+          return { scope, statusColumn, candidates };
         };
         // Klaviyo Home cards can be narrower than the content they paint (tables and
-        // summary panels overflow the wrapper). Crop the painted extent, not the box.
+        // summary panels overflow the wrapper). Crop the painted extent, not the box,
+        // limited to what Klaviyo paints (never a classic scrollbar).
         const paintedHorizontalExtent = (card: Element, bottom: number) => {
           const cardRect = card.getBoundingClientRect();
           let left = cardRect.left; let right = cardRect.right;
@@ -514,30 +574,64 @@ export async function prepareDashboardCaptureDocument(
             if (style.visibility === "hidden" || style.display === "none" || element.closest("[hidden],[aria-hidden=true]")) continue;
             left = Math.min(left, rect.left); right = Math.max(right, rect.right);
           }
-          return { left: Math.max(0, left), right: Math.min(window.innerWidth, right) };
+          return { left: Math.max(0, left), right: Math.min(layoutViewport().width, right) };
         };
         type Measurement = { rect: { x: number; y: number; width: number; height: number; left: number; top: number; right: number; bottom: number }; availableRowCount?: number; includedRowCount?: number };
-        const measureTarget = (value: NonNullable<ReturnType<typeof findDashboardCard>>): Measurement | "no_header" | "no_rows" | "non_qualifying_in_view" => {
+        type MeasurementIssue = "no_header" | "no_rows" | "non_qualifying_in_view" | "layout_unstable" | "needs_horizontal_scroll" | "too_narrow";
+        const r = (value: number) => Math.round(value * 10) / 10;
+        const rectOf = (box: { left: number; top: number; width: number; height: number }) => ({ x: r(box.left), y: r(box.top), w: r(box.width), h: r(box.height) });
+        const viewportGeometry = () => {
+          const viewport = window.visualViewport; const scroller = document.scrollingElement ?? document.documentElement; const layout = layoutViewport();
+          return { innerWidth: window.innerWidth, innerHeight: window.innerHeight, layoutWidth: layout.width, layoutHeight: layout.height, classicScrollbarWidth: Math.max(0, window.innerWidth - layout.width), devicePixelRatio: window.devicePixelRatio,
+            visualViewport: viewport ? { width: r(viewport.width), height: r(viewport.height), scale: viewport.scale, offsetLeft: r(viewport.offsetLeft), pageLeft: r(viewport.pageLeft) } : null,
+            scrollX: r(window.scrollX), scrollY: r(window.scrollY), pageScrollLeft: r(scroller.scrollLeft), horizontalOverflow: scroller.scrollWidth > scroller.clientWidth + 1 };
+        };
+        const measureTarget = (value: NonNullable<ReturnType<typeof findDashboardCard>>): Measurement | MeasurementIssue => {
           const cardRect = value.card.getBoundingClientRect();
-          const painted = (bottom: number) => { const extent = paintedHorizontalExtent(value.card, bottom); return { x: extent.left, y: cardRect.y, width: extent.right - extent.left, height: bottom - cardRect.top, left: extent.left, top: cardRect.top, right: extent.right, bottom }; };
-          if (target.screenshotType !== "top_flows") return { rect: painted(cardRect.bottom) };
+          const paintedRect = (bottom: number) => { const extent = paintedHorizontalExtent(value.card, bottom); return { x: extent.left, y: cardRect.y, width: extent.right - extent.left, height: bottom - cardRect.top, left: extent.left, top: cardRect.top, right: extent.right, bottom }; };
+          if (target.screenshotType !== "top_flows") return { rect: paintedRect(cardRect.bottom) };
           const header = findFlowHeader(value.card);
-          if (!header) return "no_header";
-          const rows = usableFlowRows(value.card, header);
-          if (!rows.length) return "no_rows";
-          // Chrome serializes this function, so the limit travels on the target descriptor.
-          // Never pad: 1-4 usable rows are captured as the real count.
-          const includedRowCount = Math.min(target.rowLimit ?? 5, rows.length);
-          const finalRowRect = boxOf(rows[includedRowCount - 1]!);
-          if (finalRowRect.bottom > cardRect.bottom || finalRowRect.bottom <= cardRect.top) return "no_header";
-          // The crop is contiguous, so every flow row painted above the last counted row must itself be counted.
-          const counted = new Set(rows.slice(0, includedRowCount));
-          if (usableFlowRows(value.card, header, ANY_FLOW_STATUS).some((row) => !counted.has(row) && boxOf(row).top < finalRowRect.bottom)) return "non_qualifying_in_view";
-          return {
-            rect: painted(finalRowRect.bottom),
-            availableRowCount: rows.length,
-            includedRowCount,
+          if (!header) { selection = { decision: "no_header", viewport: viewportGeometry(), card: rectOf(cardRect) }; return "no_header"; }
+          const { scope, statusColumn, candidates } = flowCandidates(value.card, header);
+          const flowRows = candidates.filter((candidate) => candidate.flowRow);
+          const qualifying = flowRows.filter((candidate) => candidate.qualifying);
+          // Chrome serializes this function, so the limit travels on the target descriptor. Never pad: 1-4 rows are the real count.
+          const included = qualifying.slice(0, target.rowLimit ?? 5);
+          const last = included[included.length - 1];
+          const headerBox = boxOf(header); const area = visibleAreaOf(header);
+          const decide = <T extends MeasurementIssue | "ok">(decision: T, reason: string): T => {
+            selection = {
+              decision, reason, viewport: viewportGeometry(), card: rectOf(cardRect), header: rectOf(headerBox), table: rectOf(boxOf(scope)), tableIsCard: scope === value.card,
+              visibleArea: { left: r(area.left), top: r(area.top), right: r(area.right), bottom: r(area.bottom) }, statusColumn,
+              availableRowCount: qualifying.length, includedRowCount: included.length, lastIncludedRank: last ? candidates.indexOf(last) + 1 : null,
+              candidates: candidates.slice(0, 15).map((candidate, index) => ({
+                rank: index + 1, rect: rectOf(candidate.box), status: candidate.status, statusSource: candidate.statusSource, qualifying: candidate.qualifying, included: included.includes(candidate),
+                rejection: included.includes(candidate) ? null : !candidate.flowRow ? "no Live/Manual/Draft status" : !candidate.qualifying ? `status ${candidate.status}: not ranked` : `ranked below the top ${target.rowLimit ?? 5}`,
+                // Text is used only in failure diagnostics; it is stripped from success evidence.
+                text: separatedText(candidate.element).replace(/\s+/g, " ").slice(0, 90),
+              })),
+            };
+            return decision;
           };
+          if (!last) return decide("no_rows", "the flow table rendered no Live or Manual flow row");
+          // Semantic (layout independent): a Draft flow ranked above the last counted flow would be painted inside a
+          // contiguous crop without being counted.
+          const lastRank = flowRows.indexOf(last);
+          if (flowRows.slice(0, lastRank).some((candidate) => !candidate.qualifying)) return decide("non_qualifying_in_view", "a Draft flow is ranked between the counted Live/Manual flows");
+          // Every column must be visible: the header row is the semantic proof of the full table width.
+          if (headerBox.width > area.right - area.left + 1) return decide("too_narrow", `the flow table (${Math.round(headerBox.width)} px) is wider than the visible area (${Math.round(area.right - area.left)} px)`);
+          if (headerBox.left < area.left - 1 || headerBox.right > area.right + 1) return decide("needs_horizontal_scroll", "the flow table is horizontally outside the visible area");
+          // Geometry must agree with the ranking: counted rows sit below the header, in order, without overlapping, and no
+          // other flow row is painted inside the crop. Anything else is a layout still moving (reflow, zoom, side panel).
+          let previousBottom = headerBox.bottom;
+          for (const candidate of included) {
+            if (candidate.box.top < previousBottom - 2 || candidate.box.bottom > cardRect.bottom + 1) return decide("layout_unstable", `row ${candidates.indexOf(candidate) + 1} is not below the previous counted row`);
+            previousBottom = candidate.box.bottom;
+          }
+          const intruder = flowRows.find((candidate) => !included.includes(candidate) && (candidate.box.top + candidate.box.bottom) / 2 > headerBox.bottom && (candidate.box.top + candidate.box.bottom) / 2 < last.box.bottom);
+          if (intruder) return decide("layout_unstable", `uncounted row ${candidates.indexOf(intruder) + 1} is painted inside the crop`);
+          decide("ok", "top flows verified");
+          return { rect: paintedRect(last.box.bottom), availableRowCount: qualifying.length, includedRowCount: included.length };
         };
         const box = (element: Element | null) => { if (!element) return null; const rect = element.getBoundingClientRect(); return { x: Math.round(rect.left * 10) / 10, y: Math.round(rect.top * 10) / 10, w: Math.round(rect.width * 10) / 10, h: Math.round(rect.height * 10) / 10 }; };
         const describe = (element: Element) => ({ tag: element.tagName.toLowerCase(), role: element.getAttribute("role"), display: getComputedStyle(element).display, box: box(element), links: element.querySelectorAll("a, [role=link]").length });
@@ -575,48 +669,72 @@ export async function prepareDashboardCaptureDocument(
         const scrollStartedAt = performance.now();
         resolved.card.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior: "auto" });
         stageTimingsMs.scrollMs = Math.max(0, Math.round(performance.now() - scrollStartedAt));
-        const measurementFailure = (value: "no_header" | "no_rows" | "non_qualifying_in_view") => value === "no_rows"
-          ? fail("TOP_FLOWS_NO_DATA", "Top performing flows showed its table header but no usable flow rows for the selected month.")
-          : value === "non_qualifying_in_view" ? fail("TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW", "A Draft flow sits between the top-ranked Live/Manual flows, so a contiguous Top Flows crop would show a flow it does not count.")
-          : fail("TOP_FLOW_ROWS_NOT_FOUND", "The Top performing flows table header or visible flow rows were not found.");
-        const initial = measureTarget(resolved);
-        if (typeof initial === "string") return measurementFailure(initial);
-        // Klaviyo keeps re-laying out Overview after the one-off scroll above (cards above finish loading and grow), so
-        // the target is re-measured on every pass and, when it has left the visible area (viewport ∩ clipping
-        // ancestors), moved back by scrolling its real scroll container — never to a fixed coordinate. The old loop
-        // only waited, so a target pushed below the fold failed TARGET_NOT_VISIBLE until a lucky retry (run 67311d57).
+        const measurementFailure = (value: MeasurementIssue) => {
+          if (value === "no_rows") return fail("TOP_FLOWS_NO_DATA", "Top performing flows showed its table header but no usable flow rows for the selected month.");
+          if (value === "non_qualifying_in_view") return fail("TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW", "A Draft flow is ranked between the top Live/Manual flows, so a contiguous Top Flows crop would show a flow it does not count.");
+          if (value === "too_narrow") {
+            const header = (selection?.header ?? null) as { w: number } | null; const area = (selection?.visibleArea ?? null) as { left: number; right: number } | null;
+            const actualWidth = layoutViewport().width;
+            const requiredWidth = Math.max(target.minLayoutWidth ?? 0, Math.ceil(actualWidth + (header && area ? Math.max(0, header.w - (area.right - area.left)) + 16 : 0)));
+            selection = { ...(selection ?? {}), actualWidth, requiredWidth };
+            return fail("KLAVIYO_VIEWPORT_TOO_NARROW", `Klaviyo lays the page out only ${actualWidth} px wide, so the Top performing flows table does not fit (at least ${requiredWidth} px is required).`);
+          }
+          if (value === "needs_horizontal_scroll") return fail("TARGET_NOT_VISIBLE", "The Top performing flows table could not be scrolled fully into view horizontally.");
+          if (value === "layout_unstable") return fail("TARGET_LAYOUT_NOT_STABLE", "The Top performing flows rows did not settle into a consistent layout.");
+          return fail("TOP_FLOW_ROWS_NOT_FOUND", "The Top performing flows table header or visible flow rows were not found.");
+        };
+        // Klaviyo keeps re-laying out Overview after the one-off scroll above (cards above finish loading and grow; the
+        // side panel or a zoom change reflows the page), so the target is re-located and re-measured on every pass and,
+        // when it has left the visible area (layout viewport ∩ clipping ancestors), moved back by scrolling its real
+        // scroll container — never to a fixed coordinate (run 67311d57). Geometry from before a layout-width change is
+        // discarded. A semantic verdict (no rows, Draft in range, table too wide) must repeat on a later pass to count.
         const scrollerOf = (element: Element): HTMLElement => {
           for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) if (/^(?:auto|scroll|overlay)$/.test(getComputedStyle(node).overflowY)) return node;
           return (document.scrollingElement ?? document.documentElement) as HTMLElement;
         };
-        const visibleAreaOf = (element: Element) => {
-          const bounds = { top: 0, left: 0, right: window.innerWidth, bottom: window.innerHeight };
-          for (let node = element.parentElement; node && node !== document.body && node !== document.documentElement; node = node.parentElement) {
-            const style = getComputedStyle(node);
-            if (/^(?:visible)?$/.test(style.overflowY) && /^(?:visible)?$/.test(style.overflowX)) continue;
-            const box = node.getBoundingClientRect(); if (box.width <= 0 || box.height <= 0) continue;
-            bounds.top = Math.max(bounds.top, box.top); bounds.left = Math.max(bounds.left, box.left); bounds.right = Math.min(bounds.right, box.right); bounds.bottom = Math.min(bounds.bottom, box.bottom);
-          }
-          return bounds;
-        };
+        const scrollerName = (scroller: Element) => scroller === document.scrollingElement || scroller === document.documentElement ? "document" : `${scroller.tagName.toLowerCase()}${scroller.id ? `#${scroller.id}` : ""}`;
         const placeInVisibleArea = async (card: Element, rect: { top: number; bottom: number; height: number }) => {
           const area = visibleAreaOf(card); const margin = 8; const fits = rect.height <= area.bottom - area.top - 2 * margin;
           const delta = rect.top < area.top + 1 || !fits ? rect.top - (area.top + margin) : rect.bottom > area.bottom - 1 ? rect.bottom - (area.bottom - margin) : 0;
           const scroller = scrollerOf(card); const before = scroller.scrollTop;
           if (Math.abs(delta) >= 1) scroller.scrollTop = before + Math.round(delta);
-          positioning.push({ scroller: scroller === document.scrollingElement || scroller === document.documentElement ? "document" : `${scroller.tagName.toLowerCase()}${scroller.id ? `#${scroller.id}` : ""}`, scrollTopBefore: Math.round(before), scrollTopAfter: Math.round(scroller.scrollTop), delta: Math.round(delta), fits,
-            target: { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) }, visibleArea: { top: Math.round(area.top), bottom: Math.round(area.bottom) }, viewport: { width: window.innerWidth, height: window.innerHeight } });
+          positioning.push({ axis: "y", scroller: scrollerName(scroller), scrollTopBefore: Math.round(before), scrollTopAfter: Math.round(scroller.scrollTop), delta: Math.round(delta), fits,
+            target: { top: Math.round(rect.top), bottom: Math.round(rect.bottom), height: Math.round(rect.height) }, visibleArea: { top: Math.round(area.top), bottom: Math.round(area.bottom) }, viewport: { width: window.innerWidth, height: window.innerHeight, layoutWidth: layoutViewport().width } });
           if (scroller.scrollTop !== before) { await nextFrame(); await pause(200); }
         };
-        let previous = initial.rect; let stable = 0; let placements = 0;
-        for (let attempt = 0; attempt < 14; attempt += 1) {
+        // Brings the flow table's header (its full column set) horizontally into the visible area by scrolling the
+        // nearest horizontal scroller (an overflowing page on a narrow Windows layout) — never by fixed coordinates.
+        const placeHorizontally = async (element: Element) => {
+          const area = visibleAreaOf(element); const box = boxOf(element); const margin = 8;
+          const delta = box.left < area.left ? box.left - (area.left + margin) : box.right > area.right ? box.right - (area.right - margin) : 0;
+          let scroller = (document.scrollingElement ?? document.documentElement) as HTMLElement;
+          for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) if (/^(?:auto|scroll|overlay)$/.test(getComputedStyle(node).overflowX) && node.scrollWidth > node.clientWidth + 1) { scroller = node; break; }
+          const before = scroller.scrollLeft;
+          if (Math.abs(delta) >= 1) scroller.scrollLeft = before + Math.round(delta);
+          positioning.push({ axis: "x", scroller: scrollerName(scroller), scrollLeftBefore: Math.round(before), scrollLeftAfter: Math.round(scroller.scrollLeft), delta: Math.round(delta), target: { left: Math.round(box.left), right: Math.round(box.right) }, visibleArea: { left: Math.round(area.left), right: Math.round(area.right) } });
+          await nextFrame(); await pause(200);
+        };
+        const SEMANTIC_ISSUES: readonly MeasurementIssue[] = ["no_header", "no_rows", "non_qualifying_in_view", "too_narrow"];
+        let previous: Measurement["rect"] | null = null; let stable = 0; let placements = 0;
+        let lastIssue: MeasurementIssue | null = null; let issueRepeats = 0; let measuredLayoutWidth = layoutViewport().width;
+        for (let attempt = 0; attempt < 16; attempt += 1) {
           await nextFrame(); resolved = findDashboardCard();
           if (!resolved) return fail(target.missingCode, `The ${target.heading} card was replaced without its required semantic evidence.`);
+          const layoutWidth = layoutViewport().width;
+          if (layoutWidth !== measuredLayoutWidth) { measuredLayoutWidth = layoutWidth; previous = null; stable = 0; lastIssue = null; issueRepeats = 0; positioning.push({ layoutWidthChangedTo: layoutWidth }); await pause(250); continue; }
           const measurement = measureTarget(resolved);
-          if (typeof measurement === "string") return measurementFailure(measurement);
-          const rect = measurement.rect; const headingRect = resolved.heading.getBoundingClientRect(); const fullyVisible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.top >= 0 && rect.right <= window.innerWidth && rect.bottom <= window.innerHeight;
+          if (typeof measurement === "string") {
+            previous = null; stable = 0;
+            issueRepeats = measurement === lastIssue ? issueRepeats + 1 : 1; lastIssue = measurement;
+            if (SEMANTIC_ISSUES.includes(measurement) && issueRepeats >= 2) return measurementFailure(measurement);
+            if (measurement === "needs_horizontal_scroll" && placements < 6) { placements += 1; const header = findFlowHeader(resolved.card); if (header) await placeHorizontally(header); continue; }
+            await pause(250); continue;
+          }
+          lastIssue = null; issueRepeats = 0;
+          const rect = measurement.rect; const headingRect = resolved.heading.getBoundingClientRect(); const area = visibleAreaOf(resolved.card);
+          const fullyVisible = rect.width > 0 && rect.height > 0 && rect.left >= 0 && rect.right <= layoutWidth + 0.5 && rect.top >= area.top - 0.5 && rect.bottom <= area.bottom + 0.5;
           if (!fullyVisible) { previous = rect; stable = 0; if (placements < 6) { placements += 1; await placeInVisibleArea(resolved.card, rect); } else await pause(200); continue; }
-          if (rect.x === previous.x && rect.y === previous.y && rect.width === previous.width && rect.height === previous.height) stable += 1; else stable = 0;
+          if (previous && rect.x === previous.x && rect.y === previous.y && rect.width === previous.width && rect.height === previous.height) stable += 1; else stable = 0;
           previous = rect;
           if (stable >= 1) {
             if (!hasMeaningfulBounds(rect, headingRect)) return fail("TARGET_BOUNDS_INVALID", `The ${target.heading} target bounds only cover a heading-sized region.`);
@@ -625,11 +743,17 @@ export async function prepareDashboardCaptureDocument(
             stageTimingsMs.totalMs = Math.max(0, Math.round(performance.now() - operationStartedAt));
             // Report cover values: DOM text of this verified card only (never OCR, never another card or period).
             const performance_ = target.screenshotType === "overview" ? readBusinessPerformance(resolved.card) : null;
-            return { ...(performance_ ? { businessPerformance: performance_.evidence, businessPerformanceIssues: performance_.issues, businessPerformanceReadout: performance_.readout } : {}), ok: true, sourceUrl: window.location.href, targetRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, visibleControls, stageTimingsMs: { ...stageTimingsMs }, layoutEvidence: layoutEvidence(resolved.card, resolved.heading), ...(measurement.availableRowCount === undefined ? {} : { availableRowCount: measurement.availableRowCount, includedRowCount: measurement.includedRowCount }) }, observedPeriod: { startDate: expected.startDate, endDate: expected.endDate } };
+            // Success evidence is geometry only: row text stays out of it.
+            const recorded = selection as Record<string, unknown> | null;
+            const selectionGeometry = recorded ? { ...recorded, candidates: (recorded.candidates as Array<Record<string, unknown>> | undefined)?.map(({ text: _text, ...rest }) => rest) } : null;
+            return { ...(performance_ ? { businessPerformance: performance_.evidence, businessPerformanceIssues: performance_.issues, businessPerformanceReadout: performance_.readout } : {}), ok: true, sourceUrl: window.location.href, targetRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, viewportWidth: window.innerWidth, viewportHeight: window.innerHeight, layoutViewportWidth: layoutWidth, visibleControls, stageTimingsMs: { ...stageTimingsMs }, layoutEvidence: { ...layoutEvidence(resolved.card, resolved.heading), ...(selectionGeometry ? { selection: selectionGeometry } : {}) }, ...(measurement.availableRowCount === undefined ? {} : { availableRowCount: measurement.availableRowCount, includedRowCount: measurement.includedRowCount }) }, observedPeriod: { startDate: expected.startDate, endDate: expected.endDate } };
           }
         }
+        if (lastIssue) return measurementFailure(lastIssue);
         const finalRect = previous;
-        if (finalRect.width <= 0 || finalRect.height <= 0 || finalRect.left < 0 || finalRect.top < 0 || finalRect.right > window.innerWidth || finalRect.bottom > window.innerHeight) return fail("TARGET_NOT_VISIBLE", `The ${target.heading} target is not fully visible.`);
+        if (!finalRect) return fail("TARGET_LAYOUT_NOT_STABLE", `The ${target.heading} target layout did not stabilize.`);
+        const finalArea = visibleAreaOf(resolved!.card);
+        if (finalRect.width <= 0 || finalRect.height <= 0 || finalRect.left < 0 || finalRect.top < finalArea.top - 0.5 || finalRect.right > layoutViewport().width + 0.5 || finalRect.bottom > finalArea.bottom + 0.5) return fail("TARGET_NOT_VISIBLE", `The ${target.heading} target is not fully visible.`);
         if (!hasMeaningfulBounds(finalRect, resolved!.heading.getBoundingClientRect())) return fail("TARGET_BOUNDS_INVALID", `The ${target.heading} target bounds only cover a heading-sized region.`);
         return fail("TARGET_LAYOUT_NOT_STABLE", `The ${target.heading} target layout did not stabilize.`);
       } catch (error) {

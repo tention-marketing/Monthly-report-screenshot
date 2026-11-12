@@ -59,6 +59,9 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
   const started = useRef(false);
   const [zoom, setZoom] = useState<Extract<KlaviyoViewportNormalization, { ok: true }> | null>(null);
   const [zoomRestore, setZoomRestore] = useState<KlaviyoZoomRestore | null>(null);
+  // Production has no run store: a failed section's attempt record stays here so it can be copied for diagnosis.
+  const [failureRecords, setFailureRecords] = useState<Record<string, Record<string, unknown>[]>>({});
+  const [copiedSection, setCopiedSection] = useState<string | null>(null);
 
   useEffect(() => {
     if (started.current) return;
@@ -165,7 +168,10 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
 
           if (state.stage === "failed") throw Object.assign(new Error(state.message), { code: state.code, diagnostics: state.diagnostics ?? {}, failureState: state });
           if (state.stage !== "review_ready") throw Object.assign(new Error("Automatic capture ended in an unexpected state."), { code: "AUTOMATIC_CAPTURE_UNEXPECTED_STATE" });
-          if (!(state.target.viewportWidth >= MIN_KLAVIYO_VIEWPORT_WIDTH)) throw Object.assign(new Error(klaviyoViewportTooNarrowMessage(state.target.viewportWidth)), { code: "KLAVIYO_VIEWPORT_TOO_NARROW" });
+          // Klaviyo's layout width (classic Windows scrollbars excluded) when the adapter measured it; `viewportWidth`
+          // stays the screenshot's CSS width for crop mapping.
+          const layoutWidth = layoutViewportWidth(state.target);
+          if (!(layoutWidth >= MIN_KLAVIYO_VIEWPORT_WIDTH)) throw Object.assign(new Error(klaviyoViewportTooNarrowMessage(layoutWidth)), { code: "KLAVIYO_VIEWPORT_TOO_NARROW", diagnostics: { actualWidth: layoutWidth, requiredWidth: MIN_KLAVIYO_VIEWPORT_WIDTH, innerWidth: state.target.viewportWidth, viewportNormalization: normalization } });
 
           stage = "VERIFYING_PERIOD";
           // Top Campaigns proof carries the adapter's read-only Campaigns-list evidence.
@@ -272,9 +278,13 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
             usableRowCount: typeof diagnostic?.usableRowCount === "number" ? diagnostic.usableRowCount : ready && typeof ready.target.availableRowCount === "number" ? ready.target.availableRowCount : null,
             screenshotResult: capturedFailure ? "failure_viewport_saved" : "not_available", sourceProofResult: "not_created_or_unverified",
             errorCode: finalErrorCode, errorMessage: finalError,
-            diagnostics: { extensionBuild: EXTENSION_BUILD, recovery: recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline, failureStage: stage === "NAVIGATION" || stage === "PAGE_READY" ? failureStageFromCode(finalErrorCode) : stage, failureCode: finalErrorCode, failureMessage: finalError, ...(diagnostic ?? {}), ...(ready ? { periodEvidence: ready.periodEvidence ?? null, targetBounds: ready.target } : {}), viewportEvidence, stageTimingsMs: { ...(isNumericRecord(diagnostic?.stageTimingsMs) ? diagnostic.stageTimingsMs : {}), ...(ready?.target.stageTimingsMs ?? {}), navigationMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "navigationMs"), pageReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "pageReadyMs"), periodSetMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "periodSetMs"), cardResolveMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "cardResolveMs"), viewSwitchMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "viewSwitchMs"), contentReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "contentReadyMs"), captureMs, cropMs, uploadMs, backendConfirmMs, totalMs }, attemptNumber: attempt, maxAttempts: MAX_ATTEMPTS, attemptHistory: [...attemptHistory] },
+            diagnostics: { extensionBuild: EXTENSION_BUILD, recovery: recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline, failureStage: stage === "NAVIGATION" || stage === "PAGE_READY" ? failureStageFromCode(finalErrorCode) : stage, failureCode: finalErrorCode, failureMessage: finalError, viewportNormalization: normalization, ...(diagnostic ?? {}), ...(ready ? { periodEvidence: ready.periodEvidence ?? null, targetBounds: ready.target } : {}), viewportEvidence, stageTimingsMs: { ...(isNumericRecord(diagnostic?.stageTimingsMs) ? diagnostic.stageTimingsMs : {}), ...(ready?.target.stageTimingsMs ?? {}), navigationMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "navigationMs"), pageReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "pageReadyMs"), periodSetMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "periodSetMs"), cardResolveMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "cardResolveMs"), viewSwitchMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "viewSwitchMs"), contentReadyMs: numberTiming(diagnostic?.stageTimingsMs ?? ready?.target.stageTimingsMs, "contentReadyMs"), captureMs, cropMs, uploadMs, backendConfirmMs, totalMs }, attemptNumber: attempt, maxAttempts: MAX_ATTEMPTS, attemptHistory: [...attemptHistory] },
           };
-          attemptHistory.push({ attemptNumber: attempt, ...recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline: { ...stageTimeline }, startedAt, finishedAt: failedResult.finishedAt, durationMs: totalMs, failureStage: failedResult.diagnostics && typeof failedResult.diagnostics.failureStage === "string" ? failedResult.diagnostics.failureStage : stage, errorCode: finalErrorCode, errorMessage: finalError, expectedUrl: failedResult.expectedUrl, observedUrl: failedResult.observedUrl, expectedPeriod: failedResult.expectedPeriod, observedPeriod: failedResult.observedPeriod, stageTimingsMs: failedResult.diagnostics && typeof failedResult.diagnostics.stageTimingsMs === "object" ? failedResult.diagnostics.stageTimingsMs : {}, viewportEvidence });
+          attemptHistory.push({ attemptNumber: attempt, ...recoveryRecord, failureCategory: classification.category, knownFailure: classification.knownFailure, stageTimeline: { ...stageTimeline }, startedAt, finishedAt: failedResult.finishedAt, durationMs: totalMs, failureStage: failedResult.diagnostics && typeof failedResult.diagnostics.failureStage === "string" ? failedResult.diagnostics.failureStage : stage, errorCode: finalErrorCode, errorMessage: finalError, expectedUrl: failedResult.expectedUrl, observedUrl: failedResult.observedUrl, expectedPeriod: failedResult.expectedPeriod, observedPeriod: failedResult.observedPeriod, stageTimingsMs: failedResult.diagnostics && typeof failedResult.diagnostics.stageTimingsMs === "object" ? failedResult.diagnostics.stageTimingsMs : {}, viewportEvidence,
+            // Geometry and row selection travel with the attempt so a production failure (no dev run store) can be
+            // copied from the panel and diagnosed without a local run.
+            viewportNormalization: normalization, ...(diagnostic && typeof diagnostic.selection === "object" ? { selection: diagnostic.selection } : {}) });
+          setFailureRecords((current) => ({ ...current, [type]: [...attemptHistory] }));
           try { await bounded(saveDiagnostics(type, { ...failedResult, diagnostics: { ...failedResult.diagnostics, attemptHistory: [...attemptHistory] } }), 30_000, "PERSISTENCE_TIMEOUT"); }
           catch (saveError) {
             finalError = `Backend did not acknowledge attempt diagnostics: ${errorMessage(saveError, "local diagnostic write failed")}`;
@@ -321,13 +331,18 @@ export function LocalAutomaticAcceptanceRun({ api, report, targets, plan, servic
       ? [screenshot] : [];
   }) : [];
   const confirmedApproved = confirmedCaptures.filter((screenshot) => screenshot.approved).length;
+  async function copyDiagnostics(section: string) {
+    const text = JSON.stringify({ runId, extensionBuild: EXTENSION_BUILD, section, platform: navigator.userAgent, attempts: failureRecords[section] ?? [] }, null, 1);
+    try { await navigator.clipboard.writeText(text); setCopiedSection(section); }
+    catch { setRunError("The diagnostics could not be copied to the clipboard."); }
+  }
   return <main className="capture-workflow"><section className="card" aria-live="polite">
     <p className="kicker">Automatic Capture</p><h1>{running ? "Automatic capture running" : paused ? "Automatic capture paused" : passed === plan.length ? "Automatic Capture Complete" : "Automatic capture finished"}</h1><p className="report-month">{report.client.name}</p><p className="support-copy">Extension build {EXTENSION_BUILD}</p>
     {!running && <h2>AUTOMATIC CAPTURE RESULTS</h2>}
     <p className="support-copy">{running ? "Each section is verified and saved on the report before the next one starts. No review is needed between sections." : paused ? `${results.find(({ status }) => status === "FAIL")?.label ?? "The current section"} needs attention. Sections that passed are saved on the report; later sections were not started. Resume captures only what is missing.` : passed === plan.length ? `${passed}/${plan.length} PASS · saved on this report. The final report is generated automatically; human review is optional.` : "Automatic capture finished."}</p>
     {current && <p role="status" className="notice">{position(current.section)} {current.label} — {current.phase} (attempt {current.attempt}/{MAX_ATTEMPTS})…</p>}
     {runId && <p className="support-copy">Diagnostic run ID: <code>{runId}</code></p>}
-    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Waiting" : result.status === "running" ? `${result.phase === "Capturing" ? "Capturing" : "Preparing"} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small></span></li>)}</ul>
+    <ul className="checklist runner-checklist">{results.map((result, index) => <li key={result.section}><span className={`check-icon ${result.status === "PASS" ? "approved" : result.status === "FAIL" ? "unapproved" : "pending"}`}>{result.status === "PASS" ? "✓" : result.status === "FAIL" ? "!" : result.status === "running" ? "…" : "○"}</span><span><strong>{position(result.section)} {result.label}</strong><small>{result.status === "pending" ? "Waiting" : result.status === "running" ? `${result.phase === "Capturing" ? "Capturing" : "Preparing"} · attempt ${result.attempt}/${MAX_ATTEMPTS}` : result.status === "PASS" ? `PASS · ${(result.durationMs ?? 0) / 1000}s · ${result.attempt} attempt(s)` : `FAIL after ${result.attempt} attempt(s) · ${result.error ?? "See diagnostic details."}`}</small>{result.status === "FAIL" && failureRecords[result.section] && <button type="button" className="secondary" onClick={() => void copyDiagnostics(result.section)}>{copiedSection === result.section ? "Diagnostics copied" : "Copy diagnostics"}</button>}</span></li>)}</ul>
     {!running && <p role="status" className="notice">This run: {passed}/{plan.length} PASS · {canonicalReport ? `Saved on report: ${confirmedCaptures.length}/${allSections.length} captured · ${allSections.length - confirmedCaptures.length} missing · human review optional (${confirmedApproved} approved)` : "report save not confirmed"} · Total duration: {((runDurationMs ?? 0) / 1000).toFixed(1)}s</p>}
     {zoom && <p className="support-copy">Klaviyo zoom: {formatZoom(zoom.originalZoom)} → {formatZoom(zoom.captureZoom)} for capture · viewport {Math.round(zoom.viewport.width)} px (minimum {MIN_KLAVIYO_VIEWPORT_WIDTH} px)</p>}
     {zoomRestore?.restored && <p className="support-copy">Klaviyo zoom restored to {formatZoom(zoomRestore.originalZoom)}.</p>}
@@ -395,4 +410,10 @@ function coverIssues(evidence: BusinessPerformanceEvidence, currency: string | n
   if (!currency) return (["totalRevenue", "emailAttributedRevenue", "campaignRevenue", "flowRevenue"] as const).filter((key) => !evidence[key]).map((key) => `${key} is missing.`);
   const verified = verifyBusinessPerformance(evidence, currency);
   return verified.ok ? [] : verified.issues.map(({ code, message }) => `${code}: ${message}`);
+}
+
+/** The width Klaviyo lays out to, when the adapter reported it; otherwise the screenshot's CSS width. */
+export function layoutViewportWidth(target: { viewportWidth: number }): number {
+  const layout = (target as { layoutViewportWidth?: unknown }).layoutViewportWidth;
+  return typeof layout === "number" && Number.isFinite(layout) && layout > 0 ? layout : target.viewportWidth;
 }

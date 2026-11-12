@@ -18,6 +18,13 @@ describe("shared recovery policy", () => {
     expect(classifyFailure(code)).toMatchObject({ category, permanent });
   });
 
+  it("never reads TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW as VIEW_NOT_SELECTED (Windows run 7417360d): it is a card/row state with its known fingerprint", () => {
+    expect(classifyFailure("TOP_FLOWS_NON_QUALIFYING_ROW_IN_VIEW")).toEqual({ category: "CARD_NOT_READY", permanent: false, knownFailure: "TOP_FLOWS_WINDOWS_LAYOUT" });
+    expect(classifyFailure("TOP_FLOW_ROWS_NOT_FOUND").category).toBe("CARD_NOT_READY");
+    // Viewport geometry stays a retryable layout problem, never a view-selection one.
+    expect(classifyFailure("KLAVIYO_VIEWPORT_TOO_NARROW").category).toBe("LAYOUT_UNSTABLE");
+  });
+
   it("recognises the session-storage quota fingerprint behind a generic CAPTURE_FAILED", () => {
     expect(classifyFailure("CAPTURE_FAILED", "Session storage quota bytes exceeded. Values were not stored.")).toEqual({ category: "CAPTURE_STATE_STORAGE_FULL", permanent: false, knownFailure: "SESSION_STORAGE_QUOTA" });
   });

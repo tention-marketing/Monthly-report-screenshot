@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ChromeStorageSession, KlaviyoActiveTabGrantStore } from "../klaviyo-navigation/active-tab-grant.js";
-import { KLAVIYO_ZOOM_RUN_KEY, KlaviyoViewportNormalizer, MIN_KLAVIYO_VIEWPORT_WIDTH, klaviyoViewportTooNarrowMessage } from "./klaviyo-viewport.js";
+import { KLAVIYO_ZOOM_RUN_KEY, KlaviyoViewportNormalizer, MIN_KLAVIYO_VIEWPORT_WIDTH, klaviyoViewportTooNarrowMessage, readKlaviyoLayoutViewport } from "./klaviyo-viewport.js";
 
 const grant = { grantedTabId: 7, grantedWindowId: 4, grantedOrigin: "https://www.klaviyo.com", grantedUrl: "https://www.klaviyo.com/dashboard", grantedAt: 1 };
 const grantStore = (value: typeof grant | null = grant) => ({ get: vi.fn().mockResolvedValue(value) }) as unknown as KlaviyoActiveTabGrantStore;
@@ -85,5 +85,46 @@ describe("Klaviyo viewport normalization (Chrome tab zoom)", () => {
     expect(1315).toBeLessThan(MIN_KLAVIYO_VIEWPORT_WIDTH);
     expect(1394).toBeGreaterThanOrEqual(MIN_KLAVIYO_VIEWPORT_WIDTH);
     expect(klaviyoViewportTooNarrowMessage(974.4)).toMatch(/only 974 px wide.*at least 1390 px/);
+  });
+});
+
+describe("Klaviyo layout width on macOS and Windows (classic scrollbars)", () => {
+  function page(innerWidth: number, documentClientWidth: number, appGutter: number): void {
+    document.body.innerHTML = `<div id="app" style="overflow-y: auto"><main>Klaviyo</main></div>`;
+    vi.spyOn(window, "innerWidth", "get").mockReturnValue(innerWidth);
+    Object.defineProperty(document.documentElement, "clientWidth", { configurable: true, get: () => documentClientWidth });
+    const app = document.getElementById("app")!;
+    Object.defineProperty(app, "offsetWidth", { configurable: true, get: () => documentClientWidth });
+    Object.defineProperty(app, "clientWidth", { configurable: true, get: () => documentClientWidth - appGutter });
+    Object.defineProperty(app, "clientHeight", { configurable: true, get: () => 900 });
+    Object.defineProperty(app, "scrollHeight", { configurable: true, get: () => 4_000 });
+  }
+  const cleanup = () => { vi.restoreAllMocks(); delete (document.documentElement as { clientWidth?: number }).clientWidth; document.body.innerHTML = ""; };
+
+  it.each([
+    ["macOS overlay scrollbars", 1394, 1394, 0, 1394],
+    ["Windows: classic scrollbar on the document", 1407, 1390, 0, 1390],
+    ["Windows: classic scrollbar on Klaviyo's app scroller", 1407, 1407, 17, 1390],
+    ["Windows 80% zoom: a 17 device-px scrollbar is 21 CSS px", 1442, 1442, 21, 1421],
+  ] as const)("%s: innerWidth %i → layout width %i − %i = %i", (_name, inner, documentWidth, gutter, expected) => {
+    try {
+      page(inner, documentWidth, gutter);
+      expect(readKlaviyoLayoutViewport()).toMatchObject({ width: expected, innerWidth: inner, scrollbarWidth: inner - expected });
+    } finally { cleanup(); }
+  });
+
+  it("zooms one step further on Windows when innerWidth passes 1390 but the layout behind the scrollbar does not", async () => {
+    const chrome = fakeChrome(1, 1120); // 1400 px innerWidth at 80% (accepted before), 1379 px of layout behind a 21 px scrollbar
+    chrome.scripting.executeScript.mockImplementation(async ({ target }: { target: { tabId: number } }) => {
+      const zoom = chrome.zooms.get(target.tabId)!; const inner = Math.round(1120 / zoom); const scrollbar = Math.round(17 / zoom);
+      return [{ result: { width: inner - scrollbar, innerWidth: inner, scrollbarWidth: scrollbar, height: 900, devicePixelRatio: 1.25 * zoom } }];
+    });
+    const result = await new KlaviyoViewportNormalizer(chrome.tabs, chrome.scripting, grantStore(), chrome.session, fast).normalize();
+    expect(chrome.tabs.setZoom.mock.calls.map(([, factor]) => factor)).toEqual([0.9, 0.8, 0.75]);
+    expect(result).toMatchObject({ ok: true, captureZoom: 0.75, viewport: { width: 1493 - 23, innerWidth: 1493, scrollbarWidth: 23 } });
+  });
+
+  it("names both platforms' zoom shortcut", () => {
+    expect(klaviyoViewportTooNarrowMessage(1200)).toMatch(/Ctrl − on Windows, ⌘ − on Mac/);
   });
 });
